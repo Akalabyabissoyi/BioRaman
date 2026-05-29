@@ -12,7 +12,7 @@ authors:
     email: akalabya.bissoyi@manchester.ac.uk
 version: 0.8.0
 date-released: "2026-05-29"
-license: MIT
+license: GPL-3.0-or-later
 keywords:
   - Raman spectroscopy
   - hyperspectral imaging

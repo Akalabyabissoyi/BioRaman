@@ -50,4 +50,9 @@ the repository is connected.
 
 ## License
 
-Released under the MIT License — see [LICENSE](LICENSE).
+Released under the GNU General Public License v3.0 — see [LICENSE](LICENSE).
+
+This is copyleft: you are free to use, study, modify and redistribute
+BioRaman, but any distributed modified version (including under a new name)
+must also be released as open source under the GPL and must preserve the
+original authorship and copyright notices.

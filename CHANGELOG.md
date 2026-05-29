@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Renamed the application to **BioRaman** and the entry-point file to
   `bioraman.py` (previously the versioned `Raman_map_explorer_v11.py`) ahead of
   the first public release.
+- Relicensed from MIT to **GNU GPL v3.0-or-later** (copyleft) so that any
+  distributed modified or renamed version must remain open source and retain
+  the original authorship. Added a GPL header to `bioraman.py` and a license
+  notice to the About dialog.
 
 ## [0.7.0] - 2026-05-29
 
