@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Raman Map Explorer  —  Professional Edition v7
+Raman Map Explorer  —  Professional Edition v11
 ================================================
+NEW in v11 (Peak Identification & Spectra Comparison):
+• Peak Identification Window — open_peak_id()
+    - Automatic peak detection on selected spectra
+    - Matches detected peaks against a built-in Raman band library
+    - Import custom band lists / CSV reference tables
+    - Export identified-peak table as CSV
+
+• Spectra Comparison Window — open_spectra_compare()
+    - Side-by-side overlay/comparison of selected spectra
+    - Compare clustering components and extracted endmembers
+    - Export comparison figure as PNG / PDF
+
 NEW in v7 (Spectral Unmixing & Clustering Suite):
 • Cluster Analysis Window — open_clustering()
     - K-means and Agglomerative (hierarchical) clustering
