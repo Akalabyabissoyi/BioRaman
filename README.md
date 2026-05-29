@@ -1,6 +1,6 @@
-# RamanScope
+# BioRaman
 
-*Raman Hyperspectral Map Analysis*
+*Raman Hyperspectral Map Analysis for Biophysics*
 
 A desktop GUI (Tkinter + matplotlib) for exploring and analysing Raman
 hyperspectral maps. It loads Renishaw WiRE / HORIBA LabSpec data and provides
@@ -32,7 +32,7 @@ pip install scikit-learn pandas seaborn openpyxl
 ## Usage
 
 ```bash
-python ramanscope.py
+python bioraman.py
 ```
 
 ## Versioning
