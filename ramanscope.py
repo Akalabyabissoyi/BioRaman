@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Raman Map Explorer  —  Professional Edition v11
+RamanScope  —  Raman Hyperspectral Map Analysis
 ================================================
 Created by: Akalabya Bissoyi  <akalabya.bissoyi@manchester.ac.uk>
 ================================================
@@ -1281,7 +1281,7 @@ class PCAWindow(tk.Toplevel):
 class RamanApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Raman Map Explorer  —  Professional  v6")
+        self.title("RamanScope  —  Raman Hyperspectral Map Analysis  (v0.8.0)")
         self.geometry("1380x820")
         self.minsize(1100, 660)
         self.configure(bg=C["bg"])
@@ -1405,8 +1405,8 @@ class RamanApp(tk.Tk):
                      activebackground=C["accent"], activeforeground="white")
         mb.add_cascade(label="Help", menu=hm)
         hm.add_command(label="About", command=lambda: messagebox.showinfo(
-            "Raman Map Explorer v11",
-            "Professional Raman Map Analysis  (v0.8.0)\n\n"
+            "RamanScope",
+            "RamanScope — Raman Hyperspectral Map Analysis  (v0.8.0)\n\n"
             "Created by Akalabya Bissoyi\n"
             "akalabya.bissoyi@manchester.ac.uk\n\n"
             "Shortcuts:\n"
@@ -1428,7 +1428,7 @@ class RamanApp(tk.Tk):
         logo = tk.Frame(tb, bg=C["header"], width=210, height=tb_h)
         logo.pack(side="left", fill="y")
         logo.pack_propagate(False)
-        tk.Label(logo, text="  ◈ RAMAN EXPLORER",
+        tk.Label(logo, text="  ◈ RAMANSCOPE",
                  bg=C["header"], fg="white",
                  font=("Consolas", 13, "bold")).pack(side="left", padx=8, pady=32)
 

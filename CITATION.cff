@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it using these metadata."
-title: "Raman Map Explorer"
+title: "RamanScope — Raman Hyperspectral Map Analysis"
 abstract: >-
   A desktop GUI for exploring and analysing Raman hyperspectral maps,
   with baseline correction, peak fitting, spectral unmixing (MCR-ALS,

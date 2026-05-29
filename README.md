@@ -1,4 +1,6 @@
-# Raman Map Explorer
+# RamanScope
+
+*Raman Hyperspectral Map Analysis*
 
 A desktop GUI (Tkinter + matplotlib) for exploring and analysing Raman
 hyperspectral maps. It loads Renishaw WiRE / HORIBA LabSpec data and provides
@@ -30,7 +32,7 @@ pip install scikit-learn pandas seaborn openpyxl
 ## Usage
 
 ```bash
-python Raman_map_explorer_v11.py
+python ramanscope.py
 ```
 
 ## Versioning

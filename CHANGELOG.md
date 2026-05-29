@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   spectra, components, and endmembers.
 
 ### Changed
-- Main entry-point file is now `Raman_map_explorer_v11.py` (replaces v7).
+- Renamed the application to **RamanScope** and the entry-point file to
+  `ramanscope.py` (previously the versioned `Raman_map_explorer_v11.py`) ahead of
+  the first public release.
 
 ## [0.7.0] - 2026-05-29
 
