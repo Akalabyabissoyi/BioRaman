@@ -13,6 +13,8 @@ clustering (K-means, hierarchical), and 3D confocal volume rendering.
 - MCR-ALS multivariate curve resolution (non-negative factorisation)
 - N-FINDR endmember extraction with NNLS abundance maps
 - Spectral tools: resampling, spatial cropping, rotation, background subtraction
+- Peak identification against a Raman band library
+- Side-by-side spectra comparison
 - 3D confocal volume viewer (volume scatter, orthogonal slices, surface, multi-band RGB)
 - PNG / PDF / CSV export throughout
 
@@ -28,7 +30,7 @@ pip install scikit-learn pandas seaborn openpyxl
 ## Usage
 
 ```bash
-python Raman_map_explorer_v7.py
+python Raman_map_explorer_v11.py
 ```
 
 ## Versioning

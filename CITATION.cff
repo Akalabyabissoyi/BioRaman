@@ -10,7 +10,7 @@ authors:
   - given-names: Akalabya
     family-names: Bissoyi
     email: bissoyi.akalabya@gmail.com
-version: 0.7.0
+version: 0.8.0
 date-released: "2026-05-29"
 license: MIT
 keywords:

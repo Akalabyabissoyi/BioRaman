@@ -4874,7 +4874,7 @@ class ClusteringWindow(tk.Toplevel):
             self._labels = labels
             self.after(0, lambda: self._draw(labels))
         except Exception as ex:
-            self.after(0, lambda: messagebox.showerror("Error", str(ex), parent=self))
+            self.after(0, lambda ex=ex: messagebox.showerror("Error", str(ex), parent=self))
         finally:
             self.after(0, self._prog.stop)
 
@@ -4982,6 +4982,385 @@ class ClusteringWindow(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SPECTRAL ANALYSIS HELPERS  (peak identification + endmember comparison)
+# Shared by the N-FINDR and MCR-ALS windows.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Raman band assignments tuned for CELL CRYOPRESERVATION  (cm⁻¹).
+# Grouped: (A) ice / water state, (B) cryoprotectants, (C) cytosol biomolecules.
+# Literature anchors: Dong et al., Biophys. J. 113 (2017) [low-T Raman of
+# intracellular ice in lymphoblasts]; Raman cryomicroscopy PMC8214853;
+# water OH-stretch decomposition (sym 3230 / asym 3420 cm⁻¹).
+#
+# NOTE: the OH-stretch ICE markers (>3000 cm⁻¹) fall OUTSIDE an 837–2472 cm⁻¹
+# acquisition window. To map intracellular ice vs vitrified cytosol directly,
+# extend the spectral range to ~2900–3600 cm⁻¹.
+# ─────────────────────────────────────────────────────────────────────────────
+# Domain-specific reference libraries.  Each is a list of (cm⁻¹, assignment).
+# Add your own, or import a custom CSV at runtime (Peak ID → Load custom CSV).
+BAND_LIBRARIES = {
+
+    # ════════════════════════════════════════════════════════════════════════
+    "Biology / Cryopreservation": [
+        # (A) ICE / WATER STATE  — primary cryopreservation markers
+        (3140, "ICE: sharp OH stretch — crystalline hexagonal ice Iₕ "
+               "(intracellular/extracellular ICE FORMATION)"),
+        (3230, "WATER: symmetric OH stretch — tetrahedral H-bonded (ice-like)"),
+        (3420, "WATER: asymmetric OH stretch — partially H-bonded "
+               "(liquid / VITRIFIED cytosol, unfrozen water)"),
+        (1640, "Water H–O–H bend / amide I shoulder (bound water)"),
+        # (B) CRYOPROTECTANTS
+        (672,  "DMSO: C–S stretch (penetrating CPA)"),
+        (700,  "DMSO: C–S stretch"),
+        (1042, "DMSO: S=O stretch — DMSO uptake/distribution marker"),
+        (2998, "DMSO: CH₃ stretch"),
+        (850,  "Trehalose/sucrose: C–C / C–O–C ring (non-penetrating CPA)"),
+        (920,  "Glycerol / sugar: C–C–O stretch"),
+        (1056, "Glycerol: C–O / C–C stretch (penetrating CPA)"),
+        (1085, "Sugar C–O / PO₂⁻ overlap (freeze-concentrated solute)"),
+        (1462, "Glycerol / sugar CH₂ deformation"),
+        # (C) CYTOSOL BIOMOLECULES
+        (1004, "Phenylalanine ring breathing (protein marker)"),
+        (1031, "Phenylalanine C–H in-plane"),
+        (1095, "PO₂⁻ symmetric stretch (nucleic acid / phospholipid)"),
+        (1126, "C–N / C–C stretch (protein, lipid)"),
+        (1158, "C–C / C=C (carotenoid)"),
+        (1208, "Tyrosine / phenylalanine"),
+        (1250, "Amide III (β-sheet / random coil protein)"),
+        (1300, "CH₂ twist (lipid acyl chains)"),
+        (1336, "Nucleic acids (A,G) / CH deformation"),
+        (1440, "CH₂/CH₃ deformation (lipid + protein — total biomass)"),
+        (1515, "Carotenoid C=C"),
+        (1576, "Guanine / adenine ring (nucleic acid)"),
+        (1605, "Phenylalanine / tyrosine ring"),
+        (1655, "Amide I (α-helix protein) / C=C unsaturated lipid"),
+        (1745, "Ester C=O stretch (phospholipid / triglyceride)"),
+        (2850, "CH₂ symmetric stretch (lipid)"),
+        (2885, "CH₂ asymmetric stretch (lipid)"),
+        (2935, "CH₃ stretch (protein)"),
+    ],
+
+    # ════════════════════════════════════════════════════════════════════════
+    "Carbon & 2D materials": [
+        (520,  "Si substrate (520.7 cm⁻¹ — calibration / substrate)"),
+        (1350, "D band — disorder / sp³ defects (graphene, soot, DLC)"),
+        (1580, "G band — sp² graphitic C=C stretch"),
+        (1620, "D′ band — defect-activated shoulder"),
+        (2450, "G* / combination band"),
+        (2690, "2D (G′) band — graphene layer count / stacking"),
+        (2930, "D+D′ combination (disorder)"),
+        (1100, "C–C amorphous carbon"),
+        (1430, "Diamond / sp³ (≈1332 diamond line nearby)"),
+        (1332, "Diamond T₂g — sp³ crystalline carbon"),
+    ],
+
+    # ════════════════════════════════════════════════════════════════════════
+    "Minerals / geology (RRUFF-style)": [
+        (1086, "Calcite ν₁ CO₃²⁻ symmetric stretch"),
+        (712,  "Calcite ν₄ CO₃²⁻ bend"),
+        (282,  "Calcite lattice mode"),
+        (1085, "Aragonite ν₁ CO₃²⁻"),
+        (704,  "Aragonite ν₄ doublet"),
+        (464,  "Quartz — α-quartz Si–O–Si symmetric"),
+        (206,  "Quartz lattice mode"),
+        (1008, "Gypsum ν₁ SO₄²⁻ (calibration standard)"),
+        (960,  "Apatite ν₁ PO₄³⁻ (bone, phosphate minerals)"),
+        (144,  "Anatase TiO₂ Eg (strong)"),
+        (397,  "Anatase TiO₂ B1g"),
+        (515,  "Anatase TiO₂ A1g/B1g"),
+        (639,  "Anatase TiO₂ Eg"),
+        (225,  "Hematite Fe₂O₃ A1g"),
+        (292,  "Hematite Fe₂O₃ Eg"),
+        (410,  "Hematite Fe₂O₃ Eg"),
+        (343,  "Pyrite FeS₂ Eg"),
+        (379,  "Pyrite FeS₂ Ag"),
+        (820,  "Olivine SiO₄ doublet (lower)"),
+        (855,  "Olivine SiO₄ doublet (upper)"),
+    ],
+
+    # ════════════════════════════════════════════════════════════════════════
+    "Microplastics & polymers (SLoPP-style)": [
+        (1062, "PE: C–C stretch (polyethylene)"),
+        (1128, "PE: C–C stretch"),
+        (1295, "PE: CH₂ twist"),
+        (1440, "PE/PP: CH₂ bend"),
+        (2848, "PE: CH₂ symmetric stretch"),
+        (2882, "PE: CH₂ asymmetric stretch"),
+        (809,  "PP: CH₂ rock (polypropylene)"),
+        (841,  "PP: CH₂ rock / C–C"),
+        (998,  "PP: CH₃ rock"),
+        (1458, "PP: CH₃ bend"),
+        (1001, "PS: ring breathing (polystyrene — diagnostic)"),
+        (1031, "PS: ring C–H in-plane"),
+        (1602, "PS: aromatic C=C ring"),
+        (3054, "PS: aromatic C–H stretch"),
+        (1096, "PET: C–O / ring (polyethylene terephthalate)"),
+        (1614, "PET: aromatic ring C=C"),
+        (1728, "PET/PMMA: ester C=O stretch"),
+        (632,  "PET: C=O in-plane / ring"),
+        (638,  "PVC: C–Cl stretch (polyvinyl chloride)"),
+        (1430, "PVC: CH₂ bend"),
+        (812,  "PMMA: C–O–C (acrylic)"),
+        (1635, "Nylon/PA: amide I"),
+    ],
+}
+
+# Active library (mutable; the Peak-ID window can switch it).  Default = biology.
+RAMAN_BANDS = BAND_LIBRARIES["Biology / Cryopreservation"]
+
+
+def _detect_peaks(wn, spectrum, prominence=0.05, tol=12.0, bands=None):
+    """Return ranked peak list [(wn, norm_intensity, assignment), ...].
+    `bands` overrides the active library; defaults to RAMAN_BANDS."""
+    ref = bands if bands is not None else RAMAN_BANDS
+    y = np.asarray(spectrum, dtype=float)
+    pk = y.max() or 1.0
+    y = y / pk
+    ys = savgol_filter(y, 11, 3) if len(y) > 11 else y
+    peaks, _ = find_peaks(ys, prominence=prominence, distance=5)
+    rows = []
+    for p in peaks:
+        w = float(wn[p])
+        if ref:
+            cand = min(ref, key=lambda b: abs(b[0] - w))
+            assign = cand[1] if abs(cand[0] - w) <= tol else "unassigned"
+        else:
+            assign = "unassigned"
+        rows.append((round(w, 1), round(float(y[p]), 3), assign))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return rows
+
+
+def _load_band_csv(path):
+    """Load a custom band library CSV: columns = wavenumber, assignment."""
+    bands = []
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.lower().startswith(("wavenumber", "cm", "#")):
+                continue
+            parts = line.split(",", 1)
+            try:
+                wn_v = float(parts[0])
+            except (ValueError, IndexError):
+                continue
+            label = parts[1].strip().strip('"') if len(parts) > 1 else ""
+            bands.append((wn_v, label))
+    return bands
+
+
+def open_peak_id(parent, wn, M, labels, colors):
+    """
+    Peak-identification window.
+    M : (k, W) matrix of spectra (rows = endmembers/components).
+    """
+    win = tk.Toplevel(parent)
+    win.title("Peak Identification")
+    win.geometry("1100x720")
+    win.configure(bg=C["bg"])
+
+    hdr = tk.Frame(win, bg=C["header"], height=40); hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    tk.Label(hdr, text="⛯  PEAK IDENTIFICATION", bg=C["header"], fg="white",
+             font=("Consolas", 12, "bold")).pack(side="left", padx=16, pady=8)
+
+    body = tk.Frame(win, bg=C["bg"]); body.pack(fill="both", expand=True)
+
+    # left: plot
+    left = tk.Frame(body, bg=C["bg"]); left.pack(side="left", fill="both",
+                                                 expand=True)
+    fig = plt.figure(figsize=(8, 6), facecolor="#ffffff")
+    canvas = FigureCanvasTkAgg(fig, master=left)
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+    NavigationToolbar2Tk(canvas, left).update()
+
+    # right: selector + table
+    right = tk.Frame(body, bg=C["sidebar"], width=360); right.pack(side="right",
+                                                                   fill="y")
+    right.pack_propagate(False)
+
+    # ── Reference band library (multi-domain, switchable) ───────────────────
+    SectionDiv(right, "REFERENCE LIBRARY").pack(fill="x")
+    state = {"bands": RAMAN_BANDS, "custom": None}
+    lib_names = list(BAND_LIBRARIES.keys())
+    lib_var = tk.StringVar(value=lib_names[0])
+    lib_box = ttk.Combobox(right, textvariable=lib_var,
+                           values=lib_names + ["Custom (loaded CSV)"],
+                           state="readonly", width=30)
+    lib_box.pack(padx=12, pady=4)
+
+    def _set_lib(*_):
+        name = lib_var.get()
+        if name == "Custom (loaded CSV)":
+            state["bands"] = state["custom"] or []
+        else:
+            state["bands"] = BAND_LIBRARIES.get(name, [])
+        _refresh()
+
+    def _load_custom():
+        path = filedialog.askopenfilename(
+            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")], parent=win,
+            title="Custom band library: column1=wavenumber, column2=assignment")
+        if not path:
+            return
+        try:
+            state["custom"] = _load_band_csv(path)
+        except Exception as ex:
+            messagebox.showerror("Load error", str(ex), parent=win); return
+        if not state["custom"]:
+            messagebox.showwarning("Empty", "No (wavenumber, label) rows found.",
+                                   parent=win); return
+        lib_var.set("Custom (loaded CSV)")
+        _set_lib()
+        messagebox.showinfo("Loaded",
+                            f"{len(state['custom'])} reference bands loaded.",
+                            parent=win)
+
+    lib_var.trace_add("write", _set_lib)
+    ttk.Button(right, text="＋ Load custom CSV…", style="N.TButton",
+               command=_load_custom).pack(fill="x", padx=12, pady=(0, 4))
+
+    SectionDiv(right, "SELECT SPECTRUM").pack(fill="x")
+    sel = tk.IntVar(value=0)
+    for i, lbl in enumerate(labels):
+        tk.Radiobutton(right, text=lbl, variable=sel, value=i,
+                       bg=C["sidebar"], fg=colors[i % len(colors)],
+                       selectcolor=C["sidebar"], activebackground=C["sidebar"],
+                       font=("Segoe UI", 10, "bold"),
+                       command=lambda: _refresh()).pack(anchor="w", padx=14,
+                                                        pady=1)
+
+    SectionDiv(right, "DETECTED PEAKS  (ranked)").pack(fill="x")
+    cols = ("wn", "rel", "assignment")
+    tree = ttk.Treeview(right, columns=cols, show="headings", height=22)
+    tree.heading("wn", text="cm⁻¹"); tree.column("wn", width=70, anchor="e")
+    tree.heading("rel", text="Rel.I"); tree.column("rel", width=55, anchor="e")
+    tree.heading("assignment", text="Assignment")
+    tree.column("assignment", width=210, anchor="w")
+    tree.pack(fill="both", expand=True, padx=8, pady=6)
+
+    rows_cache = {}
+
+    def _refresh():
+        i = sel.get()
+        rows = _detect_peaks(wn, M[i], bands=state["bands"])
+        rows_cache["last"] = rows
+        fig.clear()
+        ax = fig.add_subplot(111)
+        y = M[i] / (M[i].max() or 1.0)
+        ax.plot(wn, y, color=colors[i % len(colors)], lw=1.3)
+        for w, ri, _a in rows:
+            ax.axvline(w, color="0.85", lw=0.7, zorder=0)
+            ax.annotate(f"{w:.0f}", (w, ri), textcoords="offset points",
+                        xytext=(0, 4), ha="center", fontsize=7, rotation=90)
+        ax.set_xlabel("Raman Shift  (cm⁻¹)"); ax.set_ylabel("Intensity (norm.)")
+        ax.set_title(f"Peak identification — {labels[i]}",
+                     fontweight="semibold")
+        ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+        fig.tight_layout()
+        canvas.draw_idle()
+        tree.delete(*tree.get_children())
+        for w, ri, a in rows:
+            tree.insert("", "end", values=(f"{w:.1f}", f"{ri:.2f}", a))
+
+    def _save_csv():
+        rows = rows_cache.get("last")
+        if not rows:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")], parent=win)
+        if path:
+            with open(path, "w") as fh:
+                fh.write("Wavenumber_cm-1,Relative_Intensity,Assignment\n")
+                for w, ri, a in rows:
+                    fh.write(f"{w},{ri},{a}\n")
+            messagebox.showinfo("Saved", f"Peak table saved to\n{path}",
+                                parent=win)
+
+    ttk.Button(right, text="↓ Save Peak Table (.csv)", style="N.TButton",
+               command=_save_csv).pack(fill="x", padx=8, pady=8)
+    _refresh()
+    return win
+
+
+def open_spectra_compare(parent, wn, M, labels, colors):
+    """
+    Overlay/compare two spectra on the same axis with a difference trace
+    and similarity metrics.  M : (k, W).
+    """
+    win = tk.Toplevel(parent)
+    win.title("Compare Spectra")
+    win.geometry("1080x680")
+    win.configure(bg=C["bg"])
+
+    hdr = tk.Frame(win, bg=C["header"], height=40); hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    tk.Label(hdr, text="⇄  COMPARE / SUPERIMPOSE", bg=C["header"], fg="white",
+             font=("Consolas", 12, "bold")).pack(side="left", padx=16, pady=8)
+
+    body = tk.Frame(win, bg=C["bg"]); body.pack(fill="both", expand=True)
+    left = tk.Frame(body, bg=C["bg"]); left.pack(side="left", fill="both",
+                                                 expand=True)
+    fig = plt.figure(figsize=(8, 5.5), facecolor="#ffffff")
+    canvas = FigureCanvasTkAgg(fig, master=left)
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+    NavigationToolbar2Tk(canvas, left).update()
+
+    right = tk.Frame(body, bg=C["sidebar"], width=280); right.pack(side="right",
+                                                                   fill="y")
+    right.pack_propagate(False)
+    SectionDiv(right, "CHOOSE TWO").pack(fill="x")
+
+    tk.Label(right, text="Spectrum A", bg=C["sidebar"], fg=C["text_mid"],
+             font=("Segoe UI", 10)).pack(anchor="w", padx=14, pady=(6, 0))
+    va = tk.StringVar(value=labels[0])
+    ttk.Combobox(right, textvariable=va, values=labels, state="readonly",
+                 width=22).pack(padx=14, pady=2)
+    tk.Label(right, text="Spectrum B", bg=C["sidebar"], fg=C["text_mid"],
+             font=("Segoe UI", 10)).pack(anchor="w", padx=14, pady=(6, 0))
+    vb = tk.StringVar(value=labels[1] if len(labels) > 1 else labels[0])
+    ttk.Combobox(right, textvariable=vb, values=labels, state="readonly",
+                 width=22).pack(padx=14, pady=2)
+
+    show_diff = tk.BooleanVar(value=True)
+    tk.Checkbutton(right, text="Show difference (A − B)", variable=show_diff,
+                   bg=C["sidebar"], fg=C["text_mid"],
+                   activebackground=C["sidebar"], selectcolor=C["sidebar"],
+                   font=("Segoe UI", 10),
+                   command=lambda: _refresh()).pack(anchor="w", padx=12, pady=4)
+
+    metric = tk.Label(right, text="", bg=C["sidebar"], fg=C["text_dim"],
+                      font=("Consolas", 10), justify="left")
+    metric.pack(anchor="w", padx=14, pady=8)
+
+    def _refresh(*_):
+        i, j = labels.index(va.get()), labels.index(vb.get())
+        a = M[i] / (M[i].max() or 1.0)
+        b = M[j] / (M[j].max() or 1.0)
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.plot(wn, a, color=colors[i % len(colors)], lw=1.4, label=labels[i])
+        ax.plot(wn, b, color=colors[j % len(colors)], lw=1.4, label=labels[j])
+        if show_diff.get():
+            ax.plot(wn, a - b, color="0.45", lw=1.0, alpha=0.8,
+                    label=f"{labels[i]} − {labels[j]}")
+            ax.axhline(0, color="0.85", lw=0.8, zorder=0)
+        ax.set_xlabel("Raman Shift  (cm⁻¹)"); ax.set_ylabel("Intensity (norm.)")
+        ax.set_title("Endmember comparison", fontweight="semibold")
+        ax.legend(fontsize=9); ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+        fig.tight_layout(); canvas.draw_idle()
+        cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+        pear = float(np.corrcoef(a, b)[0, 1])
+        metric.config(text=f"cosine  = {cos:.3f}\npearson = {pear:.3f}")
+
+    va.trace_add("write", _refresh)
+    vb.trace_add("write", _refresh)
+    _refresh()
+    return win
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MCR-ALS WINDOW
 # ─────────────────────────────────────────────────────────────────────────────
 class MCRWindow(tk.Toplevel):
@@ -5060,6 +5439,26 @@ class MCRWindow(tk.Toplevel):
                        activebackground=C["sidebar"],
                        font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=2)
 
+        # ── SPEED (Apple Silicon / large maps) ──────────────────────────────
+        SectionDiv(left, "SPEED").pack(fill="x")
+        sf = tk.Frame(left, bg=C["sidebar"]); sf.pack(fill="x", padx=12, pady=2)
+        tk.Label(sf, text="Pixel bin (k×k)", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", pady=3)
+        self._bin = tk.IntVar(value=2)
+        ttk.Spinbox(sf, from_=1, to=8, textvariable=self._bin,
+                    width=5).grid(row=0, column=1, padx=8)
+        self._fast32 = tk.BooleanVar(value=True)
+        tk.Checkbutton(left, text="float32 (faster, M1 Accelerate)",
+                       variable=self._fast32, bg=C["sidebar"], fg=C["text_mid"],
+                       activebackground=C["sidebar"],
+                       font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=2)
+        tk.Label(left,
+                 text="ALS iterates on binned pixels; full-res abundance maps "
+                      "are computed in one final pass.",
+                 bg=C["sidebar"], fg=C["text_dim"], font=("Segoe UI", 8),
+                 wraplength=240, justify="left").pack(anchor="w", padx=12,
+                                                      pady=(0, 2))
+
         ttk.Button(left, text="▶  Run MCR-ALS", style="P.TButton",
                    command=self._run).pack(fill="x", padx=12, pady=10)
         self._prog = ttk.Progressbar(left, mode="indeterminate")
@@ -5069,6 +5468,12 @@ class MCRWindow(tk.Toplevel):
                                 font=("Segoe UI", 10), wraplength=240,
                                 justify="left")
         self._status.pack(padx=12, pady=4, anchor="w")
+
+        SectionDiv(left, "ANALYSIS").pack(fill="x")
+        ttk.Button(left, text="⇄ Compare Components", style="N.TButton",
+                   command=self._compare_comps).pack(fill="x", padx=12, pady=4)
+        ttk.Button(left, text="⛯ Identify Peaks", style="N.TButton",
+                   command=self._identify_peaks).pack(fill="x", padx=12, pady=4)
 
         SectionDiv(left, "EXPORT").pack(fill="x")
         ttk.Button(left, text="↓ Save Figure", style="N.TButton",
@@ -5082,6 +5487,23 @@ class MCRWindow(tk.Toplevel):
         self._canvas = FigureCanvasTkAgg(self._fig, master=right)
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self._canvas, right).update()
+
+    def _compare_comps(self):
+        if self._S is None:
+            messagebox.showwarning("No results", "Run MCR-ALS first.",
+                                   parent=self)
+            return
+        labels = [f"Component {i+1}" for i in range(self._k)]
+        open_spectra_compare(self, self._xsel, self._S.T, labels,
+                             self.COMP_COLORS)
+
+    def _identify_peaks(self):
+        if self._S is None:
+            messagebox.showwarning("No results", "Run MCR-ALS first.",
+                                   parent=self)
+            return
+        labels = [f"Component {i+1}" for i in range(self._k)]
+        open_peak_id(self, self._xsel, self._S.T, labels, self.COMP_COLORS)
 
     def _run(self):
         if not HAS_SKL:
@@ -5104,60 +5526,90 @@ class MCRWindow(tk.Toplevel):
             mask_w = (self.xdata >= lo) & (self.xdata <= hi)
             xsel   = self.xdata[mask_w]
 
-            D_full = self.spectra.reshape(-1, W)[:, mask_w].astype(float)
-            D_full = np.clip(D_full, 0, None)
+            # float32 → ~2× faster + half memory via Apple Accelerate BLAS
+            dt   = np.float32 if self._fast32.get() else np.float64
+            cube = np.clip(self.spectra[:, :, mask_w].astype(dt), 0, None)
+            Wsel = cube.shape[2]
 
             # Analyse only ROI pixels (ignore background) when an ROI is set
             if self.roi_mask is not None:
                 roi_flat = np.asarray(self.roi_mask, dtype=bool).ravel()
             else:
                 roi_flat = np.ones(Y * X, dtype=bool)
-            D = D_full[roi_flat]
+            D = cube.reshape(-1, Wsel)[roi_flat]          # full-res ROI pixels
 
             k        = self._vars["n_comp"].get()
             max_iter = self._vars["max_iter"].get()
             tol      = self._vars["tol"].get()
             nn_C     = self._nn_C.get()
             nn_S     = self._nn_S.get()
+            bin_f    = max(1, int(self._bin.get()))
 
-            # Initialise with NMF for a good starting point
+            # scipy.optimize.nnls needs float64 contiguous input — wrap so the
+            # float32 fast-path doesn't raise a dtype error.
+            def _nnls(A, b):
+                return scipy_nnls(np.ascontiguousarray(A, dtype=np.float64),
+                                  np.ascontiguousarray(b, dtype=np.float64))[0]
+
+            # ── Build the (much smaller) matrix the ALS loop iterates on ────
+            #    Spatial k×k binning cuts the pixel count by k², which is the
+            #    dominant cost.  Pure-component spectra are scale-invariant, so
+            #    the recovered S is essentially unchanged.
+            if bin_f > 1:
+                yb, xb = Y // bin_f, X // bin_f
+                if yb >= 1 and xb >= 1:
+                    cb = cube[:yb * bin_f, :xb * bin_f, :].reshape(
+                        yb, bin_f, xb, bin_f, Wsel).mean(axis=(1, 3))
+                    D_work = cb.reshape(-1, Wsel).astype(dt)
+                else:
+                    D_work = D
+            else:
+                D_work = D
+
+            # NMF initialisation on the working matrix (good starting point)
             nmf = NMF(n_components=k, init="nndsvda", max_iter=300,
                       random_state=42)
-            C_cur = nmf.fit_transform(D)
-            S_cur = nmf.components_.T   # W × k
+            C_w   = nmf.fit_transform(D_work)
+            S_cur = nmf.components_.T.astype(dt)           # Wsel × k
 
-            # ALS iterations
+            # ── ALS iterations on the small working matrix ──────────────────
             prev_resid = np.inf
             for _ in range(max_iter):
-                # Update C: D ≈ C · S^T  →  S^T C^T ≈ D^T  row by row
                 if nn_C:
-                    C_new = np.array([scipy_nnls(S_cur, D[i])[0]
-                                      for i in range(D.shape[0])])
+                    C_w = np.array([_nnls(S_cur, D_work[i])
+                                    for i in range(D_work.shape[0])], dtype=dt)
                 else:
-                    C_new = np.linalg.lstsq(S_cur, D.T, rcond=None)[0].T
-
-                # Update S: D ≈ C · S^T  →  C S^T ≈ D^T col by col
+                    C_w = np.linalg.lstsq(S_cur, D_work.T, rcond=None)[0].T
                 if nn_S:
-                    S_new = np.array([scipy_nnls(C_new, D[:, j])[0]
-                                      for j in range(D.shape[1])]).T
+                    # list over wavenumbers → (Wsel, k) == S directly (no .T)
+                    S_cur = np.array([_nnls(C_w, D_work[:, j])
+                                      for j in range(D_work.shape[1])],
+                                     dtype=dt)
                 else:
-                    S_new = np.linalg.lstsq(C_new, D, rcond=None)[0].T
-
-                resid = float(np.linalg.norm(D - C_new @ S_new.T, "fro"))
+                    S_cur = np.linalg.lstsq(C_w, D_work, rcond=None)[0].T
+                resid = float(np.linalg.norm(D_work - C_w @ S_cur.T))
                 if abs(prev_resid - resid) < tol:
                     break
-                C_cur, S_cur, prev_resid = C_new, S_new, resid
+                prev_resid = resid
+
+            # ── Final FULL-resolution abundance maps: one NNLS sweep ────────
+            #    (instead of max_iter sweeps over every pixel)
+            if nn_C:
+                C_cur = np.array([_nnls(S_cur, D[i])
+                                  for i in range(D.shape[0])], dtype=dt)
+            else:
+                C_cur = np.linalg.lstsq(S_cur, D.T, rcond=None)[0].T
 
             # Scatter abundances back to the full map; background = NaN
             C_full = np.full((Y * X, k), np.nan, dtype=float)
-            C_full[roi_flat] = C_cur
+            C_full[roi_flat] = C_cur.astype(float)
             self._C  = C_full.reshape(Y, X, k)
-            self._S  = S_cur          # mask_W × k
+            self._S  = np.asarray(S_cur, dtype=float)     # Wsel × k
             self._xsel = xsel
             self._k  = k
             self.after(0, self._draw)
         except Exception as ex:
-            self.after(0, lambda: messagebox.showerror("Error", str(ex),
+            self.after(0, lambda ex=ex: messagebox.showerror("Error", str(ex),
                                                         parent=self))
         finally:
             self.after(0, self._prog.stop)
@@ -5318,6 +5770,12 @@ class NFindrWindow(tk.Toplevel):
                                 justify="left")
         self._status.pack(padx=12, pady=4, anchor="w")
 
+        SectionDiv(left, "ANALYSIS").pack(fill="x")
+        ttk.Button(left, text="⇄ Compare Endmembers", style="N.TButton",
+                   command=self._compare_ems).pack(fill="x", padx=12, pady=4)
+        ttk.Button(left, text="⛯ Identify Peaks", style="N.TButton",
+                   command=self._identify_peaks).pack(fill="x", padx=12, pady=4)
+
         SectionDiv(left, "EXPORT").pack(fill="x")
         ttk.Button(left, text="↓ Save Figure", style="N.TButton",
                    command=self._save_fig).pack(fill="x", padx=12, pady=4)
@@ -5330,6 +5788,24 @@ class NFindrWindow(tk.Toplevel):
         self._canvas = FigureCanvasTkAgg(self._fig, master=right)
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self._canvas, right).update()
+
+    def _compare_ems(self):
+        if self._endmembers is None:
+            messagebox.showwarning("No results", "Run N-FINDR first.",
+                                   parent=self)
+            return
+        labels = [f"Endmember {i+1}" for i in range(self._p)]
+        open_spectra_compare(self, self._xsel, self._endmembers,
+                             labels, self.COMP_COLORS)
+
+    def _identify_peaks(self):
+        if self._endmembers is None:
+            messagebox.showwarning("No results", "Run N-FINDR first.",
+                                   parent=self)
+            return
+        labels = [f"Endmember {i+1}" for i in range(self._p)]
+        open_peak_id(self, self._xsel, self._endmembers,
+                     labels, self.COMP_COLORS)
 
     def _run(self):
         if not HAS_SKL:
@@ -5412,7 +5888,7 @@ class NFindrWindow(tk.Toplevel):
             self._p          = p
             self.after(0, self._draw)
         except Exception as ex:
-            self.after(0, lambda: messagebox.showerror("Error", str(ex),
+            self.after(0, lambda ex=ex: messagebox.showerror("Error", str(ex),
                                                         parent=self))
         finally:
             self.after(0, self._prog.stop)

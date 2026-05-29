@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-29
+
+### Added
+- **[OUTPUT]** Peak identification window: detects spectral peaks and matches
+  them against a Raman band library (with custom/CSV band-list import).
+- **[OUTPUT]** Spectra comparison window: side-by-side comparison of selected
+  spectra, components, and endmembers.
+
+### Changed
+- Main entry-point file is now `Raman_map_explorer_v11.py` (replaces v7).
+
 ## [0.7.0] - 2026-05-29
 
 First version under semantic versioning. Prior builds (v1–v6) were tracked
@@ -31,5 +42,6 @@ informally and are summarised below.
 - v1–v5 — Core map exploration, baseline correction, peak fitting, smoothing,
   and export functionality.
 
-[Unreleased]: https://example.com/compare/v0.7.0...HEAD
+[Unreleased]: https://example.com/compare/v0.8.0...HEAD
+[0.8.0]: https://example.com/releases/tag/v0.8.0
 [0.7.0]: https://example.com/releases/tag/v0.7.0
