@@ -2,6 +2,8 @@
 """
 Raman Map Explorer  —  Professional Edition v11
 ================================================
+Created by: Akalabya Bissoyi  <akalabya.bissoyi@manchester.ac.uk>
+================================================
 NEW in v11 (Peak Identification & Spectra Comparison):
 • Peak Identification Window — open_peak_id()
     - Automatic peak detection on selected spectra
@@ -65,6 +67,10 @@ pip install scikit-learn pandas seaborn openpyxl
 v7 additions use only packages already listed above (scipy.optimize.nnls,
 sklearn.cluster, sklearn.decomposition.NMF).
 """
+
+__author__  = "Akalabya Bissoyi"
+__email__   = "akalabya.bissoyi@manchester.ac.uk"
+__version__ = "0.8.0"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import os, time, threading, queue
@@ -1399,8 +1405,11 @@ class RamanApp(tk.Tk):
                      activebackground=C["accent"], activeforeground="white")
         mb.add_cascade(label="Help", menu=hm)
         hm.add_command(label="About", command=lambda: messagebox.showinfo(
-            "Raman Map Explorer v4",
-            "Professional Raman Map Analysis\n\nShortcuts:\n"
+            "Raman Map Explorer v11",
+            "Professional Raman Map Analysis  (v0.8.0)\n\n"
+            "Created by Akalabya Bissoyi\n"
+            "akalabya.bissoyi@manchester.ac.uk\n\n"
+            "Shortcuts:\n"
             "  Ctrl+O  Open WDF\n  Ctrl+M  Save map\n"
             "  Ctrl+S  Save spectrum\n"
             "  Right-click map → Comparison spectrum\n\n"
