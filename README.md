@@ -2,6 +2,10 @@
 
 *Raman Hyperspectral Map Analysis for Biophysics*
 
+<!-- DOI: after minting on Zenodo, replace XXXXXXX below (both places) with your
+     Zenodo record ID and uncomment this badge line. -->
+<!-- [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
+
 A desktop GUI (Tkinter + matplotlib) for exploring and analysing Raman
 hyperspectral maps. It loads Renishaw WiRE / HORIBA LabSpec data and provides
 baseline correction, peak fitting, spectral unmixing (MCR-ALS, N-FINDR),
