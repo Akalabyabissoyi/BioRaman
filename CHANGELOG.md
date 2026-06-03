@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Gaussian smoothing/upsampling, Z-stretch, opacity and background; robust
   percentile contrast; interactive HTML + high-resolution PNG export. Plotly
   (and kaleido for PNG) are auto-installed on first use.
+- **Full-spectrum library search** (`Analysis → Library Search`) — identify a
+  pixel / ROI / whole-map spectrum by Pearson-correlation matching against a
+  user-supplied reference library (RRUFF, Raman Open Database, SLoPP, or any
+  folder of spectra), with raw / SNV / 1st-derivative preprocessing, overlap-
+  aware scoring, a ranked match table, query-vs-match overlay, and CSV export.
+  No library is bundled with BioRaman (the user loads their own downloaded
+  one), so there are no licensing constraints on the software.
 - **Concentration estimate analysis (reference CLS/NNLS)** in the volume
   renderer — load measured reference component spectra, fit every voxel by
   non-negative least squares (no normalisation, per the Renishaw "concentration

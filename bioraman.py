@@ -2936,6 +2936,8 @@ class RamanApp(tk.Tk):
         am.add_command(label="⟠  MCR-ALS…",              command=self.open_mcr)
         am.add_command(label="◉  N-FINDR Endmembers…",   command=self.open_nfindr)
         am.add_separator()
+        am.add_command(label="🔎  Library Search (full-spectrum)…",
+                       command=self.open_library_search)
         am.add_command(label="⚒  Spectral Tools…",       command=self.open_spectral_tools)
 
         hm = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
@@ -6549,6 +6551,13 @@ class RamanApp(tk.Tk):
         """Open the batch-processing dialog (apply current recipe to a folder)."""
         BatchWindow(self)
 
+    def open_library_search(self):
+        """Full-spectrum library search against a user-supplied reference
+        library (RRUFF / Raman Open Database / SLoPP / any spectra folder)."""
+        if self.spectra is None:
+            messagebox.showwarning("No data", "Load a file first."); return
+        LibrarySearchWindow(self)
+
     def save_report(self):
         """Write a self-contained HTML report of the current map + recipe."""
         if self.spectra is None:
@@ -8986,6 +8995,225 @@ class VolumeRenderWindow(tk.Toplevel):
         except Exception as exc:
             messagebox.showerror("Render failed", str(exc), parent=self)
             self._status.config(text="")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v13: FULL-SPECTRUM LIBRARY SEARCH
+# ─────────────────────────────────────────────────────────────────────────────
+class LibrarySearchWindow(tk.Toplevel):
+    """Identify a spectrum by correlating it against a user-supplied reference
+    library (RRUFF / Raman Open Database / SLoPP / any folder of spectra).
+
+    No spectral library is bundled with BioRaman — the user loads one they have
+    downloaded, so there are no licensing constraints on the software itself.
+    Libraries are matched on the overlapping wavenumber range after a chosen
+    preprocessing (raw / SNV / 1st-derivative) using Pearson correlation.
+    """
+    SPEC_EXTS = (".txt", ".csv", ".dpt", ".dat", ".asc", ".jdx", ".spc", ".wdf")
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.title("Full-Spectrum Library Search")
+        self.configure(bg=C["bg"]); self.geometry("960x620")
+        self.app = app
+        self.x = np.asarray(app.xdata, dtype=float)
+        self._lib = []     # list of {name, spec(W,) with NaN outside coverage}
+
+        left = tk.Frame(self, bg=C["sidebar"], width=300)
+        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        SectionDiv(left, "REFERENCE LIBRARY").pack(fill="x")
+        ttk.Button(left, text="📁 Load library folder…",
+                   command=self._load_folder).pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Button(left, text="＋ Load library files…",
+                   command=self._load_files).pack(fill="x", padx=10, pady=2)
+        self._libl = tk.Label(left, text="no library loaded", bg=C["sidebar"],
+                              fg=C["text_dim"], font=("Segoe UI", 9),
+                              wraplength=270, justify="left")
+        self._libl.pack(fill="x", padx=10, pady=4)
+
+        SectionDiv(left, "QUERY SPECTRUM").pack(fill="x")
+        self._qsrc = tk.StringVar(value="Selected pixel")
+        for v in ("Selected pixel", "ROI mean", "Whole-map mean"):
+            ttk.Radiobutton(left, text=v, value=v, variable=self._qsrc).pack(
+                anchor="w", padx=14)
+
+        SectionDiv(left, "MATCHING").pack(fill="x")
+        rp = tk.Frame(left, bg=C["sidebar"]); rp.pack(fill="x", padx=10, pady=3)
+        tk.Label(rp, text="Preprocess", width=11, anchor="w", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+        self._prep = tk.StringVar(value="SNV")
+        ttk.Combobox(rp, textvariable=self._prep, state="readonly", width=14,
+                     values=["raw", "SNV", "1st derivative"]).pack(side="left")
+        rt = tk.Frame(left, bg=C["sidebar"]); rt.pack(fill="x", padx=10, pady=3)
+        tk.Label(rt, text="Top matches", width=11, anchor="w", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+        self._topn = tk.IntVar(value=15)
+        ttk.Spinbox(rt, from_=5, to=100, textvariable=self._topn,
+                    width=6).pack(side="left")
+        ttk.Button(left, text="🔎 Search", style="ROI.TButton",
+                   command=self._search).pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Button(left, text="↓ Export results (CSV)",
+                   command=self._export).pack(fill="x", padx=10, pady=2)
+
+        right = tk.Frame(self, bg=C["bg"]); right.pack(side="left", fill="both",
+                                                       expand=True)
+        cols = ("rank", "name", "score")
+        self._tv = ttk.Treeview(right, columns=cols, show="headings", height=10)
+        for c, w in zip(cols, (50, 360, 90)):
+            self._tv.heading(c, text=c.title()); self._tv.column(c, width=w)
+        self._tv.pack(fill="x", padx=8, pady=8)
+        self._tv.bind("<<TreeviewSelect>>", lambda _e: self._plot_selected())
+
+        self._fig = plt.Figure(figsize=(7, 3.2))
+        self._ax = self._fig.add_subplot(111)
+        self._cv = FigureCanvasTkAgg(self._fig, master=right)
+        self._cv.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._results = []
+        self._draw_query()
+
+    # ── library loading ─────────────────────────────────────────────────────
+    def _ingest(self, paths):
+        n = 0
+        for p in paths:
+            try:
+                r = _open_raman_any(str(p))
+                sx = np.asarray(r.xdata, dtype=float).ravel()
+                sd = np.asarray(r.spectra, dtype=float)
+                spec = sd.reshape(-1, sd.shape[-1]).mean(axis=0)
+                if sx.size != spec.size:
+                    m = min(sx.size, spec.size); sx, spec = sx[:m], spec[:m]
+                if sx.size < 4:
+                    continue
+                order = np.argsort(sx); sx, spec = sx[order], spec[order]
+                sx, uniq = np.unique(sx, return_index=True); spec = spec[uniq]
+                spec = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
+                si = np.interp(self.x, sx, spec, left=np.nan, right=np.nan)
+                if np.isfinite(si).sum() >= 10:
+                    self._lib.append({"name": Path(p).stem[:60], "spec": si})
+                    n += 1
+            except Exception:
+                continue
+        if n:
+            self._libl.config(text=f"{len(self._lib)} spectra loaded",
+                              fg=C["success"])
+        else:
+            messagebox.showwarning("Library",
+                "No usable spectra found (need spectra overlapping your data's "
+                "wavenumber range).", parent=self)
+
+    def _load_folder(self):
+        d = filedialog.askdirectory(parent=self, title="Reference library folder")
+        if not d:
+            return
+        paths = [p for p in Path(d).rglob("*")
+                 if p.is_file() and p.suffix.lower() in self.SPEC_EXTS]
+        if not paths:
+            messagebox.showwarning("Library", "No spectra files in that folder.",
+                                   parent=self); return
+        self._libl.config(text=f"loading {len(paths)} files…", fg=C["text_mid"])
+        self.update_idletasks()
+        self._ingest(paths)
+
+    def _load_files(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Reference library files",
+            filetypes=[("Spectra", " ".join("*" + e for e in self.SPEC_EXTS)),
+                       ("All files", "*.*")])
+        if paths:
+            self._ingest([Path(p) for p in paths])
+
+    # ── query + matching ────────────────────────────────────────────────────
+    def _query_spectrum(self):
+        S = self.app.spectra
+        src = self._qsrc.get()
+        if src == "Whole-map mean":
+            return S.reshape(-1, S.shape[-1]).mean(axis=0)
+        if src == "ROI mean":
+            m = getattr(self.app, "_roi_mask", None)
+            if m is not None and np.asarray(m).any():
+                return S[np.asarray(m, dtype=bool)].mean(axis=0)
+        xy = getattr(self.app, "coords", None) or (0, 0)
+        x, y = xy
+        return S[y, x]
+
+    @staticmethod
+    def _prep_vec(v, mode):
+        v = np.asarray(v, dtype=float)
+        if mode == "1st derivative":
+            v = np.gradient(v)
+        if mode in ("SNV", "1st derivative"):
+            mu = np.nanmean(v); sd = np.nanstd(v)
+            if sd > 0: v = (v - mu) / sd
+        return v
+
+    def _search(self):
+        if not self._lib:
+            messagebox.showwarning("Library", "Load a reference library first.",
+                                   parent=self); return
+        mode = self._prep.get()
+        q = self._prep_vec(self._query_spectrum(), mode)
+        self._q_disp = self._query_spectrum()
+        results = []
+        for entry in self._lib:
+            L = self._prep_vec(entry["spec"], mode)
+            m = np.isfinite(L) & np.isfinite(q)
+            if m.sum() < 10:
+                continue
+            a = q[m] - q[m].mean(); b = L[m] - L[m].mean()
+            denom = (np.linalg.norm(a) * np.linalg.norm(b))
+            if denom <= 0:
+                continue
+            results.append((entry["name"], float(a @ b / denom), entry["spec"]))
+        results.sort(key=lambda t: t[1], reverse=True)
+        self._results = results[: self._topn.get()]
+        self._tv.delete(*self._tv.get_children())
+        for i, (name, score, _) in enumerate(self._results, 1):
+            self._tv.insert("", "end", values=(i, name, f"{score:.3f}"))
+        if self._results:
+            kids = self._tv.get_children()
+            if kids: self._tv.selection_set(kids[0])
+            self._plot_selected()
+
+    def _draw_query(self):
+        self._ax.cla()
+        self._ax.plot(self.x, self._query_spectrum(), color="#2563eb", lw=1.1,
+                      label="query")
+        self._ax.set_xlabel("Raman shift (cm⁻¹)"); self._ax.set_ylabel("Intensity")
+        self._ax.legend(fontsize=8); self._cv.draw()
+
+    def _plot_selected(self):
+        sel = self._tv.selection()
+        if not sel or not self._results:
+            return
+        idx = self._tv.index(sel[0])
+        name, score, spec = self._results[idx]
+        self._ax.cla()
+        q = self._query_spectrum()
+        qn = (q - np.nanmin(q)) / (np.nanmax(q) - np.nanmin(q) + 1e-9)
+        sn = (spec - np.nanmin(spec)) / (np.nanmax(spec) - np.nanmin(spec) + 1e-9)
+        self._ax.plot(self.x, qn, color="#2563eb", lw=1.1, label="query")
+        self._ax.plot(self.x, sn, color="#ef4444", lw=1.0, alpha=0.8,
+                      label=f"{name}  (r={score:.3f})")
+        self._ax.set_xlabel("Raman shift (cm⁻¹)")
+        self._ax.set_ylabel("Normalised intensity")
+        self._ax.legend(fontsize=8); self._cv.draw()
+
+    def _export(self):
+        if not self._results:
+            messagebox.showwarning("Export", "Run a search first.", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")], initialfile="library_matches")
+        if not path:
+            return
+        import csv
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh); w.writerow(["rank", "name", "correlation"])
+            for i, (name, score, _) in enumerate(self._results, 1):
+                w.writerow([i, name, f"{score:.4f}"])
+        messagebox.showinfo("Export", f"Saved {len(self._results)} matches.",
+                            parent=self)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
