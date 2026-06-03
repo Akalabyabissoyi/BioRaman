@@ -20,7 +20,9 @@ clustering (K-means, hierarchical), and 3D confocal volume rendering.
 - N-FINDR endmember extraction with NNLS abundance maps
 - Spectral tools: resampling, spatial cropping, rotation, background subtraction
 - Peak identification against a Raman band library
+- Full-spectrum library search against user-supplied reference libraries (RRUFF / Raman Open Database / SLoPP)
 - Side-by-side spectra comparison
+- 3D confocal volume reconstruction with a publication-quality renderer (solid / surface / cloud) and reference-spectra concentration (CLS) analysis
 - 3D confocal volume viewer (volume scatter, orthogonal slices, surface, multi-band RGB)
 - PNG / PDF / CSV export throughout
 - Save preprocessed data (full spectral cube + wavenumber axis) to NPZ / HDF5 / CSV / TXT / MAT
@@ -68,6 +70,19 @@ python bioraman.py --input data/ --out processed/ --recipe recipe.json --format 
 
 Recipes are also created and re-used inside the app via
 **Preprocessing → Save/Load Recipe**.
+
+## Reference spectral libraries
+
+BioRaman does **not** bundle any spectral database, so there are no licensing
+constraints on the software. For full-spectrum **Library Search**
+(`Analysis → Library Search`), download a free library yourself and point the
+tool at the folder:
+
+- **RRUFF** — minerals, 14k+ spectra — https://rruff.info/zipped_data_files/raman/
+- **Raman Open Database (ROD)** — open-access (CC0) — http://solsa.crystallography.net/rod/
+- **SLoPP / SLoPP-E** — microplastics — https://rochmanlab.com/slopp-and-slopp-e-raman-libraries/
+
+Please observe each database's own licence and cite it in your work.
 
 ## Versioning
 
