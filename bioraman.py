@@ -1110,6 +1110,74 @@ def show_map(ax, fig, arr, cmap="turbo", sigma=0.8, robust=True,
     return im
 
 
+_LUT_CMAPS = ["turbo", "viridis", "plasma", "inferno", "magma", "cividis",
+              "jet", "hot", "coolwarm", "RdBu_r", "gray", "gist_earth",
+              "nipy_spectral"]
+
+
+def _lut_clim(arr, setting):
+    """vmin/vmax from a panel LUT setting's low/high percentiles."""
+    f = np.asarray(arr)[np.isfinite(arr)]
+    if f.size == 0:
+        return None, None
+    lo, hi = np.percentile(f, [setting["lo"], setting["hi"]])
+    if hi <= lo:
+        lo, hi = float(f.min()), float(f.max())
+    return float(lo), float(hi)
+
+
+def _lut_for_win(win, key, default_cmap="turbo"):
+    d = getattr(win, "_lut", {}).get(key)
+    if d:
+        return d
+    return {"cmap": default_cmap, "lo": 2.0, "hi": 98.0}
+
+
+def _build_lut_panel(win, parent, ready_fn, n_panels=8):
+    """Attach a per-panel LUT control (colour map + contrast percentiles) to a
+    map window. Stores vars on *win* and redraws via win._draw()."""
+    from functools import partial
+    SectionDiv(parent, "PANEL LUT").pack(fill="x")
+    r1 = tk.Frame(parent, bg=C["sidebar"]); r1.pack(fill="x", padx=10, pady=2)
+    tk.Label(r1, text="Panel #", width=8, anchor="w", bg=C["sidebar"],
+             fg=C["text_mid"], font=("Segoe UI", 9)).pack(side="left")
+    win._lut_idx = tk.IntVar(value=1)
+    ttk.Spinbox(r1, from_=1, to=n_panels, width=4,
+                textvariable=win._lut_idx).pack(side="left")
+    win._lut_all = tk.BooleanVar(value=False)
+    ttk.Checkbutton(r1, variable=win._lut_all, text="all").pack(side="left",
+                                                                padx=6)
+    r2 = tk.Frame(parent, bg=C["sidebar"]); r2.pack(fill="x", padx=10, pady=2)
+    tk.Label(r2, text="Colour map", width=8, anchor="w", bg=C["sidebar"],
+             fg=C["text_mid"], font=("Segoe UI", 9)).pack(side="left")
+    win._lut_cmap = tk.StringVar(value="turbo")
+    ttk.Combobox(r2, textvariable=win._lut_cmap, state="readonly", width=12,
+                 values=_LUT_CMAPS).pack(side="left")
+    r3 = tk.Frame(parent, bg=C["sidebar"]); r3.pack(fill="x", padx=10, pady=2)
+    tk.Label(r3, text="Contrast %", width=8, anchor="w", bg=C["sidebar"],
+             fg=C["text_mid"], font=("Segoe UI", 9)).pack(side="left")
+    win._lut_lo = tk.DoubleVar(value=2.0); win._lut_hi = tk.DoubleVar(value=98.0)
+    ttk.Spinbox(r3, from_=0, to=49, width=5, textvariable=win._lut_lo).pack(
+        side="left")
+    tk.Label(r3, text="–", bg=C["sidebar"], fg=C["text_dim"]).pack(side="left")
+    ttk.Spinbox(r3, from_=51, to=100, width=5, textvariable=win._lut_hi).pack(
+        side="left")
+
+    def _apply():
+        if not ready_fn():
+            return
+        s = {"cmap": win._lut_cmap.get(), "lo": float(win._lut_lo.get()),
+             "hi": float(win._lut_hi.get())}
+        if win._lut_all.get():
+            for k in range(n_panels):
+                win._lut[k] = dict(s)
+        else:
+            win._lut[int(win._lut_idx.get()) - 1] = dict(s)
+        win._draw()
+    ttk.Button(parent, text="🎨 Apply LUT", command=_apply).pack(
+        fill="x", padx=10, pady=3)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CUSTOM WIDGETS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7623,6 +7691,8 @@ class MCRWindow(tk.Toplevel):
                     textvariable=self._dsig,
                     command=lambda: getattr(self, "_C", None) is not None
                     and self._draw()).pack(side="left", padx=6)
+        self._lut = {}
+        _build_lut_panel(self, left, lambda: getattr(self, "_C", None) is not None)
 
         SectionDiv(left, "EXPORT").pack(fill="x")
         ttk.Button(left, text="↓ Save Figure", style="N.TButton",
@@ -7797,11 +7867,14 @@ class MCRWindow(tk.Toplevel):
         # Abundance maps on bottom row — smoothed, robust-contrast display
         for c in range(k):
             ax_m = self._fig.add_subplot(gs[1, c])
-            show_map(ax_m, self._fig, self._C[:, :, c], cmap="turbo",
+            s = _lut_for_win(self, c)
+            vmin, vmax = _lut_clim(self._C[:, :, c], s)
+            show_map(ax_m, self._fig, self._C[:, :, c], cmap=s["cmap"],
                      sigma=float(getattr(self, "_dsig", None).get()
                                  if getattr(self, "_dsig", None) else 0.8),
-                     robust=True, title=f"Abundance Map — C{c+1}",
-                     title_color=cols[c], colorbar=False)
+                     robust=False, vmin=vmin, vmax=vmax,
+                     title=f"Abundance Map — C{c+1}", title_color=cols[c],
+                     colorbar=False)
 
         self._canvas.draw_idle()
         self._status.config(
@@ -7859,6 +7932,7 @@ class NFindrWindow(tk.Toplevel):
                                      and np.asarray(roi_mask).any()) else None
         self._endmembers: np.ndarray | None = None
         self._abund: np.ndarray | None = None
+        self._lut = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -7926,6 +8000,7 @@ class NFindrWindow(tk.Toplevel):
                     textvariable=self._dsig,
                     command=lambda: self._abund is not None and self._draw()
                     ).pack(side="left", padx=6)
+        _build_lut_panel(self, left, lambda: self._abund is not None)
 
         SectionDiv(left, "EXPORT").pack(fill="x")
         ttk.Button(left, text="↓ Save Figure", style="N.TButton",
@@ -8075,11 +8150,13 @@ class NFindrWindow(tk.Toplevel):
         # Abundance maps (bottom row) — smoothed, robust-contrast display
         for c in range(p):
             ax_m = self._fig.add_subplot(gs[1, c])
-            show_map(ax_m, self._fig, self._abund[:, :, c], cmap="turbo",
+            s = _lut_for_win(self, c)
+            vmin, vmax = _lut_clim(self._abund[:, :, c], s)
+            show_map(ax_m, self._fig, self._abund[:, :, c], cmap=s["cmap"],
                      sigma=float(getattr(self, "_dsig", None).get()
                                  if getattr(self, "_dsig", None) else 0.8),
-                     robust=True, title=f"Abundance — EM {c+1}",
-                     title_color=cols[c])
+                     robust=False, vmin=vmin, vmax=vmax,
+                     title=f"Abundance — EM {c+1}", title_color=cols[c])
 
         self._canvas.draw_idle()
         self._status.config(
