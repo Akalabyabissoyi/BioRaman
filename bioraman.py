@@ -1059,6 +1059,58 @@ def run_batch(in_dir, out_dir, params, out_format=".npz",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MAP DISPLAY QUALITY HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _smooth_nan(a, sigma):
+    """NaN-aware Gaussian smoothing for nicer map display (background kept NaN)."""
+    a = np.asarray(a, dtype=float)
+    if sigma <= 0:
+        return a
+    m = np.isfinite(a)
+    if not m.any():
+        return a
+    a0 = np.where(m, a, 0.0)
+    num = gaussian_filter(a0, sigma)
+    den = gaussian_filter(m.astype(float), sigma)
+    out = np.where(den > 0, num / den, np.nan)
+    out[~m] = np.nan
+    return out
+
+
+def show_map(ax, fig, arr, cmap="turbo", sigma=0.8, robust=True,
+             vmin=None, vmax=None, title=None, title_color=None,
+             colorbar=True, equal=True):
+    """Render a 2-D map the way instrument software does: light NaN-aware
+    Gaussian smoothing, bilinear interpolation, robust percentile contrast and
+    an equal aspect ratio. Returns the AxesImage."""
+    a = _smooth_nan(arr, sigma)
+    finite = a[np.isfinite(a)]
+    if vmin is None or vmax is None:
+        if robust and finite.size:
+            lo, hi = np.percentile(finite, [2, 98])
+            if hi <= lo:
+                lo, hi = float(finite.min()), float(finite.max())
+        elif finite.size:
+            lo, hi = float(finite.min()), float(finite.max())
+        else:
+            lo, hi = 0.0, 1.0
+        vmin = lo if vmin is None else vmin
+        vmax = hi if vmax is None else vmax
+    cm = plt.get_cmap(cmap).copy(); cm.set_bad("#ffffff")
+    im = ax.imshow(np.ma.masked_invalid(a), origin="upper",
+                   aspect=("equal" if equal else "auto"), cmap=cm,
+                   interpolation="bilinear", vmin=vmin, vmax=vmax)
+    if title:
+        ax.set_title(title, fontsize=9, fontweight="semibold",
+                     color=(title_color or "#1b2333"))
+    ax.set_xticks([]); ax.set_yticks([])
+    if colorbar:
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
+                     shrink=0.85).ax.tick_params(labelsize=7)
+    return im
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CUSTOM WIDGETS
 # ─────────────────────────────────────────────────────────────────────────────
 class RangeSlider(tk.Frame):
@@ -7734,20 +7786,12 @@ class MCRWindow(tk.Toplevel):
                      borderaxespad=0., frameon=True, framealpha=0.9)
         ax_sp.grid(True, ls="--", lw=0.4, alpha=0.5)
 
-        # Abundance maps on bottom row
+        # Abundance maps on bottom row — smoothed, robust-contrast display
         for c in range(k):
             ax_m = self._fig.add_subplot(gs[1, c])
-            ab   = self._C[:, :, c]
-            vmin, vmax = np.nanmin(ab), np.nanmax(ab)
-            ab_n = (ab - vmin) / (vmax - vmin + 1e-12)
-            cmap = plt.get_cmap("turbo").copy()
-            cmap.set_bad("#ffffff")          # background (NaN) shown white
-            ax_m.imshow(np.ma.masked_invalid(ab_n), origin="upper",
-                        aspect="equal", cmap=cmap, interpolation="bilinear")
-            ax_m.set_title(f"Abundance Map — C{c+1}",
-                           fontsize=9, fontweight="semibold",
-                           color=cols[c])
-            ax_m.set_xticks([]); ax_m.set_yticks([])
+            show_map(ax_m, self._fig, self._C[:, :, c], cmap="turbo",
+                     sigma=0.8, robust=True, title=f"Abundance Map — C{c+1}",
+                     title_color=cols[c], colorbar=False)
 
         self._canvas.draw_idle()
         self._status.config(
@@ -8010,21 +8054,12 @@ class NFindrWindow(tk.Toplevel):
                      borderaxespad=0., frameon=True, framealpha=0.9)
         ax_sp.grid(True, ls="--", lw=0.4, alpha=0.5)
 
-        # Abundance maps (bottom row)
+        # Abundance maps (bottom row) — smoothed, robust-contrast display
         for c in range(p):
             ax_m = self._fig.add_subplot(gs[1, c])
-            ab   = self._abund[:, :, c]
-            cmap = plt.get_cmap("turbo").copy()
-            cmap.set_bad("#ffffff")          # background (NaN) shown white
-            im   = ax_m.imshow(np.ma.masked_invalid(ab), origin="upper",
-                               aspect="equal", cmap=cmap,
-                               interpolation="bilinear", vmin=0, vmax=1)
-            self._fig.colorbar(im, ax=ax_m, fraction=0.046, pad=0.04,
-                               shrink=0.8).ax.tick_params(labelsize=7)
-            ax_m.set_title(f"Abundance — EM {c+1}",
-                           fontsize=9, fontweight="semibold",
-                           color=cols[c])
-            ax_m.set_xticks([]); ax_m.set_yticks([])
+            show_map(ax_m, self._fig, self._abund[:, :, c], cmap="turbo",
+                     sigma=0.8, robust=True, title=f"Abundance — EM {c+1}",
+                     title_color=cols[c])
 
         self._canvas.draw_idle()
         self._status.config(
@@ -9469,16 +9504,12 @@ class ComponentAnalysisWindow(tk.Toplevel):
         cols = min(3, n); rows = int(np.ceil(n / cols))
         for k, (m, name) in enumerate(zip(maps, names)):
             ax = self._fig.add_subplot(rows, cols, k + 1)
-            im = ax.imshow(m, cmap="turbo", origin="upper", vmin=0, vmax=100)
-            ax.set_title(f"{name}  ({res['overall'][k]:.1f}%)", fontsize=10)
-            ax.set_xticks([]); ax.set_yticks([])
-            self._fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            show_map(ax, self._fig, m, cmap="turbo", sigma=0.8, robust=True,
+                     title=f"{name}  ({res['overall'][k]:.1f}%)")
         if show_lof:
             ax = self._fig.add_subplot(rows, cols, len(maps) + 1)
-            im = ax.imshow(res["lof"], cmap="magma", origin="upper")
-            ax.set_title("% lack of fit", fontsize=10)
-            ax.set_xticks([]); ax.set_yticks([])
-            self._fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            show_map(ax, self._fig, res["lof"], cmap="magma", sigma=0.8,
+                     robust=True, title="% lack of fit")
         self._fig.tight_layout(); self._cv.draw()
         self._conc.config(text="\n".join(
             f"{nm:<14}{v:6.2f}%" for nm, v in zip(names, res["overall"])))

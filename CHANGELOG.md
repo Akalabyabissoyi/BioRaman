@@ -77,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (so `.wdf` map geometry is recovered without manual setup). Set
   `BIORAMAN_NO_AUTOINSTALL=1` to disable for offline/frozen builds.
 
+- **Higher-quality map rendering** — abundance (MCR-ALS, N-FINDR) and
+  concentration (Component Analysis) maps now use NaN-aware Gaussian smoothing,
+  bilinear interpolation and robust 2–98 percentile contrast (shared `show_map`
+  helper), giving smooth, publication-quality images instead of noisy/blocky
+  pixels.
+
 ### Fixed
 - Loading some `.wdf` maps crashed with `ValueError: not enough values to unpack
   (expected 3, got 1)` when the backend returned a 1-D/2-D array instead of a
