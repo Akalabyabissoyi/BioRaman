@@ -1,0 +1,23 @@
+# Core (required)
+numpy
+scipy
+matplotlib
+pybaselines
+pillow
+
+# Recommended (analysis features)
+scikit-learn
+pandas
+seaborn
+openpyxl
+
+# Instrument file formats
+renishawWiRE        # Renishaw .wdf
+# ramanspy          # WITec .wip (optional)
+
+# Optional export
+# h5py              # HDF5 (.h5) export
+
+# Optional 3D publication rendering (auto-installed on first use)
+# plotly            # interactive volume rendering
+# kaleido           # static PNG export of Plotly figures

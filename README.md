@@ -23,6 +23,13 @@ clustering (K-means, hierarchical), and 3D confocal volume rendering.
 - Side-by-side spectra comparison
 - 3D confocal volume viewer (volume scatter, orthogonal slices, surface, multi-band RGB)
 - PNG / PDF / CSV export throughout
+- Save preprocessed data (full spectral cube + wavenumber axis) to NPZ / HDF5 / CSV / TXT / MAT
+- Multi-format input: Renishaw `.wdf`, WITec `.wip`, and ASCII `.txt`/`.csv`/`.dpt`/`.jdx`
+- Reproducible preprocessing recipes (save/load as JSON) and non-destructive reprocessing
+- Batch-process a whole folder, with a headless command-line mode for pipelines
+- Per-pixel quality-control maps (SNR, intensity, saturation)
+- One-click HTML analysis report and session save/restore
+- Cluster validation via mean silhouette score
 
 ## Installation
 
@@ -33,11 +40,34 @@ pip install numpy scipy matplotlib pybaselines renishawWiRE pillow
 pip install scikit-learn pandas seaborn openpyxl
 ```
 
+Optional: install `ramanspy` to open WITec `.wip` files, and `h5py` for HDF5
+export.
+
+```bash
+pip install ramanspy h5py
+```
+
 ## Usage
+
+Launch the graphical interface:
 
 ```bash
 python bioraman.py
 ```
+
+### Headless batch processing
+
+Process a file or a whole folder from the command line — no GUI — using an
+optional JSON preprocessing recipe:
+
+```bash
+# write the default recipe, edit it, then batch-process a folder
+python bioraman.py --save-recipe recipe.json
+python bioraman.py --input data/ --out processed/ --recipe recipe.json --format .npz
+```
+
+Recipes are also created and re-used inside the app via
+**Preprocessing → Save/Load Recipe**.
 
 ## Versioning
 

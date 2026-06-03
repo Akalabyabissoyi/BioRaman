@@ -19,6 +19,35 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 ================================================
+NEW in v13 (Reproducibility, Batch & QC):
+• Preprocessing recipes — save_recipe() / load_recipe()
+    - Save/load all preprocessing parameters as a JSON recipe for reproducible,
+      shareable analyses
+• Non-destructive reprocessing — reprocess()
+    - Re-apply a changed recipe to the retained raw cube without reloading
+• Batch processing — open_batch() / run_batch()
+    - Apply one recipe to a whole folder of files; writes processed outputs
+      plus a batch_summary.csv
+• Quality-control maps — open_qc_map()
+    - Per-pixel SNR, total/max intensity and detector-saturation maps
+• Analysis report — save_report()
+    - One-click self-contained HTML report (map, mean spectrum, recipe, log)
+• Session save/restore — save_session() / load_session()
+• Headless CLI — run `python bioraman.py --input … --out … [--recipe …]`
+    for GUI-free batch processing in pipelines/servers
+• Cluster validation — mean silhouette score reported after clustering
+• HDF5 export added to Save Processed Data
+
+NEW in v12 (Processed-Data Export):
+• Save Processed Data — save_processed()
+    - Exports the full preprocessed spectral cube (baseline-corrected,
+      smoothed, normalised, cosmic-ray-cleaned) plus the wavenumber axis
+    - Formats: .npz (lossless, reloadable), .csv/.txt/.dpt (Renishaw long
+      format for maps — round-trips through the built-in reader), .mat (SciPy)
+    - Available from File menu, the toolbar, and Ctrl+Shift+S
+    - Note: proprietary instrument containers (.wdf/.wip/.spc) cannot be
+      rewritten, so processed data is exported to open formats instead
+
 NEW in v11 (Peak Identification & Spectra Comparison):
 • Peak Identification Window — open_peak_id()
     - Automatic peak detection on selected spectra
@@ -85,13 +114,47 @@ sklearn.cluster, sklearn.decomposition.NMF).
 
 __author__  = "Akalabya Bissoyi"
 __email__   = "akalabya.bissoyi@manchester.ac.uk"
-__version__ = "0.8.0"
+__version__ = "0.10.0"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
-import os, time, threading, queue
+import os, sys, time, threading, queue
 from dataclasses import dataclass
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
+
+def _ensure_package(import_name, pip_name=None):
+    """Import a package, transparently pip-installing it into the *current*
+    interpreter (sys.executable) if it is missing.
+
+    Returns the imported module, or None if it is unavailable and could not be
+    installed. Set the environment variable BIORAMAN_NO_AUTOINSTALL=1 to disable
+    automatic installation (e.g. for offline or frozen builds).
+    """
+    import importlib
+    try:
+        return importlib.import_module(import_name)
+    except Exception:
+        pass
+    if os.environ.get("BIORAMAN_NO_AUTOINSTALL"):
+        return None
+    pip_name = pip_name or import_name
+    try:
+        import subprocess
+        print(f"[BioRaman] '{pip_name}' not found — installing it for "
+              f"{sys.executable} …", flush=True)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", pip_name])
+        importlib.invalidate_caches()
+        mod = importlib.import_module(import_name)
+        print(f"[BioRaman] Installed '{pip_name}'.", flush=True)
+        return mod
+    except Exception as exc:
+        print(f"[BioRaman] Could not auto-install '{pip_name}': {exc}\n"
+              f"           Install it manually with:\n"
+              f"           {sys.executable} -m pip install {pip_name}",
+              flush=True)
+        return None
 
 # ── numeric / scientific ──────────────────────────────────────────────────────
 import numpy as np
@@ -118,11 +181,501 @@ try:
 except ImportError:
     HAS_PYBL = False
 
-try:
-    from renishawWiRE import WDFReader
-    HAS_WDF = True
-except ImportError:
+# Native Renishaw .wdf reader — auto-installed on first run if missing, because
+# it is what recovers the true X×Y map geometry from .wdf files.
+if _ensure_package("renishawWiRE") is not None:
+    try:
+        from renishawWiRE import WDFReader
+        HAS_WDF = True
+    except Exception:
+        HAS_WDF = False
+else:
     HAS_WDF = False
+
+# Universal multi-format reader (wdf/spc/jdx/dpt/dat/txt/csv …)
+try:
+    from raman_io import open_raman, SUPPORTED_PATTERNS
+    HAS_RAMANIO = True
+except Exception:
+    HAS_RAMANIO = False
+    SUPPORTED_PATTERNS = [("Renishaw WDF", "*.wdf"), ("All files", "*.*")]
+
+# WITec .wip reader (via RamanSPy or the photonicdata wip_loader)
+try:
+    import ramanspy as _ramanspy
+    HAS_RAMANSPY = True
+except Exception:
+    HAS_RAMANSPY = False
+
+try:
+    from wip_loader import load as _wip_load   # photonicdata-files-wip
+    HAS_WIPLOADER = True
+except Exception:
+    HAS_WIPLOADER = False
+
+HAS_WITEC = HAS_RAMANSPY or HAS_WIPLOADER
+
+# Add WITec to the file-open patterns no matter which base reader is active.
+if not any("wip" in pat.lower() for _, pat in SUPPORTED_PATTERNS):
+    SUPPORTED_PATTERNS = (
+        [("Raman data", "*.wdf *.wip *.spc *.jdx *.txt *.csv *.dpt *.dat"),
+         ("WITec WIP", "*.wip"), ("Renishaw WDF", "*.wdf")]
+        + [p for p in SUPPORTED_PATTERNS if "wdf" not in p[1].lower()]
+    )
+
+
+class _WITecReader:
+    """Adapter for WITec ``.wip`` files exposing the same minimal interface as
+    the WDF/raman_io readers: ``.xdata`` (1-D wavenumbers, cm⁻¹) and
+    ``.spectra`` (a Y×X×W intensity cube). Single spectra and line scans are
+    promoted to a cube so the existing map pipeline can consume them."""
+
+    def __init__(self, path):
+        if not HAS_WITEC:
+            raise RuntimeError(
+                "Reading WITec .wip files needs RamanSPy.\n"
+                "Install it with:\n    pip install ramanspy\n"
+                "(or the photonicdata 'wip_loader' package).")
+        axis, data = self._read(path)
+        data = np.asarray(data, dtype=float)
+        if data.ndim == 1:                 # single spectrum  -> 1×1×W
+            data = data[None, None, :]
+        elif data.ndim == 2:               # line scan (N×W)   -> 1×N×W
+            data = data[None, :, :]
+        self.xdata   = np.asarray(axis, dtype=float)
+        self.spectra = data
+        self.img     = None                # no embedded white-light image
+
+    @staticmethod
+    def _read(path):
+        # Preferred: RamanSPy returns a SpectralContainer (or a list of them).
+        if HAS_RAMANSPY:
+            obj = _ramanspy.load.witec(path)
+            if isinstance(obj, (list, tuple)):
+                obj = obj[0]
+            return obj.spectral_axis, obj.spectral_data
+        # Fallback: photonicdata wip_loader (dict-like).
+        wip = _wip_load(path)
+        graph = None
+        for v in (wip.values() if hasattr(wip, "values") else []):
+            if hasattr(v, "spectral_data") or hasattr(v, "data"):
+                graph = v; break
+        if graph is None:
+            raise RuntimeError("No spectral graph found in WIP file.")
+        axis = getattr(graph, "spectral_axis", getattr(graph, "x", None))
+        data = getattr(graph, "spectral_data", getattr(graph, "data", None))
+        return axis, data
+
+
+class _TextReader:
+    """Native reader for ASCII Raman files (``.txt``/``.csv``/``.dpt``/``.dat``/
+    ``.jdx``/``.asc``) following the RAMANMETRIX data conventions:
+
+    * Single spectrum  — two columns: wavenumber, intensity.
+    * Multiple spectra — wavenumber axis in the first column (preferred) or the
+      first row; the remaining columns/rows are intensities.
+    * Renishaw "long" export with named columns — a header containing
+      ``#Wave`` and ``#Intensity`` (optionally ``#X``/``#Y`` for a scan or
+      ``#Time`` for a time series). The long table is reshaped back into a
+      proper spectrum / line / map cube.
+
+    Delimiters (tab / comma / semicolon / whitespace) are auto-detected and
+    comment lines beginning with ``%`` are ignored. Exposes ``.xdata``
+    (1-D wavenumbers) and ``.spectra`` (Y×X×W cube)."""
+
+    def __init__(self, path):
+        axis, cube = self._parse(path)
+        axis = np.asarray(axis, dtype=float)
+        cube = np.asarray(cube, dtype=float)
+        if cube.ndim == 1:
+            cube = cube[None, None, :]
+        elif cube.ndim == 2:
+            cube = cube[None, :, :]
+        # keep wavenumbers ascending (rest of the app assumes this)
+        if axis.size > 1 and axis[0] > axis[-1]:
+            axis = axis[::-1]
+            cube = cube[:, :, ::-1]
+        self.xdata   = axis
+        self.spectra = cube
+        self.img     = None
+
+    # ── helpers ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _read_lines(path):
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+            return [ln.rstrip("\n\r") for ln in fh]
+
+    @staticmethod
+    def _pick_delim(sample):
+        for d in ("\t", ";", ","):     # tab/semicolon win over comma (EU decimals)
+            if d in sample:
+                return d
+        return None
+
+    @classmethod
+    def _parse(cls, path):
+        raw = cls._read_lines(path)
+
+        # 1) Renishaw named-column long format?  (#Wave + #Intensity header)
+        for i, ln in enumerate(raw):
+            low = ln.lower()
+            if "#wave" in low and "#intensity" in low:
+                return cls._parse_named(raw, i)
+
+        # 2) Plain numeric table (the common cases).
+        return cls._parse_numeric(raw)
+
+    # ── plain numeric tables ────────────────────────────────────────────────
+    @classmethod
+    def _parse_numeric(cls, raw):
+        body = [ln for ln in raw
+                if ln.strip() and not ln.lstrip().startswith(("#", "%"))]
+        if not body:
+            raise RuntimeError("File contains no numeric data.")
+        delim = cls._pick_delim(body[min(len(body) - 1, 5)])
+
+        def split(line):
+            return line.split(delim) if delim else line.split()
+
+        def to_float(tokens):
+            out = []
+            for t in tokens:
+                t = t.strip()
+                if delim != ",":
+                    t = t.replace(",", ".")
+                try:
+                    out.append(float(t))
+                except ValueError:
+                    return None
+            return out
+
+        if to_float(split(body[0])) is None:    # drop a text header line
+            body = body[1:]
+        rows = [v for v in (to_float(split(ln)) for ln in body) if v]
+        if not rows:
+            raise RuntimeError("Could not parse any numeric rows.")
+        width = max(len(r) for r in rows)
+        arr = np.asarray([r for r in rows if len(r) == width], dtype=float)
+
+        if arr.shape[1] == 2:                    # single spectrum: wn, intensity
+            order = np.argsort(arr[:, 0])
+            return arr[order, 0], arr[order, 1]
+        if arr.shape[1] > 2:
+            axis = arr[:, 0]
+            if np.all(np.diff(axis) > 0) or np.all(np.diff(axis) < 0):
+                return axis, arr[:, 1:].T        # spectra in columns
+            return arr[0, :], arr[1:, :]         # else wavenumbers in first row
+        raise RuntimeError("Unrecognised text layout (need ≥2 columns).")
+
+    # ── Renishaw long format (#X #Y #Wave #Intensity) ───────────────────────
+    @classmethod
+    def _parse_named(cls, raw, hdr_idx):
+        header = raw[hdr_idx]
+        names = [t.strip().lstrip("#").lower() for t in header.split()]
+        def idx(name):
+            return names.index(name) if name in names else None
+        wi, ii = idx("wave"), idx("intensity")
+        xi, yi, ti = idx("x"), idx("y"), idx("time")
+        if wi is None or ii is None:
+            raise RuntimeError("Named Renishaw export missing #Wave/#Intensity.")
+
+        rows = []
+        for ln in raw[hdr_idx + 1:]:
+            if not ln.strip() or ln.lstrip().startswith(("#", "%")):
+                continue
+            toks = ln.split()
+            try:
+                rows.append([float(t) for t in toks])
+            except ValueError:
+                continue
+        if not rows:
+            raise RuntimeError("No numeric data rows after the header.")
+        ncol = max(len(r) for r in rows)
+        arr = np.asarray([r for r in rows if len(r) == ncol], dtype=float)
+
+        wave = arr[:, wi]
+        inten = arr[:, ii]
+
+        # build the per-point grouping key
+        if xi is not None and yi is not None:
+            keys = list(zip(arr[:, xi], arr[:, yi]))
+        elif ti is not None:
+            keys = list(zip(arr[:, ti]))
+        else:
+            keys = None
+
+        if keys is None:                          # single spectrum
+            return wave, inten
+
+        # split the long table into one spectrum per (changing) key
+        spectra, axes, cur = [], [], object()
+        buf_w, buf_i = [], []
+        coords = []
+        for k, w, it in zip(keys, wave, inten):
+            if k != cur:
+                if buf_i:
+                    spectra.append(buf_i); axes.append(buf_w); coords.append(cur)
+                cur, buf_w, buf_i = k, [], []
+            buf_w.append(w); buf_i.append(it)
+        if buf_i:
+            spectra.append(buf_i); axes.append(buf_w); coords.append(cur)
+
+        W = min(len(s) for s in spectra)
+        spectra = [s[:W] for s in spectra]
+        axis = np.asarray(axes[0][:W], dtype=float)
+        mat = np.asarray(spectra, dtype=float)    # (n_spectra, W)
+
+        # reshape to a 2-D map when (X, Y) form a regular grid
+        if xi is not None and yi is not None:
+            xs = sorted({c[0] for c in coords})
+            ys = sorted({c[1] for c in coords})
+            if len(xs) * len(ys) == mat.shape[0] and len(xs) > 1 and len(ys) > 1:
+                xpos = {v: j for j, v in enumerate(xs)}
+                ypos = {v: j for j, v in enumerate(ys)}
+                cube = np.zeros((len(ys), len(xs), W), dtype=float)
+                for (cx, cy), spec in zip(coords, mat):
+                    cube[ypos[cy], xpos[cx]] = spec
+                return axis, cube
+        return axis, mat                          # else 1×N×W line/series
+
+
+def _reader_map_shape(r):
+    """Best-effort (rows, cols) map geometry from a reader object.
+
+    Stage X/Y positions are used first because some Renishaw StreamLine maps
+    report a degenerate ``map_shape`` of 1×N (a flat line) even though the data
+    is a true 2-D grid — the real geometry is then only recoverable from the
+    per-spectrum xpos/ypos arrays.
+    """
+    # 1) derive the grid from the stage X/Y position arrays (most reliable)
+    for ax, ay in (("xpos", "ypos"), ("x_pos", "y_pos"),
+                   ("map_xpos", "map_ypos")):
+        xp, yp = getattr(r, ax, None), getattr(r, ay, None)
+        try:
+            if xp is not None and yp is not None:
+                xp = np.round(np.asarray(xp, dtype=float).ravel(), 3)
+                yp = np.round(np.asarray(yp, dtype=float).ravel(), 3)
+                if xp.size == yp.size and xp.size > 1:
+                    nx, ny = np.unique(xp).size, np.unique(yp).size
+                    if nx > 1 and ny > 1 and nx * ny == xp.size:
+                        return ny, nx
+        except Exception:
+            pass
+    # 2) explicit shape attributes — but reject degenerate 1×N "line" shapes
+    for attr in ("map_shape", "map_size", "spatial_shape"):
+        ms = getattr(r, attr, None)
+        if ms is not None:
+            try:
+                a, b = int(ms[0]), int(ms[1])
+                if a > 1 and b > 1:
+                    return a, b
+            except Exception:
+                pass
+    # 3) renishawWiRE per-axis dimension counts
+    for ax, ay in (("map_x", "map_y"), ("ncollected_x", "ncollected_y")):
+        nx, ny = getattr(r, ax, None), getattr(r, ay, None)
+        try:
+            if nx and ny and int(nx) > 1 and int(ny) > 1:
+                return int(ny), int(nx)
+        except Exception:
+            pass
+    return None
+
+
+def _to_cube(spectra, map_shape=None, n_points=None):
+    """Promote any reader's spectra to a Y×X×W cube.
+
+    Uses ``n_points`` (the number of wavenumbers, i.e. len(xdata)) to recover
+    the spectral axis when the backend returns a flattened array:
+
+    1-D (W,)            -> 1×1×W                       (single spectrum)
+    1-D (N*W,)          -> map_shape×W or 1×N×W        (flattened map)
+    2-D (N, W)          -> map_shape×W or 1×N×W
+    2-D (W, N)          -> transposed first if it matches n_points
+    3-D (Y, X, W)       -> unchanged
+    """
+    s = np.asarray(spectra, dtype=float)
+    if s.ndim == 3:
+        return s
+
+    def _shape_NW(N, W, flat):
+        if map_shape is not None:
+            a, b = map_shape
+            if a * b == N:
+                return flat.reshape(a, b, W)
+        return flat.reshape(1, N, W)
+
+    if s.ndim == 2:
+        N, W = s.shape
+        # detect a transposed (W, N) layout using the known wavenumber count
+        if n_points and W != n_points and N == n_points:
+            s = s.T; N, W = s.shape
+        return _shape_NW(N, W, s)
+
+    if s.ndim == 1:
+        if n_points and s.size % n_points == 0 and s.size != n_points:
+            N = s.size // n_points          # flattened map: N pixels × W points
+            return _shape_NW(N, n_points, s.reshape(N, n_points))
+        return s.reshape(1, 1, s.size)      # single spectrum
+
+    raise RuntimeError(f"Unsupported spectra array with {s.ndim} dimensions.")
+
+
+def _cube_from_positions(spectra2d, xp, yp):
+    """Build a Y×X×W cube by assigning each spectrum to its (x, y) stage cell.
+
+    Handles maps where several spectra share a grid position (e.g. depth or
+    repeat acquisitions): collisions at the same cell are averaged. Robust to
+    acquisition order and to a multiplicity factor (count = nx·ny·k).
+    Returns None if the positions do not form a usable 2-D grid.
+    """
+    s = np.asarray(spectra2d, dtype=float)
+    xp = np.round(np.asarray(xp, dtype=float).ravel(), 3)
+    yp = np.round(np.asarray(yp, dtype=float).ravel(), 3)
+    N, W = s.shape
+    if xp.size != N or yp.size != N:
+        return None
+    xs = np.unique(xp); ys = np.unique(yp)
+    nx, ny = xs.size, ys.size
+    if nx < 2 or ny < 2 or nx * ny > N:
+        return None
+    xi = np.searchsorted(xs, xp)
+    yi = np.searchsorted(ys, yp)
+    cube = np.zeros((ny, nx, W), dtype=float)
+    cnt  = np.zeros((ny, nx), dtype=float)
+    np.add.at(cube, (yi, xi), s)
+    np.add.at(cnt,  (yi, xi), 1.0)
+    cnt[cnt == 0] = 1.0
+    cube /= cnt[:, :, None]
+    return cube
+
+
+def _volume_from_positions(spectra2d, xp, yp, zp):
+    """Build a Z×Y×X×W confocal volume from per-spectrum stage positions.
+
+    Returns (volume, zvals, yvals, xvals) or None if the positions do not form
+    a 3-D grid with more than one depth plane.
+    """
+    s = np.asarray(spectra2d, dtype=float)
+    xp = np.round(np.asarray(xp, float).ravel(), 3)
+    yp = np.round(np.asarray(yp, float).ravel(), 3)
+    zp = np.round(np.asarray(zp, float).ravel(), 3)
+    N, W = s.shape
+    if not (xp.size == yp.size == zp.size == N):
+        return None
+    xs, ys, zs = np.unique(xp), np.unique(yp), np.unique(zp)
+    nx, ny, nz = xs.size, ys.size, zs.size
+    if nz < 2 or nx < 2 or ny < 2 or nx * ny * nz > N:
+        return None
+    xi = np.searchsorted(xs, xp)
+    yi = np.searchsorted(ys, yp)
+    zi = np.searchsorted(zs, zp)
+    vol = np.zeros((nz, ny, nx, W), dtype=float)
+    cnt = np.zeros((nz, ny, nx), dtype=float)
+    np.add.at(vol, (zi, yi, xi), s)
+    np.add.at(cnt, (zi, yi, xi), 1.0)
+    cnt[cnt == 0] = 1.0
+    vol /= cnt[:, :, :, None]
+    return vol, zs, ys, xs
+
+
+def _normalise_reader(r):
+    """Ensure a reader object exposes a 3-D ``.spectra`` cube.
+
+    Prefers stage-position gridding (xpos/ypos) so that StreamLine / depth
+    maps — where ``count`` is a multiple of the spatial grid — are folded into
+    the correct Y×X×W shape instead of a flat line. When a depth axis (zpos)
+    with several planes is present, the full Z×Y×X×W confocal volume is also
+    reconstructed and attached as ``r._volume`` (with ``r._zvals``)."""
+    s = np.asarray(getattr(r, "spectra"), dtype=float)
+    try:
+        x = np.asarray(getattr(r, "xdata", None))
+        W = int(x.size) if x is not None and x.ndim >= 1 else None
+    except Exception:
+        W = None
+
+    # 1) position-based gridding (most reliable for real instrument maps)
+    xp, yp = getattr(r, "xpos", None), getattr(r, "ypos", None)
+    if W and xp is not None and yp is not None and s.ndim < 3:
+        try:
+            xp = np.asarray(xp, dtype=float).ravel()
+            yp = np.asarray(yp, dtype=float).ravel()
+            N = xp.size
+            s2 = None
+            if s.ndim == 1 and s.size == N * W:
+                s2 = s.reshape(N, W)
+            elif s.ndim == 2 and s.shape == (N, W):
+                s2 = s
+            elif s.ndim == 2 and s.shape == (W, N):
+                s2 = s.T
+            if s2 is not None:
+                cube = _cube_from_positions(s2, xp, yp)
+                if cube is not None:
+                    # reconstruct the true confocal volume when a depth axis exists
+                    zp = getattr(r, "zpos", None)
+                    if zp is not None:
+                        try:
+                            volpack = _volume_from_positions(s2, xp, yp, zp)
+                            if volpack is not None:
+                                r._volume, r._zvals, r._yvals, r._xvals = volpack
+                        except Exception:
+                            pass
+                    r.spectra = cube
+                    return r
+        except Exception:
+            pass
+
+    # 2) fall back to shape/attribute-based promotion
+    try:
+        r.spectra = _to_cube(s, _reader_map_shape(r), W)
+    except Exception:
+        s2 = np.atleast_2d(s)
+        r.spectra = s2[None, :, :] if s2.ndim == 2 else s2
+    return r
+
+
+def _open_raman_any(path):
+    """Open any supported Raman file, routing by extension.
+
+    Whatever the backend returns, the result is normalised so ``.spectra`` is
+    always a 3-D (Y × X × W) cube — single spectra and line scans are promoted,
+    and 2-D map exports are reshaped using the reader's map geometry."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".wip":
+        return _WITecReader(path)
+    if ext in (".txt", ".csv", ".dpt", ".dat", ".jdx", ".asc"):
+        if HAS_RAMANIO:
+            try:
+                return _normalise_reader(open_raman(path))
+            except Exception:
+                pass
+        return _TextReader(path)
+    if ext == ".wdf":
+        # Prefer the native Renishaw reader: it reconstructs proper 2-D map
+        # cubes (Y×X×W). Fall back to the universal raman_io reader.
+        if HAS_WDF:
+            try:
+                return _normalise_reader(WDFReader(path))
+            except Exception:
+                pass
+        if HAS_RAMANIO:
+            return _normalise_reader(open_raman(path))
+        raise RuntimeError(
+            "Reading .wdf needs renishawWiRE (pip install renishawWiRE) "
+            "or the raman_io package.")
+    if HAS_RAMANIO:
+        return _normalise_reader(open_raman(path))
+    if HAS_WDF:
+        return _normalise_reader(WDFReader(path))
+    raise RuntimeError(f"No reader available for {ext} files.")
+
+
+# RAMANMETRIX-compatible metadata workflow (ZIP + metadata table)
+try:
+    import raman_metadata as rmeta
+    HAS_RMETA = True
+except Exception:
+    HAS_RMETA = False
 
 try:
     from sklearn.decomposition import PCA
@@ -197,6 +750,21 @@ COLORMAPS = ["turbo","viridis","plasma","inferno","magma",
 ZOOM = 3
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PUPAE EXPERIMENT — filename → (diet, temperature) parser
+# Recognises stems like  Con5-1  Gly15-2  Pro5-3  Tre15-1
+# ─────────────────────────────────────────────────────────────────────────────
+import re as _re
+_DIET_MAP = {"con": "Control", "gly": "Glycerol",
+             "pro": "Proline", "tre": "Trehalose"}
+
+def parse_pupae_label(stem):
+    """UNIVERSAL build: factor auto-parsing disabled. Every file keeps its
+    filename stem as its group label; use the 'Set' label box to group files.
+    (See bioraman_pupae.py for the diet/temperature-aware version.)"""
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PREPROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -211,7 +779,7 @@ class PreprocessParams:
     smoothing:        bool  = True
     sg_window:        int   = 11
     sg_poly:          int   = 3
-    normalisation:    str   = "area"   # max|area|none  — area preserves relative band ratios
+    normalisation:    str   = "area"   # max|area|snv|vector|none  — SNV/vector best when CH-stretch dominates
 
 
 def _process_one(args):
@@ -271,6 +839,16 @@ def _process_one(args):
     elif p.normalisation == "area":
         area = float(np.trapz(np.clip(s, 0, None)))
         if area > 0: s /= area
+    elif p.normalisation == "snv":
+        # Standard Normal Variate: (x - mean) / std per spectrum.
+        # Removes multiplicative scaling + additive offset; robust when the
+        # CH-stretch dominates overall intensity.
+        mu = s.mean(); sd = s.std()
+        if sd > 0: s = (s - mu) / sd
+    elif p.normalisation == "vector":
+        # L2 / unit-vector normalisation: x / ||x||
+        nrm = float(np.sqrt(np.sum(s ** 2)))
+        if nrm > 0: s = s / nrm
 
     return idx, s, had_spike
 
@@ -284,6 +862,11 @@ def preprocess_spectrum(s, params=None):
 def preprocess_map(data, params=None, cb=None):
     if params is None: params = PreprocessParams()
     t0 = time.perf_counter()
+    data = np.asarray(data, dtype=float)
+    if data.ndim == 1:          # single spectrum  -> 1×1×W
+        data = data[None, None, :]
+    elif data.ndim == 2:        # line scan (N×W)   -> 1×N×W
+        data = data[None, :, :]
     Y, X, W  = data.shape
     total    = Y * X
     flat     = [(i, data[y, x], params)
@@ -327,6 +910,152 @@ def preprocess_map(data, params=None, cb=None):
         "elapsed_s":        f"{elapsed:.1f}",
     }
     return out, report
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECIPE / EXPORT / BATCH HELPERS  (shared by the GUI and the headless CLI)
+# ─────────────────────────────────────────────────────────────────────────────
+def recipe_to_dict(params):
+    """Serialise a PreprocessParams dataclass to a plain dict."""
+    from dataclasses import asdict
+    return asdict(params)
+
+
+def recipe_from_dict(d):
+    """Build a PreprocessParams from a dict, ignoring unknown keys."""
+    p = PreprocessParams()
+    for k, v in (d or {}).items():
+        if hasattr(p, k):
+            setattr(p, k, v)
+    return p
+
+
+def save_recipe_file(path, params):
+    import json
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"bioraman_recipe_version": 1,
+                   "params": recipe_to_dict(params)}, fh, indent=2)
+
+
+def load_recipe_file(path):
+    import json
+    with open(path, "r", encoding="utf-8") as fh:
+        d = json.load(fh)
+    return recipe_from_dict(d.get("params", d))
+
+
+def write_cube(path, cube, x, report=None, source=""):
+    """Write a preprocessed spectral cube (Y×X×W) + wavenumber axis to disk.
+
+    Format is chosen from the file extension: .npz, .h5/.hdf5, .mat,
+    or ASCII (.csv/.txt/.dpt). Maps are written in the Renishaw long format
+    (#X #Y #Wave #Intensity) so they round-trip through the built-in reader.
+    """
+    cube = np.asarray(cube, dtype=float)
+    x    = np.asarray(x, dtype=float)
+    Y, X, W = cube.shape
+    ext  = os.path.splitext(path)[1].lower()
+    report = report or {}
+
+    if ext == ".npz":
+        np.savez_compressed(
+            path, xdata=x, spectra=cube,
+            report=np.array(list(report.items()), dtype=object),
+            source=str(source or ""))
+
+    elif ext in (".h5", ".hdf5"):
+        try:
+            import h5py
+        except Exception as exc:
+            raise RuntimeError("Saving HDF5 needs h5py (pip install h5py).") from exc
+        with h5py.File(path, "w") as hf:
+            hf.create_dataset("wavenumber", data=x)
+            hf.create_dataset("spectra", data=cube, compression="gzip")
+            hf.attrs["source"] = str(source or "")
+            hf.attrs["map_shape"] = [Y, X]
+            for k, v in report.items():
+                try: hf.attrs[f"report/{k}"] = str(v)
+                except Exception: pass
+
+    elif ext == ".mat":
+        try:
+            from scipy.io import savemat
+        except Exception as exc:
+            raise RuntimeError("Saving .mat needs SciPy (pip install scipy).") from exc
+        savemat(path, {"wavenumber": x, "spectra": cube,
+                       "map_shape": np.array([Y, X], dtype=int),
+                       "source": str(source or "")})
+
+    else:  # ASCII
+        delim = "," if ext == ".csv" else "\t"
+        if Y == 1 and X == 1:
+            np.savetxt(path, np.column_stack((x, cube[0, 0])),
+                       fmt="%.6f", delimiter=delim,
+                       header=f"Raman_Shift(cm-1){delim}Intensity(a.u.)",
+                       comments="")
+        else:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(delim.join(["#X", "#Y", "#Wave", "#Intensity"]) + "\n")
+                for yy in range(Y):
+                    for xx in range(X):
+                        for wn, iv in zip(x, cube[yy, xx]):
+                            fh.write(delim.join((f"{xx}", f"{yy}",
+                                     f"{wn:.6f}", f"{iv:.6f}")) + "\n")
+
+
+def process_file(in_path, params, cb=None):
+    """Open any supported Raman file and apply the preprocessing recipe.
+    Returns (xdata, processed_cube, report)."""
+    r = _open_raman_any(in_path)
+    proc, report = preprocess_map(r.spectra, params, cb)
+    return r.xdata, proc, report
+
+
+def run_batch(in_dir, out_dir, params, out_format=".npz",
+              recursive=False, log=print):
+    """Apply one recipe to every supported file in a folder.
+
+    Writes one processed file per input plus a ``batch_summary.csv``.
+    Returns (n_ok, n_fail).
+    """
+    exts = (".wdf", ".wip", ".spc", ".jdx", ".txt", ".csv", ".dpt", ".dat", ".asc")
+    in_dir, out_dir = Path(in_dir), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = (sorted(in_dir.rglob("*")) if recursive else sorted(in_dir.iterdir()))
+    files = [f for f in files if f.is_file() and f.suffix.lower() in exts]
+
+    summary, n_ok, n_fail = [], 0, 0
+    for i, f in enumerate(files, 1):
+        try:
+            log(f"[{i}/{len(files)}] {f.name}")
+            x, cube, report = process_file(str(f), params)
+            out_path = out_dir / (f.stem + "_processed" + out_format)
+            write_cube(str(out_path), cube, x, report, source=str(f))
+            Y, X, W = cube.shape
+            summary.append({"file": f.name, "status": "ok",
+                            "X": X, "Y": Y, "points": W,
+                            "cosmic_removed": report.get("cosmic_removed", ""),
+                            "output": out_path.name})
+            n_ok += 1
+        except Exception as exc:
+            log(f"    FAILED: {exc}")
+            summary.append({"file": f.name, "status": f"failed: {exc}"})
+            n_fail += 1
+
+    # write summary CSV
+    try:
+        import csv
+        cols = ["file", "status", "X", "Y", "points", "cosmic_removed", "output"]
+        with open(out_dir / "batch_summary.csv", "w", newline="",
+                  encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols)
+            w.writeheader()
+            for row in summary:
+                w.writerow({c: row.get(c, "") for c in cols})
+    except Exception:
+        pass
+    log(f"Done: {n_ok} ok, {n_fail} failed  →  {out_dir}")
+    return n_ok, n_fail
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -722,12 +1451,13 @@ class PCAWindow(tk.Toplevel):
     def __init__(self, parent, pp_params):
         super().__init__(parent)
         self.title("PCA Analysis — Multi-File")
-        self.geometry("1200x780")
+        self.geometry("1650x980")
         self.configure(bg=C["bg"])
         self.pp_params = pp_params
 
         self._files   = []   # list of {"path":..., "label":..., "data":None}
         self._results = None
+        self._seed    = 42   # fixed RNG seed for reproducibility
 
         self._build_ui()
         self._style_ttk()
@@ -775,7 +1505,7 @@ class PCAWindow(tk.Toplevel):
 
         btns = tk.Frame(left, bg=C["sidebar"])
         btns.pack(fill="x", padx=10, pady=2)
-        ttk.Button(btns, text="+ Add WDF",  style="P.TButton",
+        ttk.Button(btns, text="+ Add files",  style="P.TButton",
                    command=self._add_wdf).pack(side="left",  padx=2)
         ttk.Button(btns, text="+ Add XLSX", style="N.TButton",
                    command=self._add_xlsx).pack(side="left", padx=2)
@@ -825,8 +1555,8 @@ class PCAWindow(tk.Toplevel):
         ttk.Spinbox(opts, from_=0, to=10000, textvariable=self._max_spec,
                     width=8).grid(row=3, column=1, padx=8, pady=2)
 
-        self._outlier_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(opts, text="Remove outliers (>2σ)",
+        self._outlier_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(opts, text="Remove outliers (Hotelling T²)",
                        variable=self._outlier_var,
                        bg=C["sidebar"], fg=C["text_mid"],
                        activebackground=C["sidebar"],
@@ -857,6 +1587,14 @@ class PCAWindow(tk.Toplevel):
         # Save button
         ttk.Button(left, text="↓  Save PCA Figure", style="N.TButton",
                    command=self._save_fig).pack(fill="x", padx=10, pady=4)
+        ttk.Button(left, text="↓  Save Panels (publication)", style="N.TButton",
+                   command=self._save_panels).pack(fill="x", padx=10, pady=(0,4))
+        ttk.Button(left, text="◎  Classify (PLS-DA / LDA)", style="N.TButton",
+                   command=self._run_classifier).pack(fill="x", padx=10, pady=(0,4))
+        ttk.Button(left, text="≈  Band-ratio export (CSV)", style="N.TButton",
+                   command=self._export_band_ratios).pack(fill="x", padx=10, pady=(0,4))
+        ttk.Button(left, text="～  Mean spectrum + bands", style="N.TButton",
+                   command=self._show_mean_spectrum).pack(fill="x", padx=10, pady=(0,4))
 
         # PC selector for spatial map
         SectionDiv(left, "SPATIAL SCORE MAP").pack(fill="x")
@@ -874,13 +1612,13 @@ class PCAWindow(tk.Toplevel):
         right = tk.Frame(self, bg=C["bg"])
         right.pack(side="left", fill="both", expand=True)
 
-        self.fig = plt.figure(figsize=(13, 7), facecolor="#ffffff")
+        self.fig = plt.figure(figsize=(17, 9.6), facecolor="#ffffff")
         # 2×3 grid: A B E / C D (E=spatial, last cell hidden if single file)
         import matplotlib.gridspec as gridspec
         gs = gridspec.GridSpec(2, 3, figure=self.fig,
-                               hspace=0.42, wspace=0.38,
-                               left=0.07, right=0.97,
-                               top=0.93, bottom=0.08)
+                               hspace=0.50, wspace=0.30,
+                               left=0.055, right=0.985,
+                               top=0.93, bottom=0.12)
         self.axes = np.array([
             [self.fig.add_subplot(gs[0, 0]),
              self.fig.add_subplot(gs[0, 1]),
@@ -911,19 +1649,26 @@ class PCAWindow(tk.Toplevel):
 
     # ── file management ───────────────────────────────────────────────────────
     def _add_wdf(self):
-        if not HAS_WDF:
+        # Universal: accepts wdf/spc/jdx/dpt/dat/txt/csv … via raman_io
+        if not (HAS_RAMANIO or HAS_WDF):
             messagebox.showerror("Missing library",
-                "renishawWiRE not installed.\npip install renishawWiRE", parent=self)
+                "No reader available.\npip install renishawWiRE  (and spc-spectra "
+                "for .spc files)", parent=self)
             return
         paths = filedialog.askopenfilenames(
-            title="Add WDF map files",
-            filetypes=[("Renishaw WDF","*.wdf"),("All","*.*")],
-            parent=self)
+            title="Add Raman files (any format)",
+            filetypes=SUPPORTED_PATTERNS, parent=self)
         for p in paths:
-            label = Path(p).stem
-            self._files.append({"path":p, "label":label,
-                                 "fmt":"wdf", "data":None})
-            self._listbox.insert("end", f"[WDF]  {label}")
+            stem = Path(p).stem
+            parsed = parse_pupae_label(stem)
+            if parsed:
+                diet, temp, group = parsed
+            else:
+                diet, temp, group = None, None, stem
+            ext = Path(p).suffix.lstrip(".").upper() or "RAMAN"
+            self._files.append({"path":p, "label":group, "diet":diet,
+                                 "temp":temp, "fmt":"raman", "data":None})
+            self._listbox.insert("end", f"[{ext}]  {group}")
 
     def _add_xlsx(self):
         if not HAS_PD:
@@ -935,10 +1680,15 @@ class PCAWindow(tk.Toplevel):
             filetypes=[("Excel XLSX","*.xlsx"),("All","*.*")],
             parent=self)
         for p in paths:
-            label = Path(p).stem
-            self._files.append({"path":p, "label":label,
-                                 "fmt":"xlsx", "data":None})
-            self._listbox.insert("end", f"[XLSX] {label}")
+            stem = Path(p).stem
+            parsed = parse_pupae_label(stem)
+            if parsed:
+                diet, temp, group = parsed
+            else:
+                diet, temp, group = None, None, stem
+            self._files.append({"path":p, "label":group, "diet":diet,
+                                 "temp":temp, "fmt":"xlsx", "data":None})
+            self._listbox.insert("end", f"[XLSX] {group}")
 
     def _remove_selected(self):
         sel = list(self._listbox.curselection())
@@ -965,6 +1715,12 @@ class PCAWindow(tk.Toplevel):
             messagebox.showerror("Missing library",
                 "scikit-learn not installed.\npip install scikit-learn", parent=self)
             return
+        if self.pp_params.baseline_method != "none" and not HAS_PYBL:
+            messagebox.showwarning("Baseline skipped",
+                "pybaselines is not installed — baseline correction will be "
+                "SKIPPED even though it is selected.\n\npip install pybaselines",
+                parent=self)
+        np.random.seed(self._seed)
         self._status_lbl.config(text="Loading and preprocessing…")
         self._prog["value"] = 0
         self.update_idletasks()
@@ -972,8 +1728,10 @@ class PCAWindow(tk.Toplevel):
 
     def _worker(self):
         try:
-            all_X, all_labels, waves_common = self._load_all()
-            self.after(0, lambda: self._finish_pca(all_X, all_labels, waves_common))
+            (all_X, all_labels, waves_common,
+             all_diets, all_temps, all_pupae) = self._load_all()
+            self.after(0, lambda: self._finish_pca(
+                all_X, all_labels, waves_common, all_diets, all_temps, all_pupae))
         except Exception as ex:
             self.after(0, lambda: messagebox.showerror(
                 "Error", str(ex), parent=self))
@@ -985,6 +1743,8 @@ class PCAWindow(tk.Toplevel):
         max_sp = self._max_spec.get()
         params = self.pp_params
         all_X, all_labels = [], []
+        all_diets, all_temps = [], []
+        all_pupae = []   # per-spectrum source-file (pupa) ID for grouped CV
         waves_common = None
         self._spatial_shapes = []   # (label, Y, X) for spatial score map
 
@@ -995,14 +1755,27 @@ class PCAWindow(tk.Toplevel):
                 value=fi/len(self._files)*50))
 
             # ── load raw data ─────────────────────────────────────────────
-            if finfo["fmt"] == "wdf":
-                reader  = WDFReader(finfo["path"])
-                raw     = reader.spectra      # Y×X×W
-                xdata   = reader.xdata
-                Y,X,W   = raw.shape
-                self._spatial_shapes.append((finfo["label"], Y, X))
-                # flatten to N×W
-                raw_flat = raw.reshape(Y*X, W)
+            if finfo["fmt"] in ("wdf", "raman"):
+                reader  = (open_raman(finfo["path"]) if HAS_RAMANIO
+                           else WDFReader(finfo["path"]))
+                raw     = np.asarray(reader.spectra)
+                xdata   = np.asarray(reader.xdata)
+                if raw.ndim == 3:                         # Y×X×W spatial map
+                    Y, X, W = raw.shape
+                    self._spatial_shapes.append((finfo["label"], Y, X))
+                    raw_flat = raw.reshape(Y * X, W)
+                elif raw.ndim == 2:                       # N×W series of spectra
+                    raw_flat = raw
+                    self._spatial_shapes.append((finfo["label"], None, None))
+                else:                                     # single 1-D spectrum
+                    raw_flat = raw.reshape(1, -1)
+                    self._spatial_shapes.append((finfo["label"], None, None))
+                # guard wavenumber axis length / orientation
+                if xdata.ndim != 1 or xdata.shape[0] != raw_flat.shape[1]:
+                    xdata = np.arange(raw_flat.shape[1], dtype=float)
+                if xdata[0] > xdata[-1]:                  # ensure ascending
+                    xdata    = xdata[::-1]
+                    raw_flat = raw_flat[:, ::-1]
             else:
                 # XLSX format: columns #Wave and #Intensity (like the script provided)
                 df      = pd.read_excel(finfo["path"])
@@ -1040,36 +1813,44 @@ class PCAWindow(tk.Toplevel):
                 proc.append(preprocess_spectrum(s, params))
             proc = np.array(proc)
 
+            pupa_id = Path(finfo["path"]).stem
             all_X.extend(proc)
             all_labels.extend([finfo["label"]] * len(proc))
+            all_diets.extend([finfo.get("diet")] * len(proc))
+            all_temps.extend([finfo.get("temp")] * len(proc))
+            all_pupae.extend([pupa_id] * len(proc))
             self.after(0, lambda fi=fi: self._prog.configure(
                 value=50 + fi/len(self._files)*50))
 
-        return np.array(all_X), np.array(all_labels), waves_common
+        return (np.array(all_X), np.array(all_labels), waves_common,
+                np.array(all_diets, dtype=object), np.array(all_temps, dtype=object),
+                np.array(all_pupae, dtype=object))
 
-    def _finish_pca(self, X, labels, waves):
+    def _finish_pca(self, X, labels, waves, diets=None, temps=None, pupae=None):
         self._status_lbl.config(text="Running PCA…")
         self._prog["value"] = 90
 
-        # Outlier removal (per group, >2σ in PC1)
-        if self._outlier_var.get():
-            pca_tmp = PCA(n_components=min(3, X.shape[0], X.shape[1]))
-            sc_tmp  = pca_tmp.fit_transform(X)
-            keep    = np.ones(len(labels), dtype=bool)
-            for g in np.unique(labels):
-                idx = labels == g
-                sc_g = sc_tmp[idx, 0]
-                mu, sigma = sc_g.mean(), sc_g.std()
-                if sigma > 0:
-                    bad = np.abs(sc_g - mu) > 2 * sigma
-                    idx_where = np.where(idx)[0]
-                    keep[idx_where[bad]] = False
-            X      = X[keep]
-            labels = labels[keep]
+        diets = np.array(diets, dtype=object) if diets is not None else None
+        temps = np.array(temps, dtype=object) if temps is not None else None
+        pupae = np.array(pupae, dtype=object) if pupae is not None else None
 
-        # Scale
+        # Scale BEFORE outlier screening so both use the same feature space
         if self._scale_var.get():
             X = StandardScaler().fit_transform(X)
+
+        # Outlier removal — Hotelling T² across the first k PCs (95% χ² limit)
+        if self._outlier_var.get() and X.shape[0] > 5:
+            from scipy.stats import chi2
+            k = int(min(self._n_comp.get(), X.shape[0] - 1, X.shape[1]))
+            sc_tmp = PCA(n_components=k).fit_transform(X)
+            sd = sc_tmp.std(axis=0, ddof=1)
+            sd[sd == 0] = 1.0
+            t2   = np.sum((sc_tmp / sd) ** 2, axis=1)
+            keep = t2 <= chi2.ppf(0.975, df=k)
+            X = X[keep]; labels = labels[keep]
+            if diets is not None: diets = diets[keep]
+            if temps is not None: temps = temps[keep]
+            if pupae is not None: pupae = pupae[keep]
 
         n_comp = min(self._n_comp.get(), X.shape[0], X.shape[1])
         pca    = PCA(n_components=n_comp)
@@ -1080,6 +1861,7 @@ class PCAWindow(tk.Toplevel):
         self._results = {
             "pca": pca, "scores": scores, "labels": labels,
             "waves": waves, "expl": expl, "loads": loads, "X": X,
+            "diets": diets, "temps": temps, "pupae": pupae,
             "spatial_shapes": getattr(self, "_spatial_shapes", []),
         }
 
@@ -1108,27 +1890,63 @@ class PCAWindow(tk.Toplevel):
 
         # ── A: Scores PC1 vs PC2 ─────────────────────────────────────────────
         ax = self.axes[0, 0]
-        for g in groups:
-            idx = labels == g
-            x, y = scores[idx, 0], scores[idx, 1]
-            col  = color_map[g]
-            ax.scatter(x, y, s=60, color=col, alpha=0.75, label=g, zorder=3)
-            if idx.sum() >= 3:
+        diets = r.get("diets"); temps = r.get("temps")
+        use_factor = (diets is not None and temps is not None
+                      and any(d is not None for d in diets))
+
+        def _draw_ellipse(x, y, col):
+            if len(x) >= 3:
                 cov = np.cov(x, y)
                 ev, evec = np.linalg.eigh(cov)
-                ev   = np.maximum(ev, 0)
-                ang  = np.degrees(np.arctan2(*evec[:, 1][::-1]))
-                ell  = Ellipse((x.mean(), y.mean()),
-                               2*np.sqrt(ev[0])*2, 2*np.sqrt(ev[1])*2,
-                               angle=ang, edgecolor=col,
-                               facecolor=col, alpha=0.12, lw=1.5)
-                ax.add_patch(ell)
+                ev  = np.maximum(ev, 0)
+                ang = np.degrees(np.arctan2(*evec[:, 1][::-1]))
+                ax.add_patch(Ellipse((x.mean(), y.mean()),
+                             4*np.sqrt(ev[0]), 4*np.sqrt(ev[1]),
+                             angle=ang, edgecolor=col, facecolor=col,
+                             alpha=0.12, lw=1.5))
+
+        if use_factor:
+            from matplotlib.lines import Line2D
+            diet_order = ["Control", "Glycerol", "Proline", "Trehalose"]
+            uniq_diet  = [d for d in diet_order if d in set(diets)]
+            uniq_diet += [d for d in sorted(set(map(str, diets)))
+                          if d not in uniq_diet and d != "None"]
+            diet_col = {d: self.COLORS[i % len(self.COLORS)]
+                        for i, d in enumerate(uniq_diet)}
+            temp_marker = {"5°C": "o", "15°C": "^"}
+            uniq_temp   = [t for t in ["5°C", "15°C"] if t in set(temps)]
+            for d in uniq_diet:
+                for t in uniq_temp:
+                    idx = np.array([(dd == d and tt == t)
+                                    for dd, tt in zip(diets, temps)])
+                    if not idx.any():
+                        continue
+                    x, y = scores[idx, 0], scores[idx, 1]
+                    ax.scatter(x, y, s=34, color=diet_col[d],
+                               marker=temp_marker.get(t, "s"), alpha=0.55,
+                               edgecolor="white", linewidth=0.35, zorder=3)
+                    _draw_ellipse(x, y, diet_col[d])
+            # Defer legends to the empty 6th panel so they never cover data
+            self._legend_handles = (
+                [mpatches.Patch(color=diet_col[d], label=d) for d in uniq_diet],
+                [Line2D([0], [0], marker=temp_marker.get(t, "s"),
+                        color="#444444", linestyle="none", markersize=9,
+                        label=t) for t in uniq_temp])
+        else:
+            for g in groups:
+                idx = labels == g
+                x, y = scores[idx, 0], scores[idx, 1]
+                col  = color_map[g]
+                ax.scatter(x, y, s=60, color=col, alpha=0.75, label=g, zorder=3)
+                _draw_ellipse(x, y, col)
+            self._legend_handles = (
+                [mpatches.Patch(color=color_map[g], label=str(g))
+                 for g in groups], [])
         ax.axhline(0, color=C["border"], lw=0.7)
         ax.axvline(0, color=C["border"], lw=0.7)
         ax.set_xlabel(f"PC1  ({expl[0]*100:.1f}%)", fontsize=10)
         ax.set_ylabel(f"PC2  ({expl[1]*100:.1f}%)", fontsize=10)
         ax.set_title("A: PCA Scores (PC1 vs PC2)", fontsize=11, fontweight="semibold")
-        ax.legend(fontsize=9, framealpha=0.9)
         ax.grid(True, ls="--", lw=0.4, alpha=0.5)
 
         # ── B: Loadings — colour-coded positive/negative ──────────────────────
@@ -1246,7 +2064,7 @@ class PCAWindow(tk.Toplevel):
             ax.scatter(np.full(len(sc), gi) + jitter, sc,
                        color=col, alpha=0.6, s=20, zorder=3)
         ax.set_xticks(range(len(groups)))
-        ax.set_xticklabels(groups, fontsize=9)
+        ax.set_xticklabels(groups, fontsize=8, rotation=35, ha="right")
         ax.set_ylabel(f"{pc_lbl} score", fontsize=10)
         ax.set_title(f"C: {pc_lbl} Score Distribution",
                      fontsize=11, fontweight="semibold")
@@ -1267,8 +2085,23 @@ class PCAWindow(tk.Toplevel):
         ax.legend(fontsize=9)
         ax.grid(True, ls="--", lw=0.4, alpha=0.5)
 
-        # hide unused 6th panel
-        self.axes[1, 2].set_visible(False)
+        # ── 6th panel → dedicated legend area (never overlaps data) ───────────
+        lax = self.axes[1, 2]
+        lax.clear()
+        lax.set_visible(True)
+        lax.axis("off")
+        diet_h, temp_h = getattr(self, "_legend_handles", ([], []))
+        if diet_h:
+            leg1 = lax.legend(handles=diet_h, title="Diet", fontsize=10,
+                              title_fontsize=11, loc="upper left",
+                              bbox_to_anchor=(0.0, 1.0), framealpha=0.95,
+                              borderpad=0.6, labelspacing=0.5)
+            lax.add_artist(leg1)
+        if temp_h:
+            lax.legend(handles=temp_h, title="Temperature", fontsize=10,
+                       title_fontsize=11, loc="upper left",
+                       bbox_to_anchor=(0.0, 0.55), framealpha=0.95,
+                       borderpad=0.6, labelspacing=0.5)
 
         self.canvas.draw_idle()
 
@@ -1276,6 +2109,462 @@ class PCAWindow(tk.Toplevel):
         """Called when PC selector spinbox changes — redraw all panels."""
         if self._results is not None:
             self._draw_pca()
+
+    # ── one-click mean spectrum + Raman band annotation ───────────────────────
+    # Standard biological Raman band library (cm⁻¹, label, assignment)
+    _BAND_LIB = [
+        (480,  "480",  "Carbohydrate / trehalose (C–O–C, ring)"),
+        (855,  "855",  "Proline / C–C, tyrosine ring"),
+        (937,  "937",  "C–C backbone (proline, protein)"),
+        (1004, "1004", "Phenylalanine ring breathing (protein ref)"),
+        (1080, "1080", "C–C / C–O (lipid chain, carbohydrate)"),
+        (1265, "1265", "=C–H deformation (unsat. lipid) / amide III"),
+        (1300, "1300", "CH₂ twist (lipid acyl chains)"),
+        (1440, "1440", "CH₂/CH₃ deformation (lipid + protein)"),
+        (1656, "1656", "Amide I / C=C stretch (protein, unsat.)"),
+        (1745, "1745", "C=O ester (triglyceride)"),
+        (2850, "2850", "CH₂ sym stretch (lipid)"),
+        (2885, "2885", "CH₂ asym stretch (lipid order)"),
+        (2930, "2930", "CH₃ stretch (protein/lipid)"),
+    ]
+
+    def _show_mean_spectrum(self):
+        """Plot mean ± SD spectrum per group with annotated Raman bands.
+        Lets the user see where real signal lies before choosing cutoffs."""
+        if self._results is None:
+            messagebox.showwarning("No results",
+                "Run PCA first (loads + preprocesses the spectra).", parent=self)
+            return
+        r = self._results
+        waves = np.asarray(r["waves"], dtype=float)
+        X = np.asarray(r["X"]); labels = np.asarray(r["labels"])
+        groups = np.unique(labels)
+        color_map = {g: self.COLORS[i % len(self.COLORS)]
+                     for i, g in enumerate(groups)}
+
+        win = tk.Toplevel(self)
+        win.title("Mean spectrum + Raman band annotation")
+        win.geometry("1150x680")
+        win.configure(bg=C["bg"])
+
+        fig = plt.figure(figsize=(12, 6.4), facecolor="#ffffff")
+        ax = fig.add_subplot(111)
+
+        ymax = 0.0
+        for g in groups:
+            idx = labels == g
+            mu = X[idx].mean(axis=0)
+            sd = X[idx].std(axis=0)
+            col = color_map[g]
+            ax.plot(waves, mu, color=col, lw=1.3, label=f"{g} (n={int(idx.sum())})",
+                    zorder=3)
+            ax.fill_between(waves, mu - sd, mu + sd, color=col, alpha=0.15, zorder=2)
+            ymax = max(ymax, float(np.nanmax(mu + sd)))
+
+        # annotate standard bands that fall inside the measured range
+        wlo, whi = float(waves.min()), float(waves.max())
+        for wn, lbl, _assign in self._BAND_LIB:
+            if wlo < wn < whi:
+                ax.axvline(wn, ls=":", color=C["text_dim"], lw=0.7, zorder=1)
+                ax.text(wn, ymax * 1.01, lbl, rotation=90, fontsize=7,
+                        ha="center", va="bottom", color=C["text_mid"])
+
+        # shade the non-informative "silent" region 1800–2700 if present
+        if wlo < 1800 and whi > 2700:
+            ax.axvspan(1800, 2700, color="#bbbbbb", alpha=0.12, zorder=0)
+            ax.text((1800 + 2700) / 2, ymax * 0.5, "silent region\n(noise only)",
+                    ha="center", va="center", fontsize=8, color=C["text_dim"],
+                    style="italic")
+
+        ax.set_xlabel("Raman Shift  (cm⁻¹)", fontsize=11)
+        ax.set_ylabel("Normalised intensity (mean ± SD)", fontsize=11)
+        ax.set_title("Group mean spectra with biological Raman band assignments",
+                     fontsize=12, fontweight="semibold")
+        ax.legend(fontsize=8, framealpha=0.9, ncol=2)
+        ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+        ax.margins(x=0.01)
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, win).update()
+
+        bar = tk.Frame(win, bg=C["bg"]); bar.pack(fill="x", pady=4)
+        info = tk.Label(bar, bg=C["bg"], fg=C["text_mid"], font=("Segoe UI", 9),
+                        text=("Tip: use this to pick Wavenumber min/max. "
+                              "Fingerprint 600–1800 = primary; CH-stretch 2800–3030 "
+                              "= separate run; skip the shaded silent region."))
+        info.pack(side="left", padx=8)
+
+        def _save():
+            p = filedialog.asksaveasfilename(
+                defaultextension=".pdf",
+                filetypes=[("PDF", "*.pdf"), ("PNG", "*.png"), ("SVG", "*.svg")],
+                parent=win)
+            if p:
+                fig.savefig(p, dpi=600, bbox_inches="tight")
+        ttk.Button(bar, text="↓ Save figure", style="N.TButton",
+                   command=_save).pack(side="right", padx=8)
+        self._mean_fig = fig
+
+    # ── supervised classification: PLS-DA / LDA with cross-validation ──────────
+    def _run_classifier(self):
+        if self._results is None:
+            messagebox.showwarning("No results", "Run PCA first.", parent=self)
+            return
+        try:
+            from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+            from sklearn.cross_decomposition import PLSRegression
+            from sklearn.model_selection import (StratifiedKFold, GroupKFold,
+                                                 cross_val_predict)
+            from sklearn.preprocessing import LabelBinarizer
+            from sklearn.metrics import (accuracy_score, confusion_matrix,
+                                         balanced_accuracy_score)
+        except Exception as ex:
+            messagebox.showerror("Missing library",
+                                 f"scikit-learn required.\n{ex}", parent=self)
+            return
+
+        r = self._results
+        X = np.asarray(r["X"]); y = np.asarray(r["labels"])
+        classes = np.unique(y)
+        if len(classes) < 2:
+            messagebox.showwarning("Classification",
+                "Need at least 2 groups.", parent=self)
+            return
+        # smallest class size sets the CV fold count (cap at 5)
+        min_n = min(int(np.sum(y == c)) for c in classes)
+        if min_n < 2:
+            messagebox.showwarning("Classification",
+                "Each group needs ≥2 spectra for cross-validation.", parent=self)
+            return
+        n_splits = int(min(5, min_n))
+
+        # ── pupa-grouped CV: keep all spectra from one pupa in the same fold ──
+        groups = r.get("pupae")
+        use_groups = groups is not None and len(np.unique(groups)) >= 2
+        if use_groups:
+            groups = np.asarray(groups)
+            # need ≥2 pupae per class, and folds ≤ min pupae-per-class
+            per_class_pupae = [len(np.unique(groups[y == c])) for c in classes]
+            if min(per_class_pupae) >= 2:
+                n_splits = int(min(n_splits, min(per_class_pupae)))
+            else:
+                use_groups = False   # not enough pupae per group → fall back
+        cv_kind = ("pupa-grouped" if use_groups else "spectrum-level")
+
+        win = tk.Toplevel(self)
+        win.title("Supervised Classification — PLS-DA / LDA")
+        win.geometry("1150x560")
+        win.configure(bg=C["bg"])
+
+        method = (self._clf_method.get()
+                  if hasattr(self, "_clf_method") else "PLS-DA")
+        def _make_cv(seed):
+            if use_groups:
+                return GroupKFold(n_splits=n_splits)
+            return StratifiedKFold(n_splits=n_splits, shuffle=True,
+                                   random_state=seed)
+        cv = _make_cv(self._seed)
+        cv_groups = groups if use_groups else None
+
+        # ── ask how many permutations (heavy step) — 0 to skip ────────────────
+        from tkinter import simpledialog
+        n_spec = X.shape[0]
+        suggested = 100 if n_spec <= 3000 else (50 if n_spec <= 8000 else 0)
+        n_perm = simpledialog.askinteger(
+            "Permutation test",
+            (f"{n_spec} spectra loaded.\n\n"
+             "How many label permutations for the significance test?\n"
+             "  • 0   = skip (fast — accuracy + confusion matrix only)\n"
+             "  • 100 = recommended\n"
+             "  • 200 = thorough (slower)\n\n"
+             "The test now runs in the background; you can keep using the app."),
+            parent=self, minvalue=0, maxvalue=1000, initialvalue=suggested)
+        if n_perm is None:
+            return   # user cancelled
+
+        # ── progress / cancel window ──────────────────────────────────────────
+        win = tk.Toplevel(self)
+        win.title("Supervised Classification — PLS-DA / LDA")
+        win.geometry("1150x600")
+        win.configure(bg=C["bg"])
+        status = tk.Label(win, text="Running cross-validation…",
+                          bg=C["bg"], fg=C["text_hi"], font=("Segoe UI", 11))
+        status.pack(pady=8)
+        prog = ttk.Progressbar(win, mode="determinate", maximum=100)
+        prog.pack(fill="x", padx=20, pady=4)
+        cancel_evt = threading.Event()
+        ttk.Button(win, text="Cancel", style="D.TButton",
+                   command=cancel_evt.set).pack(pady=4)
+
+        def _set_status(txt, pct=None):
+            self.after(0, lambda: status.config(text=txt))
+            if pct is not None:
+                self.after(0, lambda: prog.configure(value=pct))
+
+        def _compute():
+            results = {}
+            try:
+                lb = LabelBinarizer()
+                Yfull = lb.fit_transform(y)
+                if Yfull.shape[1] == 1:
+                    Yfull = np.hstack([1 - Yfull, Yfull])
+                n_comp = int(min(self._n_comp.get(), X.shape[1],
+                                 max(2, len(classes))))
+                ug = np.unique(groups) if use_groups else None
+                total_steps = 2 * (1 + n_perm)
+                step = [0]
+                def _tick(label):
+                    step[0] += 1
+                    _set_status(label, 100.0 * step[0] / max(1, total_steps))
+
+                for name in ("PLS-DA", "LDA"):
+                    if cancel_evt.is_set():
+                        return
+                    def fit(yv, cvv):
+                        if name == "PLS-DA":
+                            Yv = lb.fit_transform(yv)
+                            if Yv.shape[1] == 1:
+                                Yv = np.hstack([1 - Yv, Yv])
+                            Yh = cross_val_predict(
+                                PLSRegression(n_components=n_comp), X, Yv,
+                                cv=cvv, groups=cv_groups)
+                            if len(classes) > 2:
+                                return np.array(classes)[np.argmax(Yh, axis=1)]
+                            return lb.classes_[(Yh[:, 1] > Yh[:, 0]).astype(int)]
+                        return cross_val_predict(
+                            LinearDiscriminantAnalysis(), X, yv,
+                            cv=cvv, groups=cv_groups)
+
+                    _tick(f"{name}: observed fit…")
+                    pred = fit(y, cv)
+                    bacc_obs = balanced_accuracy_score(y, pred)
+                    res = {
+                        "pred": pred,
+                        "acc": accuracy_score(y, pred),
+                        "bacc": bacc_obs,
+                        "cm": confusion_matrix(y, pred, labels=classes),
+                    }
+                    if n_perm > 0:
+                        rng = np.random.default_rng(self._seed)
+                        null = np.empty(n_perm)
+                        for pi in range(n_perm):
+                            if cancel_evt.is_set():
+                                return
+                            if use_groups:
+                                glabel = {g: y[groups == g][0] for g in ug}
+                                permvals = rng.permutation(list(glabel.values()))
+                                gmap = dict(zip(ug, permvals))
+                                yp = np.array([gmap[g] for g in groups],
+                                              dtype=object)
+                            else:
+                                yp = rng.permutation(y)
+                            null[pi] = balanced_accuracy_score(
+                                yp, fit(yp, _make_cv(int(rng.integers(1e9)))))
+                            if pi % 5 == 0 or pi == n_perm - 1:
+                                _tick(f"{name}: permutation {pi+1}/{n_perm}…")
+                        res["p_perm"] = float((np.sum(null >= bacc_obs) + 1)
+                                              / (n_perm + 1))
+                        res["null_mean"] = float(null.mean())
+                        res["n_perm"] = n_perm
+                    results[name] = res
+            except Exception as ex:
+                results["__error__"] = str(ex)
+            if not cancel_evt.is_set():
+                self.after(0, lambda: _draw_results(results))
+
+        def _draw_results(results):
+            if "__error__" in results:
+                status.config(text=f"Error: {results['__error__']}",
+                              fg=C["danger"])
+                prog.destroy(); return
+            status.destroy(); prog.destroy()
+            self._render_clf(win, results, classes, n_splits, cv_kind)
+
+        threading.Thread(target=_compute, daemon=True).start()
+        return
+
+    def _render_clf(self, win, results, classes, n_splits, cv_kind):
+        fig = plt.figure(figsize=(11.5, 5.2), facecolor="#ffffff")
+        axes = [fig.add_subplot(1, 2, i + 1) for i in range(2)]
+        for ax, name in zip(axes, ("PLS-DA", "LDA")):
+            res = results.get(name, {})
+            if "error" in res:
+                ax.text(0.5, 0.5, f"{name}\nfailed:\n{res['error']}",
+                        ha="center", va="center", transform=ax.transAxes,
+                        fontsize=9, color=C["danger"]); ax.axis("off"); continue
+            cm = res["cm"]
+            cmn = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
+            im = ax.imshow(cmn, cmap="Blues", vmin=0, vmax=1)
+            ax.set_xticks(range(len(classes)))
+            ax.set_yticks(range(len(classes)))
+            ax.set_xticklabels(classes, rotation=40, ha="right", fontsize=7)
+            ax.set_yticklabels(classes, fontsize=7)
+            for i in range(len(classes)):
+                for j in range(len(classes)):
+                    ax.text(j, i, f"{cm[i, j]}",
+                            ha="center", va="center", fontsize=7,
+                            color="white" if cmn[i, j] > 0.5 else "#222")
+            ax.set_xlabel("Predicted", fontsize=9)
+            ax.set_ylabel("True", fontsize=9)
+            pstr = ""
+            if "p_perm" in res:
+                pv = res["p_perm"]
+                ptxt = f"p<{1.0/(res['n_perm']+1):.3f}" if pv <= 1.0/(res['n_perm']+1) \
+                    else f"p={pv:.3f}"
+                pstr = (f"\nperm. test ({res['n_perm']}×): {ptxt}  "
+                        f"(null={res['null_mean']*100:.1f}%)")
+            ax.set_title(f"{name}\n{n_splits}-fold {cv_kind} CV  ·  "
+                         f"acc={res['acc']*100:.1f}%  ·  "
+                         f"balanced={res['bacc']*100:.1f}%" + pstr,
+                         fontsize=9, fontweight="semibold")
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, win).update()
+        self._clf_fig = fig
+        self._clf_results = (results, classes, n_splits)
+
+        bar = tk.Frame(win, bg=C["bg"]); bar.pack(fill="x", pady=4)
+        def _save_clf():
+            p = filedialog.asksaveasfilename(
+                defaultextension=".pdf",
+                filetypes=[("PDF", "*.pdf"), ("PNG", "*.png")], parent=win)
+            if p:
+                fig.savefig(p, dpi=600, bbox_inches="tight")
+        def _save_clf_csv():
+            p = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV", "*.csv")], parent=win)
+            if not p:
+                return
+            with open(p, "w", encoding="utf-8") as fh:
+                for name in ("PLS-DA", "LDA"):
+                    res = results.get(name, {})
+                    if "error" in res:
+                        fh.write(f"{name},error,{res['error']}\n\n"); continue
+                    fh.write(f"{name},{n_splits}-fold {cv_kind} CV,"
+                             f"accuracy={res['acc']:.4f},"
+                             f"balanced_accuracy={res['bacc']:.4f}")
+                    if "p_perm" in res:
+                        fh.write(f",permutation_p={res['p_perm']:.4f},"
+                                 f"n_permutations={res['n_perm']},"
+                                 f"null_mean_balanced_acc={res['null_mean']:.4f}")
+                    fh.write("\n")
+                    fh.write("true\\pred," + ",".join(map(str, classes)) + "\n")
+                    for i, c in enumerate(classes):
+                        fh.write(str(c) + "," +
+                                 ",".join(map(str, res["cm"][i])) + "\n")
+                    fh.write("\n")
+        ttk.Button(bar, text="↓ Save figure", style="N.TButton",
+                   command=_save_clf).pack(side="left", padx=8)
+        ttk.Button(bar, text="↓ Save confusion CSV", style="N.TButton",
+                   command=_save_clf_csv).pack(side="left", padx=4)
+
+    # ── automated diagnostic band-ratio export ────────────────────────────────
+    def _export_band_ratios(self):
+        if self._results is None:
+            messagebox.showwarning("No results", "Run PCA first.", parent=self)
+            return
+        r = self._results
+        waves = np.asarray(r["waves"])
+        X = np.asarray(r["X"]); labels = np.asarray(r["labels"])
+        diets = r.get("diets"); temps = r.get("temps")
+
+        def band(w_lo, w_hi):
+            m = (waves >= w_lo) & (waves <= w_hi)
+            if not m.any():
+                return np.full(X.shape[0], np.nan)
+            return np.trapz(np.clip(X[:, m], 0, None), waves[m], axis=1)
+
+        # Diagnostic windows (cm⁻¹) — standard biological Raman assignments
+        I2850 = band(2840, 2860)   # CH2 sym str (lipid acyl chains)
+        I2885 = band(2875, 2900)   # CH2 asym str
+        I1656 = band(1640, 1680)   # C=C / amide I (unsaturation + protein)
+        I1440 = band(1430, 1460)   # CH2/CH3 deformation (total lipid+protein)
+        I1004 = band(995, 1010)    # phenylalanine ring-breathing (protein marker)
+        Ilip  = band(2840, 2900)   # total CH-stretch lipid envelope
+        Iprot = band(1640, 1680)   # amide I (protein)
+        Icarb = band(470, 560)     # carbohydrate / trehalose-rich region
+        eps = 1e-12
+        ratios = {
+            "Lipid_order_2850_2885":   I2850 / (I2885 + eps),
+            "Unsaturation_1656_1440":  I1656 / (I1440 + eps),
+            "Protein_lipid_1004_2850": I1004 / (I2850 + eps),
+            "Amide_lipid_1656_2850":   Iprot / (Ilip + eps),
+            "Carb_protein_500_1004":   Icarb / (I1004 + eps),
+        }
+
+        outdir = filedialog.askdirectory(
+            title="Choose folder for band-ratio outputs", parent=self)
+        if not outdir:
+            return
+        # ── CSV (per-spectrum) ────────────────────────────────────────────────
+        csv_path = os.path.join(outdir, "band_ratios_per_spectrum.csv")
+        cols = list(ratios.keys())
+        with open(csv_path, "w", encoding="utf-8") as fh:
+            hdr = ["index", "group", "diet", "temperature"] + cols
+            fh.write(",".join(hdr) + "\n")
+            for i in range(X.shape[0]):
+                d = (diets[i] if diets is not None else "")
+                t = (temps[i] if temps is not None else "")
+                row = [str(i), str(labels[i]), str(d), str(t)] + \
+                      [f"{ratios[c][i]:.6f}" for c in cols]
+                fh.write(",".join(row) + "\n")
+
+        # ── CSV (per-group summary mean ± SD) ─────────────────────────────────
+        groups = np.unique(labels)
+        sum_path = os.path.join(outdir, "band_ratios_group_summary.csv")
+        with open(sum_path, "w", encoding="utf-8") as fh:
+            fh.write("group,n," +
+                     ",".join([f"{c}_mean,{c}_sd" for c in cols]) + "\n")
+            for g in groups:
+                idx = labels == g
+                cells = [str(g), str(int(idx.sum()))]
+                for c in cols:
+                    v = ratios[c][idx]
+                    cells += [f"{np.nanmean(v):.6f}", f"{np.nanstd(v):.6f}"]
+                fh.write(",".join(cells) + "\n")
+
+        # ── boxplot figure ────────────────────────────────────────────────────
+        ncols = len(cols)
+        fig, axs = plt.subplots(1, ncols, figsize=(3.4 * ncols, 4.6),
+                                facecolor="#ffffff")
+        if ncols == 1:
+            axs = [axs]
+        palette = {g: self.COLORS[i % len(self.COLORS)]
+                   for i, g in enumerate(groups)}
+        for ax, c in zip(axs, cols):
+            data = [ratios[c][labels == g] for g in groups]
+            bp = ax.boxplot(data, patch_artist=True, widths=0.6)
+            for patch, g in zip(bp["boxes"], groups):
+                patch.set_facecolor(palette[g]); patch.set_alpha(0.35)
+            for med in bp["medians"]:
+                med.set_color("#222"); med.set_linewidth(1.5)
+            for gi, g in enumerate(groups):
+                v = ratios[c][labels == g]
+                jit = np.random.uniform(-0.12, 0.12, len(v))
+                ax.scatter(np.full(len(v), gi + 1) + jit, v,
+                           color=palette[g], s=10, alpha=0.5, zorder=3)
+            ax.set_xticks(range(1, len(groups) + 1))
+            ax.set_xticklabels(groups, rotation=40, ha="right", fontsize=7)
+            ax.set_title(c.replace("_", " "), fontsize=9, fontweight="semibold")
+            ax.grid(True, axis="y", ls="--", lw=0.4, alpha=0.5)
+        fig.tight_layout()
+        fig_path = os.path.join(outdir, "band_ratios_boxplots.pdf")
+        fig.savefig(fig_path, bbox_inches="tight")
+        png_path = os.path.join(outdir, "band_ratios_boxplots.png")
+        fig.savefig(png_path, dpi=600, bbox_inches="tight")
+        plt.close(fig)
+
+        self._status_lbl.config(
+            text=f"Band ratios → {Path(outdir).name}  "
+                 f"(per-spectrum + summary CSV + boxplots)")
+        messagebox.showinfo("Band-ratio export",
+            "Saved:\n• band_ratios_per_spectrum.csv\n"
+            "• band_ratios_group_summary.csv\n"
+            "• band_ratios_boxplots.pdf / .png", parent=self)
 
     def _save_fig(self):
         if self._results is None:
@@ -1286,8 +2575,221 @@ class PCAWindow(tk.Toplevel):
             filetypes=[("PDF","*.pdf"),("PNG","*.png"),("SVG","*.svg")],
             parent=self)
         if path:
-            self.fig.savefig(path, dpi=300, bbox_inches="tight")
+            self.fig.savefig(path, dpi=600, bbox_inches="tight")
             self._status_lbl.config(text=f"Saved → {Path(path).name}")
+
+    def _save_panels(self):
+        """Export each PCA panel as a standalone publication-quality file."""
+        if self._results is None:
+            messagebox.showwarning("No results", "Run PCA first.", parent=self)
+            return
+        outdir = filedialog.askdirectory(
+            title="Choose folder for individual panels", parent=self)
+        if not outdir:
+            return
+        ans = messagebox.askyesno(
+            "File format",
+            "Save as PDF (vector, best for publication)?\n\n"
+            "Yes = PDF   ·   No = PNG (600 dpi).", parent=self)
+        ext = ".pdf" if ans else ".png"
+        kinds = [("A_scores_PC1_PC2", "scores"),
+                 ("B_loadings",       "loadings"),
+                 ("C_score_distribution", "dist"),
+                 ("D_explained_variance", "scree"),
+                 ("E_spatial_score_map",  "spatial")]
+        saved = 0
+        for nm, kind in kinds:
+            try:
+                fig = self._render_single_panel(kind)
+                if fig is None:
+                    continue
+                fname = os.path.join(outdir, f"PCA_{nm}{ext}")
+                if ext == ".pdf":
+                    fig.savefig(fname, bbox_inches="tight")
+                else:
+                    fig.savefig(fname, dpi=600, bbox_inches="tight")
+                plt.close(fig)
+                saved += 1
+            except Exception as ex:
+                messagebox.showerror("Save error", f"{nm}: {ex}", parent=self)
+        self._status_lbl.config(
+            text=f"Saved {saved} panels ({ext}) → {Path(outdir).name}")
+
+    def _render_single_panel(self, kind):
+        """Build a clean standalone figure for one panel (publication quality).
+        Legends sit OUTSIDE the axes so they never overlap the data."""
+        r = self._results
+        if r is None:
+            return None
+        scores = r["scores"]; labels = r["labels"]
+        waves  = r["waves"];  expl = r["expl"]; loads = r["loads"]
+        groups = np.unique(labels)
+        color_map = {g: self.COLORS[i % len(self.COLORS)]
+                     for i, g in enumerate(groups)}
+        pc_idx = min(self._pc_sel.get() - 1, scores.shape[1] - 1)
+        pc_lbl = f"PC{pc_idx + 1}"
+
+        def _ellipse(ax, x, y, col):
+            if len(x) >= 3:
+                cov = np.cov(x, y)
+                ev, evec = np.linalg.eigh(cov)
+                ev = np.maximum(ev, 0)
+                ang = np.degrees(np.arctan2(*evec[:, 1][::-1]))
+                ax.add_patch(Ellipse((x.mean(), y.mean()),
+                             4*np.sqrt(ev[0]), 4*np.sqrt(ev[1]),
+                             angle=ang, edgecolor=col, facecolor=col,
+                             alpha=0.12, lw=1.5))
+
+        if kind == "scores":
+            fig, ax = plt.subplots(figsize=(8.5, 6.5))
+            diets = r.get("diets"); temps = r.get("temps")
+            use_factor = (diets is not None and temps is not None
+                          and any(d is not None for d in diets))
+            if use_factor:
+                from matplotlib.lines import Line2D
+                diet_order = ["Control", "Glycerol", "Proline", "Trehalose"]
+                uniq_diet  = [d for d in diet_order if d in set(diets)]
+                uniq_diet += [d for d in sorted(set(map(str, diets)))
+                              if d not in uniq_diet and d != "None"]
+                diet_col = {d: self.COLORS[i % len(self.COLORS)]
+                            for i, d in enumerate(uniq_diet)}
+                temp_marker = {"5°C": "o", "15°C": "^"}
+                uniq_temp = [t for t in ["5°C", "15°C"] if t in set(temps)]
+                for d in uniq_diet:
+                    for t in uniq_temp:
+                        idx = np.array([(dd == d and tt == t)
+                                        for dd, tt in zip(diets, temps)])
+                        if not idx.any():
+                            continue
+                        x, y = scores[idx, 0], scores[idx, 1]
+                        ax.scatter(x, y, s=34, color=diet_col[d],
+                                   marker=temp_marker.get(t, "s"), alpha=0.55,
+                                   edgecolor="white", linewidth=0.35, zorder=3)
+                        _ellipse(ax, x, y, diet_col[d])
+                diet_handles = [mpatches.Patch(color=diet_col[d], label=d)
+                                for d in uniq_diet]
+                temp_handles = [Line2D([0], [0], marker=temp_marker.get(t, "s"),
+                                color="#444444", linestyle="none", markersize=8,
+                                label=t) for t in uniq_temp]
+                # legends OUTSIDE the axes, stacked on the right
+                leg1 = ax.legend(handles=diet_handles, title="Diet",
+                                 fontsize=10, title_fontsize=10.5,
+                                 loc="upper left", bbox_to_anchor=(1.02, 1.0),
+                                 framealpha=0.95, borderaxespad=0)
+                ax.add_artist(leg1)
+                ax.legend(handles=temp_handles, title="Temperature",
+                          fontsize=10, title_fontsize=10.5,
+                          loc="upper left", bbox_to_anchor=(1.02, 0.55),
+                          framealpha=0.95, borderaxespad=0)
+            else:
+                for g in groups:
+                    idx = labels == g
+                    x, y = scores[idx, 0], scores[idx, 1]
+                    ax.scatter(x, y, s=34, color=color_map[g], alpha=0.6,
+                               edgecolor="white", linewidth=0.35,
+                               label=g, zorder=3)
+                    _ellipse(ax, x, y, color_map[g])
+                ax.legend(fontsize=9, loc="upper left",
+                          bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+            ax.axhline(0, color=C["border"], lw=0.7)
+            ax.axvline(0, color=C["border"], lw=0.7)
+            ax.set_xlabel(f"PC1  ({expl[0]*100:.1f}%)", fontsize=12)
+            ax.set_ylabel(f"PC2  ({expl[1]*100:.1f}%)", fontsize=12)
+            ax.set_title("PCA Scores (PC1 vs PC2)", fontsize=13,
+                         fontweight="semibold")
+            ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+
+        elif kind == "loadings":
+            fig, ax = plt.subplots(figsize=(9, 5.5))
+            ld = loads[pc_idx]
+            ax.fill_between(waves, ld, 0, where=ld >= 0, alpha=0.55,
+                            color=C["accent"], label="Positive")
+            ax.fill_between(waves, ld, 0, where=ld < 0, alpha=0.55,
+                            color=C["danger"], label="Negative")
+            ax.plot(waves, ld, color="#222222", lw=0.8, alpha=0.7)
+            ax.axhline(0, color=C["border"], lw=0.9)
+            ax.set_xlabel("Raman Shift  (cm⁻¹)", fontsize=12)
+            ax.set_ylabel("Loading weight", fontsize=12)
+            ax.set_title(f"{pc_lbl} Loadings", fontsize=13, fontweight="semibold")
+            ax.legend(fontsize=10, loc="upper left",
+                      bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+            ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+            ylim = ax.get_ylim()
+            for wn, bl in [(1000,"Ring"),(1300,"CH₂"),(1450,"CH"),
+                           (1650,"C=O"),(2850,"CH₂"),(3000,"CH")]:
+                if waves.min() < wn < waves.max():
+                    ax.axvline(wn, ls=":", color=C["text_dim"], lw=0.8)
+                    ax.text(wn, ylim[1]*0.85, bl, fontsize=8,
+                            color=C["text_dim"], rotation=90, ha="right", va="top")
+
+        elif kind == "dist":
+            fig, ax = plt.subplots(figsize=(8.5, 6))
+            for gi, g in enumerate(groups):
+                idx = labels == g
+                sc = scores[idx, pc_idx]; col = color_map[g]
+                ax.boxplot(sc, positions=[gi], widths=0.4, patch_artist=True,
+                           boxprops=dict(facecolor=col, alpha=0.3),
+                           medianprops=dict(color=col, lw=2),
+                           whiskerprops=dict(color=col),
+                           capprops=dict(color=col),
+                           flierprops=dict(marker="o", color=col, ms=4, alpha=0.5))
+                jit = np.random.uniform(-0.15, 0.15, len(sc))
+                ax.scatter(np.full(len(sc), gi) + jit, sc, color=col,
+                           alpha=0.6, s=20, zorder=3)
+            ax.set_xticks(range(len(groups)))
+            ax.set_xticklabels(groups, fontsize=9, rotation=35, ha="right")
+            ax.set_ylabel(f"{pc_lbl} score", fontsize=12)
+            ax.set_title(f"{pc_lbl} Score Distribution", fontsize=13,
+                         fontweight="semibold")
+            ax.grid(True, axis="y", ls="--", lw=0.4, alpha=0.5)
+
+        elif kind == "scree":
+            fig, ax = plt.subplots(figsize=(8, 5.5))
+            n = len(expl)
+            ax.bar(range(1, n+1), expl*100, color=C["accent"], alpha=0.8)
+            ax.plot(range(1, n+1), np.cumsum(expl)*100, "o-",
+                    color=C["danger"], lw=1.5, ms=5, label="Cumulative")
+            ax.axhline(90, ls="--", color=C["text_dim"], lw=0.8)
+            ax.set_xlabel("Principal Component", fontsize=12)
+            ax.set_ylabel("Explained Variance  (%)", fontsize=12)
+            ax.set_title("Explained Variance (Scree)", fontsize=13,
+                         fontweight="semibold")
+            ax.set_xticks(range(1, n+1))
+            ax.legend(fontsize=10)
+            ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+
+        elif kind == "spatial":
+            spatial_shapes = r.get("spatial_shapes", [])
+            shape_info = next(((lbl, Y, X) for lbl, Y, X in spatial_shapes
+                               if Y is not None and X is not None), None)
+            if shape_info is None:
+                return None
+            lbl_sp, Y_sp, X_sp = shape_info
+            idx_sp = labels == lbl_sp
+            sc_sp = scores[idx_sp, pc_idx]
+            if len(sc_sp) != Y_sp * X_sp:
+                return None
+            fig, ax = plt.subplots(figsize=(7, 6))
+            score_map = sc_sp.reshape(Y_sp, X_sp)
+            norm_map = np.zeros_like(score_map, dtype=float)
+            pos = score_map[score_map > 0]; neg = score_map[score_map < 0]
+            if pos.size: norm_map[score_map > 0] = score_map[score_map > 0]/pos.max()
+            if neg.size: norm_map[score_map < 0] = score_map[score_map < 0]/abs(neg.min())
+            vmin, vmax = norm_map.min(), norm_map.max()
+            cnorm = (TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+                     if vmin < 0 < vmax else Normalize(vmin=vmin, vmax=vmax))
+            im = ax.imshow(norm_map, cmap="RdBu_r", norm=cnorm,
+                           origin="upper", interpolation="nearest", aspect="equal")
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("Score (norm. ±1)", fontsize=10)
+            ax.set_xlabel("X (px)", fontsize=12); ax.set_ylabel("Y (px)", fontsize=12)
+            ax.set_title(f"{pc_lbl} Spatial Scores\n{lbl_sp}", fontsize=13,
+                         fontweight="semibold")
+        else:
+            return None
+
+        fig.tight_layout()
+        return fig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1296,7 +2798,7 @@ class PCAWindow(tk.Toplevel):
 class RamanApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("BioRaman  —  Raman Hyperspectral Map Analysis for Biophysics  (v0.8.0)")
+        self.title(f"BioRaman  —  Raman Hyperspectral Map Analysis for Biophysics  (v{__version__})")
         self.geometry("1380x820")
         self.minsize(1100, 660)
         self.configure(bg=C["bg"])
@@ -1380,11 +2882,22 @@ class RamanApp(tk.Tk):
         fm = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
                      activebackground=C["accent"], activeforeground="white")
         mb.add_cascade(label="File", menu=fm)
-        fm.add_command(label="Open WDF…        Ctrl+O", command=self.load_file)
+        fm.add_command(label="Open Raman file (WDF/WIP/…)   Ctrl+O", command=self.load_file)
         fm.add_command(label="Load White-Light…",       command=self.load_wl)
+        fm.add_separator()
+        fm.add_command(label="📦 RAMANMETRIX Dataset (ZIP + metadata)…",
+                       command=self.open_metrix_dataset)
         fm.add_separator()
         fm.add_command(label="Save Map…        Ctrl+M", command=self.save_map)
         fm.add_command(label="Save Spectrum…   Ctrl+S", command=self.save_spectrum)
+        fm.add_command(label="Save Processed Data…   Ctrl+Shift+S",
+                       command=self.save_processed)
+        fm.add_command(label="📂 Batch Process Folder…", command=self.open_batch)
+        fm.add_command(label="📝 Save Analysis Report (HTML)…",
+                       command=self.save_report)
+        fm.add_separator()
+        fm.add_command(label="💾 Save Session…",  command=self.save_session)
+        fm.add_command(label="📤 Load Session…",  command=self.load_session)
         fm.add_separator()
         fm.add_command(label="Exit",                    command=self.destroy)
 
@@ -1403,12 +2916,21 @@ class RamanApp(tk.Tk):
         mb.add_cascade(label="Preprocessing", menu=pm)
         pm.add_command(label="⚙  Settings…",        command=self.open_pp_settings)
         pm.add_command(label="📋  Processing Log…",  command=self.show_pp_report)
+        pm.add_separator()
+        pm.add_command(label="🔁  Reprocess (apply recipe to raw)",
+                       command=self.reprocess)
+        pm.add_command(label="💾  Save Recipe…",     command=self.save_recipe)
+        pm.add_command(label="📥  Load Recipe…",     command=self.load_recipe)
+        pm.add_separator()
+        pm.add_command(label="✓  Quality Control Maps…", command=self.open_qc_map)
 
         am = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
                      activebackground=C["accent"], activeforeground="white")
         mb.add_cascade(label="Analysis", menu=am)
         am.add_command(label="◈  PCA Analysis…",         command=self.open_pca)
         am.add_command(label="🧊  3D Volume Viewer…",     command=self.open_3d_viewer)
+        am.add_command(label="✨  Publication Volume (Plotly)…",
+                       command=self.open_volume_render)
         am.add_separator()
         am.add_command(label="⬡  Cluster Analysis…",     command=self.open_clustering)
         am.add_command(label="⟠  MCR-ALS…",              command=self.open_mcr)
@@ -1468,7 +2990,7 @@ class RamanApp(tk.Tk):
         row2_actions.pack(side="left", fill="x", expand=True)
 
         actions = [
-            ("⊕ Open WDF",      self.load_file,              "Primary.TButton"),
+            ("⊕ Open file",     self.load_file,              "Primary.TButton"),
             ("⚙ Preprocess",   self.open_pp_settings,       "Neutral.TButton"),
             ("⊞ White Light",   self.load_wl,                "Neutral.TButton"),
             ("◈ PCA",          self.open_pca,               "Neutral.TButton"),
@@ -1484,8 +3006,12 @@ class RamanApp(tk.Tk):
             ("⟠ MCR-ALS",      self.open_mcr,               "Neutral.TButton"),
             ("◉ N-FINDR",      self.open_nfindr,            "Neutral.TButton"),
             ("⚒ Spectral Tools",self.open_spectral_tools,   "Neutral.TButton"),
+            ("✓ QC Maps",       self.open_qc_map,            "Neutral.TButton"),
+            ("✨ HQ Volume",    self.open_volume_render,     "Neutral.TButton"),
+            ("📂 Batch",        self.open_batch,             "Neutral.TButton"),
             ("↓ Save Map",      self.save_map,               "Neutral.TButton"),
             ("↓ Save Spec",     self.save_spectrum,          "Neutral.TButton"),
+            ("💾 Save Processed",self.save_processed,         "Neutral.TButton"),
         ]
 
         split = (len(actions) + 1) // 2
@@ -1761,6 +3287,8 @@ class RamanApp(tk.Tk):
     def _bind_keys(self):
         self.bind("<Control-o>", lambda _: self.load_file())
         self.bind("<Control-s>", lambda _: self.save_spectrum())
+        self.bind("<Control-S>", lambda _: self.save_processed())
+        self.bind("<Control-Shift-S>", lambda _: self.save_processed())
         self.bind("<Control-m>", lambda _: self.save_map())
         self.bind("<Escape>",    lambda _: self._cancel_roi())
 
@@ -2491,22 +4019,219 @@ class RamanApp(tk.Tk):
 
     # ── file loading ──────────────────────────────────────────────────────────
 
-    def load_file(self):
-        if not HAS_WDF:
-            messagebox.showerror("Missing library",
-                "renishawWiRE not installed.\npip install renishawWiRE")
+    # ── RAMANMETRIX dataset (ZIP + metadata) ──────────────────────────────────
+    def open_metrix_dataset(self):
+        """Import a RAMANMETRIX-style ZIP (spectra + metadata table) and/or
+        generate a metadata template for it.
+
+        Implements the conventions documented at
+        https://docs.ramanmetrix.eu/documentation/Data.html
+        (Providing Metadata → Generate metadata template / Metadata Table).
+        """
+        if not HAS_RMETA:
+            messagebox.showerror(
+                "Unavailable",
+                "raman_metadata.py could not be imported.\n"
+                "Make sure it sits next to bioraman.py.", parent=self)
             return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("RAMANMETRIX Dataset — ZIP + Metadata")
+        dlg.geometry("860x620")
+        dlg.configure(bg=C["bg"])
+        dlg.grab_set()
+
+        hdr = tk.Frame(dlg, bg=C["header"], height=48)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="📦  RAMANMETRIX DATASET",
+                 bg=C["header"], fg="white",
+                 font=("Consolas", 13, "bold")).pack(side="left", padx=16, pady=12)
+
+        # state
+        state = {"zip": None, "spectra": [], "meta_files": [], "resolved": {}}
+
+        top = tk.Frame(dlg, bg=C["bg"]); top.pack(fill="x", padx=16, pady=(12, 4))
+        zip_var = tk.StringVar(value="No ZIP selected.")
+        tk.Label(top, textvariable=zip_var, bg=C["bg"], fg=C["text_mid"],
+                 font=("Segoe UI", 10), anchor="w").pack(side="left", fill="x", expand=True)
+
+        # options
+        opt = tk.Frame(dlg, bg=C["bg"]); opt.pack(fill="x", padx=16, pady=4)
+        colset = tk.StringVar(value="full")
+        kind   = tk.StringVar(value="auto")
+        tk.Label(opt, text="Columns:", bg=C["bg"], fg=C["text_mid"],
+                 font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Radiobutton(opt, text="Full default set", variable=colset, value="full",
+                       bg=C["bg"]).grid(row=0, column=1, sticky="w", padx=6)
+        tk.Radiobutton(opt, text="Core columns", variable=colset, value="core",
+                       bg=C["bg"]).grid(row=0, column=2, sticky="w", padx=6)
+        tk.Label(opt, text="Template:", bg=C["bg"], fg=C["text_mid"],
+                 font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky="w")
+        for i, (lbl, val) in enumerate([("Auto", "auto"), ("Long (per file)", "long"),
+                                        ("Short (per folder)", "short")]):
+            tk.Radiobutton(opt, text=lbl, variable=kind, value=val,
+                           bg=C["bg"]).grid(row=1, column=1 + i, sticky="w", padx=6)
+
+        # table
+        tbl_frame = tk.Frame(dlg, bg=C["bg"]); tbl_frame.pack(fill="both", expand=True,
+                                                              padx=16, pady=8)
+        cols = ("file", "type", "batch", "date", "device", "standard", "include")
+        tree = ttk.Treeview(tbl_frame, columns=cols, show="headings", height=14)
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=110 if c != "file" else 280, anchor="w")
+        vsb = ttk.Scrollbar(tbl_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        status = tk.StringVar(value="Select a ZIP archive to begin.")
+        tk.Label(dlg, textvariable=status, bg=C["bg"], fg=C["text_mid"],
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=16)
+
+        def _refresh_table(mapping):
+            tree.delete(*tree.get_children())
+            for path in state["spectra"]:
+                m = mapping.get(path, {})
+                tree.insert("", "end", values=(
+                    path,
+                    m.get("type", ""), m.get("batch", ""), m.get("date", ""),
+                    m.get("device", ""),
+                    m.get("standard", ""), m.get("include", "")))
+
+        def _select_zip():
+            p = filedialog.askopenfilename(
+                title="Select dataset ZIP", filetypes=[("ZIP archive", "*.zip")],
+                parent=dlg)
+            if not p:
+                return
+            try:
+                state["zip"] = p
+                state["spectra"] = rmeta.list_spectra_in_zip(p)
+                state["meta_files"] = rmeta.list_metadata_in_zip(p)
+            except Exception as exc:
+                messagebox.showerror("ZIP error", str(exc), parent=dlg); return
+            zip_var.set(Path(p).name)
+            # show inferred labels immediately (folder-structure parsing)
+            inferred = {sp: rmeta.infer_from_path(sp) for sp in state["spectra"]}
+            state["resolved"] = inferred
+            _refresh_table(inferred)
+            status.set(f"{len(state['spectra'])} spectra · "
+                       f"{len(state['meta_files'])} metadata file(s) detected"
+                       + (f": {', '.join(state['meta_files'])}"
+                          if state["meta_files"] else " — labels inferred from folders."))
+
+        def _apply_metadata():
+            if not state["zip"]:
+                messagebox.showwarning("No ZIP", "Select a ZIP first.", parent=dlg); return
+            if not state["meta_files"]:
+                messagebox.showinfo(
+                    "No metadata file",
+                    "No 'metadata' CSV/XLSX found inside the ZIP.\n"
+                    "Showing labels inferred from the folder structure instead.",
+                    parent=dlg)
+                return
+            all_rows = []
+            for mf in state["meta_files"]:
+                try:
+                    all_rows.extend(rmeta.read_metadata_from_zip(state["zip"], mf))
+                except Exception as exc:
+                    messagebox.showerror("Metadata error",
+                                         f"{mf}: {exc}", parent=dlg); return
+            resolved = rmeta.match_metadata(state["spectra"], all_rows)
+            # merge folder-structure inference as a base layer, metadata wins
+            merged = {}
+            for sp in state["spectra"]:
+                base = dict(rmeta.infer_from_path(sp))
+                if sp in resolved:
+                    base.update({k: v for k, v in resolved[sp].items()})
+                    merged[sp] = base
+                # spectra excluded by include=False are dropped from `resolved`
+                elif not any((sp == _norm_key(r.get("file", r.get("path", "")))
+                              or sp.startswith(_norm_key(r.get("file", r.get("path", "")))))
+                             and rmeta._coerce_bool(r.get("include", True)) is False
+                             for r in all_rows):
+                    merged[sp] = base
+            state["resolved"] = merged
+            _refresh_table(merged)
+            self._metrix_dataset = {"zip": state["zip"], "metadata": merged}
+            status.set(f"Applied metadata · {len(merged)} spectra included "
+                       f"(of {len(state['spectra'])}).")
+
+        def _norm_key(k):
+            return str(k).replace("\\", "/").lstrip("./").lstrip("/") if k else ""
+
+        def _generate_template():
+            if not state["spectra"]:
+                messagebox.showwarning("No data",
+                                       "Select a ZIP with spectra first.", parent=dlg)
+                return
+            columns = rmeta.DEFAULT_COLUMNS if colset.get() == "full" else rmeta.CORE_COLUMNS
+            cols2, rows = rmeta.generate_template(
+                state["spectra"], columns=columns, kind=kind.get())
+            out = filedialog.asksaveasfilename(
+                title="Save metadata template", defaultextension=".csv",
+                initialfile="metadata_template.csv",
+                filetypes=[("CSV", "*.csv")], parent=dlg)
+            if not out:
+                return
+            rmeta.write_template_csv(cols2, rows, out)
+            status.set(f"Template written: {Path(out).name} ({len(rows)} rows).")
+            messagebox.showinfo("Template saved",
+                                f"Metadata template saved to:\n{out}\n\n"
+                                f"{len(rows)} rows · {kind.get()} layout.",
+                                parent=dlg)
+
+        def _load_selected():
+            sel = tree.focus()
+            if not sel:
+                messagebox.showinfo("Select a row",
+                                    "Pick a spectrum row to load into the viewer.",
+                                    parent=dlg); return
+            member = tree.item(sel, "values")[0]
+            if member.endswith("/") or "*" in member:
+                messagebox.showinfo("Not a file",
+                                    "This row is a folder pattern, not a single file.",
+                                    parent=dlg); return
+            try:
+                import tempfile, zipfile as _zf
+                with _zf.ZipFile(state["zip"]) as z:
+                    raw = z.read(member)
+                suffix = os.path.splitext(member)[1] or ".txt"
+                tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                tf.write(raw); tf.close()
+                dlg.destroy()
+                self._load_path(tf.name, display_name=member)
+            except Exception as exc:
+                messagebox.showerror("Load error", str(exc), parent=dlg)
+
+        btns = tk.Frame(dlg, bg=C["bg"]); btns.pack(fill="x", padx=16, pady=12)
+        ttk.Button(top, text="📂 Select ZIP…", command=_select_zip).pack(side="right")
+        ttk.Button(btns, text="🧬 Apply metadata", command=_apply_metadata
+                   ).pack(side="left", padx=4)
+        ttk.Button(btns, text="📝 Generate template CSV…", command=_generate_template
+                   ).pack(side="left", padx=4)
+        ttk.Button(btns, text="📈 Load selected spectrum", command=_load_selected
+                   ).pack(side="left", padx=4)
+        ttk.Button(btns, text="Close", command=dlg.destroy).pack(side="right", padx=4)
+
+    def load_file(self):
         path = filedialog.askopenfilename(
-            title="Open Raman Map File",
-            filetypes=[("Renishaw WDF","*.wdf"),("All files","*.*")])
+            title="Open Raman File (any format)",
+            filetypes=SUPPORTED_PATTERNS)
         if not path: return
-        self._status.set(f"Loading  {Path(path).name}…")
+        self._load_path(path)
+
+    def _load_path(self, path, display_name=None):
+        """Load a single spectrum/map file by path (reused by the dataset dialog)."""
+        label = display_name or Path(path).name
+        self._status.set(f"Loading  {label}…")
         self._show_progress(True)
         self.progress["value"] = 0
         self.update_idletasks()
 
         def worker():
-            r = WDFReader(path)
+            r = _open_raman_any(path)
 
             # Try to extract embedded white-light microscope image (if present)
             wl_raw = None
@@ -2526,6 +4251,12 @@ class RamanApp(tk.Tk):
                 wl_raw = None
 
             params = self.pp_params
+            # Retain the raw cube so preprocessing can be re-tuned without a reload
+            self._raw_spectra = np.asarray(r.spectra, dtype=float)
+            self._raw_xdata   = np.asarray(r.xdata,   dtype=float)
+            # Retain the true confocal volume (Z×Y×X×W) when present
+            self._volume = getattr(r, "_volume", None)
+            self._zvals  = getattr(r, "_zvals", None)
             def cb(f):
                 self.after(0, lambda: self.progress.configure(value=f*100))
             proc, report = preprocess_map(r.spectra, params, cb)
@@ -2537,6 +4268,7 @@ class RamanApp(tk.Tk):
         self.xdata   = xdata
         self.spectra = spectra
         self.pp_report = report
+        self._loaded_path = path
         self.coords  = (0, 0)
         self._show_progress(False)
 
@@ -2891,8 +4623,8 @@ class RamanApp(tk.Tk):
         nm_var = tk.StringVar(value=p.normalisation)
         row(c5,"Method",
             lambda f: ttk.Combobox(f, textvariable=nm_var, width=10,
-                state="readonly", values=["max","area","none"]))
-        tk.Label(c5, text="  max: peak  ·  area: total integrated  ·  none: raw",
+                state="readonly", values=["max","area","snv","vector","none"]))
+        tk.Label(c5, text="  area/max: ratio  ·  snv/vector: removes CH-stretch dominance  ·  none: raw",
                  bg=C["panel"], fg=C["text_dim"],
                  font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(0,6))
 
@@ -4686,6 +6418,272 @@ class RamanApp(tk.Tk):
                    fmt="%.6f", header="Raman_Shift(cm-1)  Intensity(a.u.)")
         self._status.set(f"Spectrum saved  →  {Path(path).name}")
 
+    def save_processed(self):
+        """Export the *preprocessed* spectral cube (baseline-corrected, smoothed,
+        normalised, cosmic-ray-cleaned) together with the wavenumber axis.
+
+        Re-loadable output formats:
+          • .npz  — compressed NumPy archive (xdata, spectra cube, report);
+                    recommended, lossless, fast to reload.
+          • .txt / .csv / .dpt — ASCII table.  Maps are written in the Renishaw
+                    long format (#X #Y #Wave #Intensity) so they round-trip back
+                    through the built-in text reader; single spectra are written
+                    as two columns (wavenumber, intensity).
+          • .h5   — HDF5 dataset (requires h5py).
+          • .mat  — MATLAB v5 file (requires SciPy).
+
+        Note: the original instrument container (.wdf / .wip / .spc) is a
+        proprietary binary format and cannot be rewritten; the processed data is
+        therefore exported to the open formats above.
+        """
+        if self.spectra is None:
+            messagebox.showwarning("No data", "Load a file first."); return
+
+        stem = "processed"
+        src = getattr(self, "_loaded_path", None)
+        if src:
+            stem = Path(src).stem + "_processed"
+        path = filedialog.asksaveasfilename(
+            title="Save Preprocessed Data",
+            initialfile=stem,
+            defaultextension=".npz",
+            filetypes=[("NumPy archive", "*.npz"),
+                       ("HDF5", "*.h5"),
+                       ("CSV", "*.csv"),
+                       ("Text", "*.txt"),
+                       ("DPT", "*.dpt"),
+                       ("MATLAB", "*.mat")])
+        if not path:
+            return
+
+        cube = np.asarray(self.spectra, dtype=float)   # Y × X × W
+        Y, X, W = cube.shape
+        report = getattr(self, "pp_report", {}) or {}
+        try:
+            write_cube(path, cube, self.xdata, report, source=str(src or ""))
+        except Exception as exc:
+            messagebox.showerror("Save failed",
+                                 f"Could not save processed data:\n{exc}")
+            return
+
+        self._status.set(
+            f"Processed data saved  →  {Path(path).name}  "
+            f"({X}×{Y}×{W})")
+
+    # ── v13: recipes, reprocess, QC, batch, report, session ────────────────────
+    def save_recipe(self):
+        """Save the current preprocessing parameters to a JSON recipe file."""
+        path = filedialog.asksaveasfilename(
+            title="Save Preprocessing Recipe",
+            initialfile="recipe", defaultextension=".json",
+            filetypes=[("JSON recipe", "*.json")])
+        if not path:
+            return
+        try:
+            save_recipe_file(path, self.pp_params)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc)); return
+        self._status.set(f"Recipe saved  →  {Path(path).name}")
+
+    def load_recipe(self):
+        """Load preprocessing parameters from a JSON recipe and offer to reapply."""
+        path = filedialog.askopenfilename(
+            title="Load Preprocessing Recipe",
+            filetypes=[("JSON recipe", "*.json"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            self.pp_params = load_recipe_file(path)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc)); return
+        self._status.set(f"Recipe loaded  →  {Path(path).name}")
+        if getattr(self, "_raw_spectra", None) is not None and messagebox.askyesno(
+                "Reprocess", "Re-apply the loaded recipe to the current data now?"):
+            self.reprocess()
+
+    def reprocess(self):
+        """Re-run preprocessing on the retained raw cube (no disk reload)."""
+        raw = getattr(self, "_raw_spectra", None)
+        if raw is None:
+            messagebox.showwarning(
+                "No raw data",
+                "Load a file first (raw data is kept only for files loaded "
+                "in this session)."); return
+        self._status.set("Reprocessing…")
+        self._show_progress(True); self.progress["value"] = 0
+        self.update_idletasks()
+
+        def worker():
+            params = self.pp_params
+            def cb(f):
+                self.after(0, lambda: self.progress.configure(value=f*100))
+            proc, report = preprocess_map(raw, params, cb)
+            xdata = getattr(self, "_raw_xdata", self.xdata)
+            path = getattr(self, "_loaded_path", "reprocessed")
+            self.after(0, lambda: self._finish_load(
+                xdata, proc, report, path, None))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_qc_map(self):
+        """Show per-pixel quality-control maps (SNR, total intensity,
+        saturation, cosmic-affected pixels)."""
+        if self.spectra is None:
+            messagebox.showwarning("No data", "Load a file first."); return
+        QCMapWindow(self)
+
+    def open_volume_render(self):
+        """Publication-quality translucent volume rendering (Plotly) of a
+        depth-resolved confocal Raman dataset."""
+        vol = getattr(self, "_volume", None)
+        if vol is None:
+            messagebox.showinfo(
+                "No 3-D volume",
+                "This file is a single 2-D map, not a depth-resolved volume, "
+                "so there is no real Z axis to render.\n\n"
+                "The publication volume renderer needs a confocal volume "
+                "(a file with multiple Z planes) or a loaded Z-stack.")
+            return
+        VolumeRenderWindow(self, vol, getattr(self, "_zvals", None), self.xdata)
+
+    def open_batch(self):
+        """Open the batch-processing dialog (apply current recipe to a folder)."""
+        BatchWindow(self)
+
+    def save_report(self):
+        """Write a self-contained HTML report of the current map + recipe."""
+        if self.spectra is None:
+            messagebox.showwarning("No data", "Load a file first."); return
+        stem = "report"
+        src = getattr(self, "_loaded_path", None)
+        if src:
+            stem = Path(src).stem + "_report"
+        path = filedialog.asksaveasfilename(
+            title="Save Analysis Report", initialfile=stem,
+            defaultextension=".html", filetypes=[("HTML report", "*.html")])
+        if not path:
+            return
+        try:
+            self._write_html_report(path)
+        except Exception as exc:
+            messagebox.showerror("Report failed", str(exc)); return
+        self._status.set(f"Report saved  →  {Path(path).name}")
+
+    def _fig_to_b64(self, fig):
+        import io, base64
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _write_html_report(self, path):
+        import html as _html, datetime
+        cube = np.asarray(self.spectra, dtype=float)
+        Y, X, W = cube.shape
+        x = np.asarray(self.xdata, dtype=float)
+
+        # map image (mean intensity)
+        fig1 = plt.figure(figsize=(5, 4))
+        ax1 = fig1.add_subplot(111)
+        ax1.imshow(cube.mean(axis=2), cmap=self.cmap_var.get(), origin="upper")
+        ax1.set_title("Mean intensity map"); ax1.set_xlabel("X"); ax1.set_ylabel("Y")
+        img_map = self._fig_to_b64(fig1)
+
+        # mean spectrum +/- std
+        fig2 = plt.figure(figsize=(6, 3.2))
+        ax2 = fig2.add_subplot(111)
+        flat = cube.reshape(-1, W)
+        mu, sd = flat.mean(0), flat.std(0)
+        ax2.plot(x, mu, color="#2b6cff", lw=1.2)
+        ax2.fill_between(x, mu - sd, mu + sd, color="#2b6cff", alpha=0.2)
+        ax2.set_xlabel("Raman shift (cm⁻¹)"); ax2.set_ylabel("Intensity (a.u.)")
+        ax2.set_title("Mean spectrum ± 1 SD")
+        img_spec = self._fig_to_b64(fig2)
+
+        rec = recipe_to_dict(self.pp_params)
+        rec_rows = "".join(
+            f"<tr><td>{_html.escape(str(k))}</td>"
+            f"<td>{_html.escape(str(v))}</td></tr>" for k, v in rec.items())
+        report = getattr(self, "pp_report", {}) or {}
+        rep_rows = "".join(
+            f"<tr><td>{_html.escape(str(k))}</td>"
+            f"<td>{_html.escape(str(v))}</td></tr>" for k, v in report.items())
+        src = _html.escape(str(getattr(self, "_loaded_path", "—")))
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        doc = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>BioRaman report</title><style>
+body{{font-family:Segoe UI,Arial,sans-serif;margin:32px;color:#1b2333;max-width:900px}}
+h1{{color:#2b6cff}} h2{{border-bottom:1px solid #dde;padding-bottom:4px;margin-top:28px}}
+table{{border-collapse:collapse;margin:8px 0}} td{{border:1px solid #dde;padding:4px 10px}}
+td:first-child{{color:#556;font-weight:600}} img{{max-width:100%;border:1px solid #eee;border-radius:6px}}
+.small{{color:#889;font-size:13px}}</style></head><body>
+<h1>BioRaman Analysis Report</h1>
+<p class="small">Generated {now} · BioRaman v{__version__}</p>
+<table><tr><td>Source file</td><td>{src}</td></tr>
+<tr><td>Map size</td><td>{X} × {Y} pixels</td></tr>
+<tr><td>Spectral points</td><td>{W}</td></tr>
+<tr><td>Range</td><td>{x[0]:.0f} – {x[-1]:.0f} cm⁻¹</td></tr></table>
+<h2>Mean intensity map</h2><img src="data:image/png;base64,{img_map}">
+<h2>Mean spectrum</h2><img src="data:image/png;base64,{img_spec}">
+<h2>Preprocessing recipe</h2><table>{rec_rows}</table>
+<h2>Processing log</h2><table>{rep_rows}</table>
+</body></html>"""
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(doc)
+
+    def save_session(self):
+        """Save a lightweight session (source path + recipe + view settings)."""
+        import json
+        path = filedialog.asksaveasfilename(
+            title="Save Session", initialfile="session",
+            defaultextension=".bioses", filetypes=[("BioRaman session", "*.bioses")])
+        if not path:
+            return
+        sess = {
+            "bioraman_session_version": 1,
+            "source": str(getattr(self, "_loaded_path", "") or ""),
+            "recipe": recipe_to_dict(self.pp_params),
+            "cmap": self.cmap_var.get(),
+            "normalise_view": bool(self._norm_var.get()),
+            "show_peaks": bool(self._show_peaks.get()),
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(sess, fh, indent=2)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc)); return
+        self._status.set(f"Session saved  →  {Path(path).name}")
+
+    def load_session(self):
+        """Restore a session: apply recipe + view settings and reload the file."""
+        import json
+        path = filedialog.askopenfilename(
+            title="Load Session",
+            filetypes=[("BioRaman session", "*.bioses"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                sess = json.load(fh)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc)); return
+        self.pp_params = recipe_from_dict(sess.get("recipe", {}))
+        try:
+            if sess.get("cmap"): self.cmap_var.set(sess["cmap"])
+            self._norm_var.set(bool(sess.get("normalise_view", True)))
+            self._show_peaks.set(bool(sess.get("show_peaks", False)))
+        except Exception:
+            pass
+        src = sess.get("source", "")
+        if src and os.path.exists(src):
+            self._load_path(src)
+            self._status.set(f"Session restored  →  {Path(path).name}")
+        else:
+            messagebox.showinfo(
+                "Session loaded",
+                "Recipe and view settings restored. The original data file "
+                "was not found — load it manually to continue.")
+
     # ── v7 launchers ──────────────────────────────────────────────────────────
     def open_clustering(self):
         if self.spectra is None:
@@ -4907,6 +6905,14 @@ class ClusteringWindow(tk.Toplevel):
                 clf = AgglomerativeClustering(n_clusters=k, linkage="ward")
 
             sub_labels = clf.fit_predict(mat)
+            # Cluster-quality metric (mean silhouette: higher = better separation)
+            try:
+                from sklearn.metrics import silhouette_score
+                self._silhouette = (
+                    float(silhouette_score(mat, sub_labels))
+                    if k > 1 and len(set(sub_labels)) > 1 else None)
+            except Exception:
+                self._silhouette = None
             # Scatter cluster labels back; background pixels stay -1
             labels = np.full(Y * X, -1, dtype=int)
             labels[roi_flat] = sub_labels
@@ -4922,6 +6928,12 @@ class ClusteringWindow(tk.Toplevel):
         Y, X = labels.shape
         k    = self._n_clust.get()
         cols = self.CLUSTER_COLORS[:k]
+
+        sil = getattr(self, "_silhouette", None)
+        if sil is not None:
+            self._status.config(
+                text=f"Silhouette score: {sil:.3f}  (range −1→1, higher = "
+                     f"better-separated clusters)", fg=C["success"])
 
         # ── Cluster map ────────────────────────────────────────────────────
         ax = self._ax_map
@@ -6296,9 +8308,710 @@ class SpectralToolsWindow(tk.Toplevel):
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# v13: QUALITY-CONTROL MAP WINDOW
+# ─────────────────────────────────────────────────────────────────────────────
+class QCMapWindow(tk.Toplevel):
+    """Per-pixel quality-control maps computed from the loaded data:
+    signal-to-noise ratio, total/maximum intensity and (when the raw cube is
+    available) detector saturation."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.title("Quality Control — per-pixel maps")
+        self.configure(bg=C["bg"]); self.geometry("760x640")
+        self.app = app
+        self._metrics = self._compute()
+
+        top = tk.Frame(self, bg=C["panel"]); top.pack(fill="x", padx=8, pady=6)
+        tk.Label(top, text="Metric:", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 11)).pack(side="left", padx=(4, 6))
+        self._sel = tk.StringVar(value=list(self._metrics.keys())[0])
+        cb = ttk.Combobox(top, textvariable=self._sel, state="readonly",
+                          values=list(self._metrics.keys()), width=28)
+        cb.pack(side="left"); cb.bind("<<ComboboxSelected>>", lambda _e: self._draw())
+        ttk.Button(top, text="↓ Save QC map (CSV)",
+                   command=self._save).pack(side="right", padx=4)
+
+        self._fig = plt.figure(figsize=(6, 5))
+        self._ax  = self._fig.add_subplot(111)
+        self._cv  = FigureCanvasTkAgg(self._fig, master=self)
+        self._cv.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=6)
+        self._cbar = None
+        self._summary = tk.Label(self, bg=C["bg"], fg=C["text_mid"],
+                                 font=("Consolas", 10), justify="left")
+        self._summary.pack(fill="x", padx=10, pady=(0, 8))
+        self._draw()
+
+    def _compute(self):
+        P = np.asarray(self.app.spectra, dtype=float)        # Y×X×W processed
+        eps = 1e-12
+        out = {}
+        # noise estimate from successive differences (high-frequency content)
+        nd = np.diff(P, axis=2)
+        noise = np.std(nd, axis=2) / np.sqrt(2.0)
+        signal = P.max(axis=2) - P.min(axis=2)
+        out["Signal-to-noise ratio"] = signal / (noise + eps)
+        out["Total intensity"] = P.sum(axis=2)
+        out["Max intensity"]   = P.max(axis=2)
+        raw = getattr(self.app, "_raw_spectra", None)
+        if raw is not None and np.asarray(raw).shape[:2] == P.shape[:2]:
+            R = np.asarray(raw, dtype=float)
+            gmax = float(R.max()) or 1.0
+            out["Raw max (saturation)"] = R.max(axis=2) / gmax
+        return out
+
+    def _draw(self):
+        arr = self._metrics[self._sel.get()]
+        self._ax.cla()
+        if self._cbar is not None:
+            try: self._cbar.remove()
+            except Exception: pass
+            self._cbar = None
+        im = self._ax.imshow(arr, cmap="viridis", origin="upper")
+        self._ax.set_title(self._sel.get()); self._ax.set_xlabel("X (px)")
+        self._ax.set_ylabel("Y (px)")
+        self._cbar = self._fig.colorbar(im, ax=self._ax, fraction=0.046, pad=0.04)
+        self._cv.draw()
+        a = arr[np.isfinite(arr)]
+        if a.size:
+            self._summary.config(
+                text=(f"min={a.min():.3g}   median={np.median(a):.3g}   "
+                      f"mean={a.mean():.3g}   max={a.max():.3g}"))
+
+    def _save(self):
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save QC map", defaultextension=".csv",
+            initialfile=self._sel.get().replace(" ", "_"),
+            filetypes=[("CSV", "*.csv"), ("NumPy", "*.npy")])
+        if not path:
+            return
+        arr = self._metrics[self._sel.get()]
+        if path.endswith(".npy"):
+            np.save(path, arr)
+        else:
+            np.savetxt(path, arr, fmt="%.6g", delimiter=",")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v13: BATCH PROCESSING WINDOW
+# ─────────────────────────────────────────────────────────────────────────────
+class BatchWindow(tk.Toplevel):
+    """Apply the current preprocessing recipe to every supported file in a
+    folder and export each processed cube, plus a summary CSV."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.title("Batch Processing")
+        self.configure(bg=C["bg"]); self.geometry("680x520")
+        self.app = app
+        self._in  = tk.StringVar()
+        self._out = tk.StringVar()
+        self._fmt = tk.StringVar(value=".npz")
+        self._rec = tk.BooleanVar(value=False)
+
+        frm = tk.Frame(self, bg=C["panel"]); frm.pack(fill="x", padx=10, pady=10)
+        def row(label, var, cmd):
+            r = tk.Frame(frm, bg=C["panel"]); r.pack(fill="x", pady=4)
+            tk.Label(r, text=label, width=14, anchor="w", bg=C["panel"],
+                     fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+            tk.Entry(r, textvariable=var).pack(side="left", fill="x", expand=True,
+                                               padx=4)
+            ttk.Button(r, text="Browse…", command=cmd).pack(side="left")
+        row("Input folder", self._in,
+            lambda: self._in.set(filedialog.askdirectory(parent=self) or self._in.get()))
+        row("Output folder", self._out,
+            lambda: self._out.set(filedialog.askdirectory(parent=self) or self._out.get()))
+
+        opt = tk.Frame(frm, bg=C["panel"]); opt.pack(fill="x", pady=6)
+        tk.Label(opt, text="Output format", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left", padx=(0, 6))
+        ttk.Combobox(opt, textvariable=self._fmt, state="readonly", width=8,
+                     values=[".npz", ".h5", ".csv", ".txt", ".mat"]).pack(side="left")
+        ttk.Checkbutton(opt, text="Recurse into sub-folders",
+                        variable=self._rec).pack(side="left", padx=16)
+        ttk.Button(opt, text="Load recipe…",
+                   command=self._load_recipe).pack(side="right")
+
+        tk.Label(self, text="Uses the recipe currently set in Preprocessing → "
+                 "Settings (unless you load one above).", bg=C["bg"],
+                 fg=C["text_dim"], font=("Segoe UI", 9)).pack(fill="x", padx=12)
+
+        bar = tk.Frame(self, bg=C["bg"]); bar.pack(fill="x", padx=12, pady=6)
+        self._prog = ttk.Progressbar(bar, mode="determinate")
+        self._prog.pack(side="left", fill="x", expand=True)
+        self._run_btn = ttk.Button(bar, text="▶ Run batch", command=self._run)
+        self._run_btn.pack(side="left", padx=8)
+
+        self._log = tk.Text(self, height=12, bg="#0f172a", fg="#cbd5e1",
+                            font=("Consolas", 9), wrap="none")
+        self._log.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+    def _load_recipe(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Load recipe",
+            filetypes=[("JSON recipe", "*.json"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            self.app.pp_params = load_recipe_file(path)
+            self._logln(f"Loaded recipe: {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc), parent=self)
+
+    def _logln(self, msg):
+        self._log.insert("end", msg + "\n"); self._log.see("end")
+        self.update_idletasks()
+
+    def _run(self):
+        in_dir, out_dir = self._in.get().strip(), self._out.get().strip()
+        if not in_dir or not os.path.isdir(in_dir):
+            messagebox.showwarning("Input", "Choose a valid input folder.",
+                                   parent=self); return
+        if not out_dir:
+            messagebox.showwarning("Output", "Choose an output folder.",
+                                   parent=self); return
+        self._run_btn.config(state="disabled")
+        params = self.app.pp_params
+        fmt, rec = self._fmt.get(), self._rec.get()
+
+        def cb(msg):
+            self.after(0, lambda: self._logln(msg))
+
+        def worker():
+            try:
+                n_ok, n_fail = run_batch(in_dir, out_dir, params,
+                                         out_format=fmt, recursive=rec, log=cb)
+                self.after(0, lambda: messagebox.showinfo(
+                    "Batch complete", f"{n_ok} processed, {n_fail} failed.",
+                    parent=self))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: messagebox.showerror(
+                    "Batch error", str(exc), parent=self))
+            finally:
+                self.after(0, lambda: self._run_btn.config(state="normal"))
+        threading.Thread(target=worker, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v13: PUBLICATION-QUALITY VOLUME RENDERER  (Plotly go.Volume)
+# ─────────────────────────────────────────────────────────────────────────────
+class VolumeRenderWindow(tk.Toplevel):
+    """Publication 3-D renderer for a confocal Raman volume.
+
+    Two modes:
+      • Surface — solid iso-surfaces of up to three bands shown together in
+        different colours (red / green / blue), reproducing multi-component
+        chemical 3-D maps (the WiRE / paper "terrain" look).
+      • Cloud   — translucent volume ray-cast of one band (the soft "glow").
+    Exports interactive HTML and high-resolution PNG.
+    """
+    BANDS = [("A", "Red",   "#e8483b"),
+             ("B", "Green", "#2ecc55"),
+             ("C", "Blue",  "#3b7ae8")]
+    REF_COLORS = ["#e8483b", "#2ecc55", "#3b7ae8", "#f59e0b", "#06b6d4"]
+
+    def __init__(self, app, vol4, zvals, xdata):
+        super().__init__(app)
+        self.title("Publication Volume Renderer")
+        self.configure(bg=C["bg"]); self.geometry("450x760")
+        self.app = app
+        self.vol4 = np.asarray(vol4, dtype=float)        # Z × Y × X × W
+        self.zvals = (np.asarray(zvals, dtype=float)
+                      if zvals is not None else None)
+        self.xdata = np.asarray(xdata, dtype=float)
+        nz, ny, nx, W = self.vol4.shape
+
+        xmin, xmax = float(self.xdata.min()), float(self.xdata.max())
+        def clamp(v): return max(xmin, min(xmax, v))
+        defaults = [(clamp(2850), clamp(2980), True),
+                    (clamp(1560), clamp(1680), True),
+                    (clamp(1280), clamp(1340), False)]
+
+        pad = tk.Frame(self, bg=C["panel"]); pad.pack(fill="both", expand=True,
+                                                      padx=10, pady=10)
+        tk.Label(pad, text=f"Volume: {nx} × {ny} × {nz}  (X·Y·Z)",
+                 bg=C["panel"], fg=C["text_hi"],
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(2, 6))
+
+        mf = tk.Frame(pad, bg=C["panel"]); mf.pack(fill="x", pady=2)
+        tk.Label(mf, text="Mode", width=12, anchor="w", bg=C["panel"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+        self.mode = tk.StringVar(value="solid block (filled, multi-band)")
+        ttk.Combobox(mf, textvariable=self.mode, state="readonly", width=26,
+                     values=["solid block (filled, multi-band)",
+                             "surface (multi-band, hollow)",
+                             "cloud (single band, glow)"]).pack(side="left")
+
+        tk.Label(pad, text="Bands (cm⁻¹)  —  colour = chemical component",
+                 bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 2))
+        self.benable = {}; self.blo = {}; self.bhi = {}
+        for (key, cname, col), (lo, hi, en) in zip(self.BANDS, defaults):
+            r = tk.Frame(pad, bg=C["panel"]); r.pack(fill="x", pady=2)
+            v = tk.BooleanVar(value=en); self.benable[key] = v
+            ttk.Checkbutton(r, variable=v).pack(side="left")
+            tk.Label(r, text=cname, width=6, anchor="w", bg=C["panel"], fg=col,
+                     font=("Segoe UI", 10, "bold")).pack(side="left")
+            lov = tk.StringVar(value=f"{lo:.0f}"); hiv = tk.StringVar(value=f"{hi:.0f}")
+            self.blo[key] = lov; self.bhi[key] = hiv
+            tk.Entry(r, textvariable=lov, width=7).pack(side="left", padx=2)
+            tk.Label(r, text="–", bg=C["panel"], fg=C["text_dim"]).pack(side="left")
+            tk.Entry(r, textvariable=hiv, width=7).pack(side="left", padx=2)
+
+        # ── Reference-spectra concentration analysis (CLS / NNLS) ──────────
+        self._refs = []            # list of {name, color, spec(W,)}
+        self._cls_result = None
+        cf = tk.Frame(pad, bg=C["panel"]); cf.pack(fill="x", pady=(10, 0))
+        self._usecls = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cf, variable=self._usecls,
+                        text="Concentration mode (fit reference spectra)"
+                        ).pack(side="left")
+        rf = tk.Frame(pad, bg=C["panel"]); rf.pack(fill="x", pady=(2, 0))
+        ttk.Button(rf, text="＋ Load…",
+                   command=self._load_refs).pack(side="left")
+        ttk.Button(rf, text="✕ Clear",
+                   command=self._clear_refs).pack(side="left", padx=(4, 0))
+        self._reflbl = tk.Label(rf, text="none loaded", bg=C["panel"],
+                                fg=C["text_dim"], font=("Segoe UI", 9),
+                                wraplength=230, justify="left")
+        self._reflbl.pack(side="left", padx=6)
+        self._lof = tk.BooleanVar(value=True)
+        ttk.Checkbutton(pad, variable=self._lof,
+                        text="Show lack-of-fit (LoF) in purple").pack(anchor="w")
+
+        self._vars = {}
+        def field(label, key, default):
+            r = tk.Frame(pad, bg=C["panel"]); r.pack(fill="x", pady=2)
+            tk.Label(r, text=label, width=18, anchor="w", bg=C["panel"],
+                     fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+            v = tk.StringVar(value=str(default)); self._vars[key] = v
+            tk.Entry(r, textvariable=v, width=10).pack(side="left")
+        # depth axis values (µm) and default keep-range
+        if self.zvals is not None and self.zvals.size >= 2:
+            self._zf = np.sort(self.zvals.astype(float))
+        else:
+            self._zf = np.arange(nz, dtype=float)
+        z0d, z1d = float(self._zf.min()), float(self._zf.max())
+
+        tk.Label(pad, text="", bg=C["panel"]).pack(pady=1)
+        field("Z keep ≥ (µm)",   "z0",    f"{z0d:.0f}")
+        field("Z keep ≤ (µm)",   "z1",    f"{z1d:.0f}")
+        field("Iso level pct",   "iso",   "62")
+        field("Smoothing σ (vox)", "sigma", "1.0")
+        field("Upsample factor", "up",    "2")
+        field("Surface opacity", "op",    "1.0")
+        field("Z stretch",       "zst",   "2.0")
+        field("LoF threshold",   "lofthr", "0.5")
+
+        wf = tk.Frame(pad, bg=C["panel"]); wf.pack(fill="x", pady=2)
+        tk.Label(wf, text="Background", width=18, anchor="w", bg=C["panel"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+        self._bg = tk.StringVar(value="white")
+        ttk.Combobox(wf, textvariable=self._bg, state="readonly", width=8,
+                     values=["white", "black"]).pack(side="left")
+
+        self._zeq = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pad, variable=self._zeq,
+                        text="Equalize depth (compensate confocal attenuation)"
+                        ).pack(anchor="w", pady=(4, 0))
+
+        bar = tk.Frame(pad, bg=C["panel"]); bar.pack(fill="x", pady=10)
+        ttk.Button(bar, text="✨ Render (open in browser)",
+                   command=lambda: self._render(save_png=False)).pack(fill="x", pady=2)
+        ttk.Button(bar, text="🖼  Render & Save PNG…",
+                   command=lambda: self._render(save_png=True)).pack(fill="x", pady=2)
+        self._status = tk.Label(pad, text="", bg=C["panel"], fg=C["text_mid"],
+                                font=("Segoe UI", 9), wraplength=410,
+                                justify="left")
+        self._status.pack(anchor="w", pady=(6, 0))
+
+    # ── volume helpers ─────────────────────────────────────────────────────
+    def _postgeom(self, V, sigma, up, normalize=True):
+        """Apply depth-crop, optional depth-equalisation, upsampling, smoothing
+        and (optionally) robust 0-1 normalisation to a Z×Y×X scalar volume."""
+        try:
+            z0 = float(self._vars["z0"].get()); z1 = float(self._vars["z1"].get())
+            if z1 < z0: z0, z1 = z1, z0
+            zf = self._zf
+            zmask = (zf >= z0) & (zf <= z1)
+            if zmask.sum() >= 1:
+                V = V[zmask]
+                self._zlo_um = float(zf[zmask].min())
+                self._zhi_um = float(zf[zmask].max())
+        except Exception:
+            pass
+        if getattr(self, "_zeq", None) is not None and self._zeq.get():
+            for zi in range(V.shape[0]):
+                ref = np.percentile(V[zi], 99.0)
+                if ref > 0:
+                    V[zi] = V[zi] / ref
+        if up > 1: V = zoom(V, up, order=1)
+        if sigma > 0: V = gaussian_filter(V, sigma=sigma * up)
+        if normalize:
+            vmin = float(np.percentile(V, 20.0)); vmax = float(np.percentile(V, 99.0))
+            if vmax <= vmin: vmin, vmax = float(V.min()), float(V.max())
+            if vmax > vmin: V = np.clip((V - vmin) / (vmax - vmin), 0.0, 1.0)
+        return V
+
+    def _band_volume(self, lo, hi, sigma, up):
+        if hi < lo: lo, hi = hi, lo
+        mask = (self.xdata >= lo) & (self.xdata <= hi)
+        if not mask.any(): mask = np.ones_like(self.xdata, dtype=bool)
+        V = self.vol4[:, :, :, mask].mean(axis=3)
+        return self._postgeom(V, sigma, up, normalize=True)
+
+    # ── reference-spectra concentration analysis (CLS / NNLS) ───────────────
+    def _clear_refs(self):
+        self._refs = []
+        self._cls_result = None
+        self._usecls.set(False)
+        self._reflbl.config(text="none loaded", fg=C["text_dim"])
+        self._status.config(text="Reference spectra cleared.")
+
+    def _load_refs(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Load reference component spectra",
+            filetypes=[("Raman spectra",
+                        "*.txt *.csv *.dpt *.dat *.jdx *.asc *.wdf *.spc"),
+                       ("All", "*.*")])
+        if not paths:
+            return
+        added = 0
+        for i, p in enumerate(paths):
+            try:
+                r = _open_raman_any(p)
+                sx = np.asarray(r.xdata, dtype=float)
+                sd = np.asarray(r.spectra, dtype=float)
+                spec = sd.reshape(-1, sd.shape[-1]).mean(axis=0)   # mean spectrum
+                si = np.interp(self.xdata, sx, spec)               # onto data axis
+                col = self.REF_COLORS[len(self._refs) % len(self.REF_COLORS)]
+                self._refs.append({"name": Path(p).stem[:18],
+                                   "color": col, "spec": si})
+                added += 1
+            except Exception as e:
+                messagebox.showwarning("Reference load error",
+                                       f"{Path(p).name}:\n{e}", parent=self)
+        if added:
+            self._cls_result = None
+            self._usecls.set(True)
+            self._reflbl.config(
+                text=f"{len(self._refs)}: " +
+                     ", ".join(r["name"] for r in self._refs),
+                fg=C["success"])
+            if len(self._refs) < 2:
+                messagebox.showinfo(
+                    "One component loaded",
+                    "Concentration analysis compares components relative to each "
+                    "other, so it needs at least TWO reference spectra — with "
+                    "only one, every voxel is trivially 100%.\n\nLoad your other "
+                    "component spectra (e.g. select them all at once), or use "
+                    "✕ Clear to start over.", parent=self)
+
+    def _cls_abundance(self):
+        """Per-voxel non-negative least-squares fit of the reference spectra
+        (no normalisation). Returns (abundance_volumes, lof_volume, percent)."""
+        if self._cls_result is not None:
+            return self._cls_result
+        from scipy.optimize import nnls
+        R = np.stack([r["spec"] for r in self._refs], axis=1)   # W × K
+        nz, ny, nx, W = self.vol4.shape
+        S = self.vol4.reshape(-1, W)
+        K = len(self._refs)
+        A = np.zeros((S.shape[0], K), dtype=float)
+        res = np.zeros(S.shape[0], dtype=float)
+        snorm = np.linalg.norm(S, axis=1) + 1e-9
+        for i in range(S.shape[0]):
+            c, rnorm = nnls(R, S[i])
+            A[i] = c; res[i] = rnorm
+        Avol = [A[:, k].reshape(nz, ny, nx) for k in range(K)]
+        lof = (res / snorm).reshape(nz, ny, nx)
+        tot = A.sum()
+        pct = [float(A[:, k].sum() / tot * 100) if tot > 0 else 0.0
+               for k in range(K)]
+        self._cls_result = (Avol, lof, pct)
+        return self._cls_result
+
+    def _grid(self, shape):
+        nz, ny, nx = shape
+        if getattr(self, "_zlo_um", None) is not None:
+            z = np.linspace(self._zlo_um, self._zhi_um, nz)
+        elif self.zvals is not None and self.zvals.size >= 2:
+            z = np.linspace(self.zvals.min(), self.zvals.max(), nz)
+        else:
+            z = np.arange(nz, dtype=float)
+        return np.meshgrid(z, np.arange(ny), np.arange(nx), indexing="ij")
+
+    def _export(self, fig, save_png):
+        out_dir = os.path.dirname(os.path.abspath(
+            getattr(self.app, "_loaded_path", "") or "")) or os.getcwd()
+        stem = "volume_render"
+        src = getattr(self.app, "_loaded_path", None)
+        if src: stem = Path(src).stem + "_volume"
+        html_path = os.path.join(out_dir, stem + ".html")
+        fig.write_html(html_path, include_plotlyjs="cdn")
+        url = "file://" + html_path
+        opened = False
+        import webbrowser
+        for name in ("firefox", "chrome", "google-chrome", "chromium",
+                     "chromium-browser", "microsoft-edge"):
+            try:
+                webbrowser.get(name).open(url); opened = True; break
+            except Exception:
+                continue
+        if not opened and sys.platform == "darwin":
+            import subprocess
+            for app in ("Firefox", "Google Chrome", "Microsoft Edge"):
+                try:
+                    subprocess.Popen(["open", "-a", app, html_path]); opened = True; break
+                except Exception:
+                    continue
+        if not opened:
+            webbrowser.open(url)
+        msg = (f"Opened {Path(html_path).name}. If empty, open it in Firefox or "
+               f"Chrome (Safari can't render WebGL 3-D).")
+        if save_png:
+            png = filedialog.asksaveasfilename(
+                parent=self, title="Save 3-D PNG", initialfile=stem,
+                defaultextension=".png", filetypes=[("PNG", "*.png")])
+            if png:
+                if _ensure_package("kaleido") is None:
+                    messagebox.showwarning("PNG export",
+                        "Static PNG needs the 'kaleido' package.\nThe HTML was "
+                        "still saved.", parent=self)
+                else:
+                    fig.write_image(png, width=1500, height=1150, scale=2)
+                    msg += f"  PNG saved → {Path(png).name}"
+        self._status.config(text=msg)
+
+    # ── render ─────────────────────────────────────────────────────────────
+    def _render(self, save_png=False):
+        if _ensure_package("plotly") is None:
+            messagebox.showerror("Plotly required",
+                "Install Plotly:\n    pip install plotly", parent=self)
+            return
+        self._status.config(text="Rendering…"); self.update_idletasks()
+        try:
+            import plotly.graph_objects as go
+            sigma = float(self._vars["sigma"].get() or 0)
+            up    = max(1, int(float(self._vars["up"].get() or 1)))
+            zst   = max(0.3, float(self._vars["zst"].get() or 1))
+            op    = float(self._vars["op"].get() or 1.0)
+            isopct = float(self._vars["iso"].get() or 60)
+            bg = self._bg.get()
+            mode = self.mode.get()
+            solid = mode.startswith("solid")
+            surface = mode.startswith("surface")
+            use_cls = (getattr(self, "_usecls", None) is not None
+                       and self._usecls.get() and len(self._refs) >= 1)
+            traces = []
+
+            if use_cls:
+                # Concentration estimate — winner-take-all over NNLS abundances.
+                self._status.config(text="Fitting reference spectra (NNLS)…")
+                self.update_idletasks()
+                Avol, lof, pct = self._cls_abundance()
+                Ag = [self._postgeom(A.copy(), sigma, up, normalize=False)
+                      for A in Avol]
+                lofg = self._postgeom(lof.copy(), sigma, up, normalize=False)
+                stack = np.stack(Ag, axis=0)          # K × Z × Y × X
+                K = len(self._refs)
+                tot = stack.sum(axis=0)
+                dom = stack.argmax(axis=0)
+                thr = float(np.percentile(tot, np.clip(isopct, 1, 99)))
+                seg = np.where(tot >= thr, dom + 1, 0).astype(float)
+                comps = [(f"{self._refs[k]['name']} ({pct[k]:.1f}%)",
+                          self._refs[k]['color']) for k in range(K)]
+                if self._lof.get():
+                    try: lofthr = float(self._vars["lofthr"].get())
+                    except Exception: lofthr = 0.5
+                    lm = float(lofg.max()) or 1.0
+                    seg = np.where((tot >= thr) & ((lofg / lm) >= lofthr),
+                                   K + 1, seg)
+                    comps.append(("LoF", "#b026ff"))
+                ncat = len(comps)
+                Z, Y, X = self._grid(seg.shape)
+                oscale = [[0.0, 0.0], [0.5 / ncat, 0.0],
+                          [0.5 / ncat + 1e-3, 1.0], [1.0, 1.0]]
+                cscale = [[0.0, "rgba(0,0,0,0)"]]
+                for i, (n, col) in enumerate(comps):
+                    cscale += [[min(0.999, (i + 0.5) / ncat), col],
+                               [min(1.0, (i + 1) / ncat), col]]
+                traces.append(go.Volume(
+                    x=X.flatten(), y=Y.flatten(), z=Z.flatten(), value=seg.flatten(),
+                    cmin=0, cmax=ncat, colorscale=cscale, opacityscale=oscale,
+                    opacity=1.0, surface_count=max(8, 2 * ncat + 2),
+                    caps=dict(x_show=True, y_show=True, z_show=True),
+                    showscale=False))
+                for n, col in comps:
+                    traces.append(go.Scatter3d(
+                        x=[None], y=[None], z=[None], mode="markers",
+                        marker=dict(size=8, color=col), name=n, showlegend=True))
+                title = "Raman 3-D Concentration (CLS):  " + "   ".join(
+                    f"{self._refs[k]['name']} {pct[k]:.1f}%" for k in range(K))
+            elif solid:
+                # Winner-take-all segmentation → a FILLED, opaque coloured block.
+                enabled = [(k, n, c) for k, n, c in self.BANDS
+                           if self.benable[k].get()]
+                if not enabled:
+                    messagebox.showwarning("No bands",
+                        "Enable at least one band.", parent=self)
+                    self._status.config(text=""); return
+                vols = [self._band_volume(float(self.blo[k].get()),
+                                          float(self.bhi[k].get()), sigma, up)
+                        for k, _, _ in enabled]
+                stack = np.stack(vols, axis=0)            # K × Z × Y × X
+                mag = stack.max(axis=0)
+                dom = stack.argmax(axis=0)                # 0..K-1
+                thr = float(np.percentile(mag, np.clip(isopct, 1, 99)))
+                seg = np.where(mag >= thr, dom + 1, 0).astype(float)   # 0=bg
+                K = len(enabled)
+                Z, Y, X = self._grid(seg.shape)
+                # discrete colour ramp (value 0 = transparent background,
+                # values 1..K each a solid component colour) + step opacity
+                oscale = [[0.0, 0.0], [0.5 / K, 0.0], [0.5 / K + 1e-3, 1.0],
+                          [1.0, 1.0]]
+                cscale = [[0.0, "rgba(0,0,0,0)"]]
+                for i, (k, n, col) in enumerate(enabled):
+                    cscale += [[min(0.999, (i + 0.5) / K), col],
+                               [min(1.0, (i + 1) / K), col]]
+                traces.append(go.Volume(
+                    x=X.flatten(), y=Y.flatten(), z=Z.flatten(), value=seg.flatten(),
+                    cmin=0, cmax=K, colorscale=cscale, opacityscale=oscale,
+                    opacity=1.0, surface_count=max(8, 2 * K + 2),
+                    caps=dict(x_show=True, y_show=True, z_show=True),
+                    showscale=False))
+                # legend proxies
+                for k, n, col in enabled:
+                    traces.append(go.Scatter3d(
+                        x=[None], y=[None], z=[None], mode="markers",
+                        marker=dict(size=8, color=col), name=n, showlegend=True))
+                title = "Raman 3-D Chemical Volume (segmented)"
+            elif surface:
+                for key, cname, col in self.BANDS:
+                    if not self.benable[key].get():
+                        continue
+                    V = self._band_volume(float(self.blo[key].get()),
+                                          float(self.bhi[key].get()), sigma, up)
+                    Z, Y, X = self._grid(V.shape)
+                    lvl = float(np.percentile(V, np.clip(isopct, 1, 99)))
+                    traces.append(go.Isosurface(
+                        x=X.flatten(), y=Y.flatten(), z=Z.flatten(),
+                        value=V.flatten(), isomin=lvl, isomax=float(V.max()),
+                        surface_count=2, colorscale=[[0, col], [1, col]],
+                        showscale=False, opacity=op, flatshading=False,
+                        caps=dict(x_show=True, y_show=True, z_show=True),
+                        lighting=dict(ambient=0.55, diffuse=0.85, specular=0.25,
+                                      roughness=0.9, fresnel=0.1),
+                        lightposition=dict(x=100, y=200, z=300),
+                        name=cname, showlegend=True))
+                title = "Raman 3-D Chemical Surfaces"
+            else:
+                key = next((k for k, _, _ in self.BANDS
+                            if self.benable[k].get()), "A")
+                V = self._band_volume(float(self.blo[key].get()),
+                                      float(self.bhi[key].get()), sigma, up)
+                Z, Y, X = self._grid(V.shape)
+                lvl = float(np.percentile(V, np.clip(isopct, 1, 99)))
+                cscale = [[0.0, "#04240f"], [0.25, "#0e5a28"], [0.55, "#27a24b"],
+                          [0.80, "#5fd97e"], [1.0, "#e6ffe9"]]
+                traces.append(go.Volume(
+                    x=X.flatten(), y=Y.flatten(), z=Z.flatten(), value=V.flatten(),
+                    isomin=lvl, isomax=1.0, opacity=min(0.6, op),
+                    surface_count=22, colorscale=cscale,
+                    opacityscale=[[0, 0], [0.35, 0], [0.55, 0.35],
+                                  [0.8, 0.72], [1, 1]],
+                    caps=dict(x_show=False, y_show=False, z_show=False),
+                    showscale=True))
+                title = "Raman Confocal Volume"
+
+            if not traces:
+                messagebox.showwarning("No bands",
+                    "Enable at least one band.", parent=self)
+                self._status.config(text=""); return
+
+            ax_col = "#444" if bg == "white" else "#bbb"
+            fig = go.Figure(data=traces)
+            fig.update_layout(
+                title=title,
+                scene=dict(
+                    xaxis_title="X (px)", yaxis_title="Y (px)",
+                    zaxis_title="Z (µm)",
+                    aspectmode="manual", aspectratio=dict(x=1, y=1, z=zst),
+                    xaxis=dict(showgrid=False, showbackground=False, color=ax_col),
+                    yaxis=dict(showgrid=False, showbackground=False, color=ax_col),
+                    zaxis=dict(showgrid=False, showbackground=False, color=ax_col),
+                    bgcolor=bg),
+                paper_bgcolor=bg,
+                font=dict(color="black" if bg == "white" else "white"),
+                legend=dict(font=dict(color="black" if bg == "white" else "white")),
+                margin=dict(l=0, r=0, t=40, b=0), showlegend=True)
+            self._export(fig, save_png)
+        except Exception as exc:
+            messagebox.showerror("Render failed", str(exc), parent=self)
+            self._status.config(text="")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADLESS COMMAND-LINE INTERFACE
+# ─────────────────────────────────────────────────────────────────────────────
+def _run_cli(argv):
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="bioraman",
+        description="BioRaman headless batch preprocessing. With no arguments "
+                    "the graphical interface starts.")
+    ap.add_argument("--input", "-i",
+                    help="Input file or folder of Raman files.")
+    ap.add_argument("--out", "-o",
+                    help="Output folder for processed data.")
+    ap.add_argument("--recipe", "-r",
+                    help="JSON preprocessing recipe (defaults to built-in params).")
+    ap.add_argument("--format", "-f", default=".npz",
+                    choices=[".npz", ".h5", ".csv", ".txt", ".mat"],
+                    help="Output format (default: .npz).")
+    ap.add_argument("--recursive", action="store_true",
+                    help="Recurse into sub-folders when --input is a folder.")
+    ap.add_argument("--save-recipe", metavar="PATH",
+                    help="Write the default recipe to PATH and exit.")
+    ap.add_argument("--version", action="version",
+                    version=f"BioRaman {__version__}")
+    args = ap.parse_args(argv)
+
+    if args.save_recipe:
+        save_recipe_file(args.save_recipe, PreprocessParams())
+        print(f"Wrote default recipe → {args.save_recipe}")
+        return 0
+
+    params = (load_recipe_file(args.recipe) if args.recipe
+              else PreprocessParams())
+
+    if not args.input or not args.out:
+        ap.error("--input and --out are required for batch processing.")
+
+    if os.path.isdir(args.input):
+        n_ok, n_fail = run_batch(args.input, args.out, params,
+                                 out_format=args.format,
+                                 recursive=args.recursive, log=print)
+        return 0 if n_fail == 0 else 1
+
+    # single file
+    os.makedirs(args.out, exist_ok=True)
+    x, cube, report = process_file(args.input, params)
+    out_path = os.path.join(
+        args.out, Path(args.input).stem + "_processed" + args.format)
+    write_cube(out_path, cube, x, report, source=args.input)
+    print(f"Processed {args.input} → {out_path}")
+    return 0
+
+
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     multiprocessing.set_start_method("spawn", force=True)
+
+    if len(sys.argv) > 1:
+        sys.exit(_run_cli(sys.argv[1:]))
+
     app = RamanApp()
     app.mainloop()
