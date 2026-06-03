@@ -31,3 +31,7 @@ Thumbs.db
 *.csv
 *.xlsx
 !docs/**/*.png
+
+# Testing
+.pytest_cache/
+.coverage

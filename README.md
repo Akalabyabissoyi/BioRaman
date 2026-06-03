@@ -86,6 +86,28 @@ tool at the folder:
 
 Please observe each database's own licence and cite it in your work.
 
+## Testing & validation
+
+Core analysis routines are factored into pure functions (`component_fit`,
+`particle_stats`, `prep_spectra`, cube reconstruction, recipes, export) that are
+covered by an automated test suite and a quantitative validation harness.
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q                                   # unit tests
+python validation/validate_concentration.py # synthetic concentration validation
+```
+
+The validation harness checks that component-analysis concentration estimates
+recover **known** synthetic concentrations within tolerance, and includes a
+protocol (`validation/README.md`) for cross-checking against Renishaw WiRE's
+Concentration Estimate on real data (the Tablet/aspirin/caffeine/paracetamol
+exercise). Continuous integration (GitHub Actions) byte-compiles the app and
+runs the tests + validation on every push.
+
+> For quantitative work, run the WiRE cross-check and record the agreement
+> before reporting concentrations in a publication.
+
 ## Versioning
 
 This project follows [Semantic Versioning](https://semver.org/). Any change

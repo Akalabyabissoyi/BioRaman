@@ -1212,6 +1212,130 @@ def _build_lut_panel(win, parent, ready_fn, n_panels=8):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TESTABLE CORE ANALYSIS  (used by the GUI, the validation harness and tests)
+# ─────────────────────────────────────────────────────────────────────────────
+def prep_spectra(M, preprocess="Spectrum", normalise="None"):
+    """Apply derivative + normalisation to a spectra matrix (last axis = W)."""
+    M = np.asarray(M, dtype=float)
+    if preprocess == "1st derivative":
+        M = np.gradient(M, axis=-1)
+    elif preprocess == "2nd derivative":
+        M = np.gradient(np.gradient(M, axis=-1), axis=-1)
+    if normalise == "Vector":
+        n = np.linalg.norm(M, axis=-1, keepdims=True)
+        M = np.divide(M, n, out=np.zeros_like(M), where=n > 0)
+    elif normalise.startswith("Mean"):
+        mu = M.mean(axis=-1, keepdims=True); sd = M.std(axis=-1, keepdims=True)
+        M = np.divide(M - mu, sd, out=np.zeros_like(M), where=sd > 0)
+    return M
+
+
+def component_fit(flat, refs, method="NNLS", preprocess="Spectrum",
+                  normalise="None", background_order=0):
+    """Component analysis (DCLS / NNLS) of spectra against reference spectra.
+
+    Parameters
+    ----------
+    flat : (N, W) array of spectra (rows are pixels).
+    refs : (K, W) array of reference component spectra on the same axis.
+    method : 'NNLS' (non-negative) or 'DCLS' (unconstrained least squares).
+    preprocess : 'Spectrum' | '1st derivative' | '2nd derivative'.
+    normalise : 'None…' | 'Vector' | 'Mean…' (see prep_spectra).
+    background_order : polynomial background order modelled in the fit
+        (Spectrum method only; the background coefficients are unconstrained).
+
+    Returns a dict with:
+        conc    : (N, K) component abundances (clipped at 0 for ≥0 reporting)
+        raw     : (N, K) raw fit coefficients (may be negative for DCLS)
+        rel     : (N, K) per-pixel relative concentration in percent
+        lof     : (N,)   percentage lack of fit
+        overall : (K,)   overall concentration estimate in percent
+    """
+    flat = np.asarray(flat, dtype=float)
+    refs = np.asarray(refs, dtype=float)
+    if refs.ndim == 1:
+        refs = refs[None, :]
+    N, W = flat.shape
+    K = refs.shape[0]
+    Fq = prep_spectra(flat, preprocess, normalise)
+    R = prep_spectra(refs, preprocess, normalise).T          # W × K
+    A = R
+    if preprocess == "Spectrum" and background_order > 0:
+        xn = np.linspace(-1, 1, W)
+        P = np.vander(xn, background_order + 1, increasing=True)
+        A = np.hstack([R, P])
+    M = A.shape[1]
+    C = np.zeros((N, K)); recon = np.zeros((N, W))
+    if method == "DCLS":
+        coef, *_ = np.linalg.lstsq(A, Fq.T, rcond=None)      # M × N
+        C = coef[:K].T
+        recon = (A @ coef).T
+    else:
+        from scipy.optimize import nnls
+        if M > K:
+            from scipy.optimize import lsq_linear
+            lb = np.concatenate([np.zeros(K), -np.inf * np.ones(M - K)])
+            ub = np.inf * np.ones(M)
+            for i in range(N):
+                sol = lsq_linear(A, Fq[i], bounds=(lb, ub), method="bvls")
+                C[i] = sol.x[:K]; recon[i] = A @ sol.x
+        else:
+            for i in range(N):
+                c, _ = nnls(A, Fq[i]); C[i] = c; recon[i] = A @ c
+    resid = Fq - recon
+    lof = np.linalg.norm(resid, axis=1) / (np.linalg.norm(Fq, axis=1) + 1e-9) * 100
+    Cc = np.clip(C, 0, None)
+    tot = Cc.sum(axis=1, keepdims=True)
+    rel = np.divide(Cc, tot, out=np.zeros_like(Cc), where=tot > 0) * 100
+    overall = Cc.sum(axis=0) / (Cc.sum() + 1e-9) * 100
+    return dict(conc=Cc, raw=C, rel=rel, lof=lof, overall=overall)
+
+
+def particle_stats(image, auto=True, threshold_pct=50.0, remove_edge=True,
+                   min_size_pct=1.0, px_um=1.0):
+    """Label and measure particles/domains in a 2-D image.
+
+    Returns a dict with: labels (int array), mask (bool), props (list of dicts
+    with label/area_px/area_um2/ecd_um/cx/cy), area_pct, n.
+    """
+    from scipy import ndimage
+    img = np.asarray(image, dtype=float)
+    finite = np.isfinite(img)
+    img = np.where(finite, img, np.nanmin(img[finite]) if finite.any() else 0.0)
+    if auto:
+        thr = _otsu_threshold(img)
+    else:
+        lo, hi = float(np.nanmin(img)), float(np.nanmax(img))
+        thr = lo + (hi - lo) * threshold_pct / 100.0
+    mask = img >= thr
+    lbl, n = ndimage.label(mask)
+    if remove_edge and n:
+        border = set(lbl[0, :]) | set(lbl[-1, :]) | set(lbl[:, 0]) | set(lbl[:, -1])
+        for b in border:
+            if b:
+                lbl[lbl == b] = 0
+    counts = np.bincount(lbl.ravel())
+    areas = {i: counts[i] for i in range(1, len(counts)) if counts[i] > 0}
+    keep = set()
+    if areas:
+        biggest = max(areas.values())
+        keep = {i for i, a in areas.items()
+                if a >= biggest * min_size_pct / 100.0}
+    coms = ndimage.center_of_mass(mask, lbl, sorted(keep)) if keep else []
+    props = []
+    for idx, lab in enumerate(sorted(keep)):
+        a_px = int(areas[lab]); a_um = a_px * px_um * px_um
+        ecd = 2.0 * np.sqrt(a_um / np.pi)
+        cy, cx = coms[idx] if len(coms) else (0, 0)
+        props.append(dict(label=lab, area_px=a_px, area_um2=a_um,
+                          ecd_um=ecd, cx=cx, cy=cy))
+    area_pct = (np.isin(lbl, list(keep)).sum() / lbl.size * 100
+                if lbl.size else 0.0)
+    return dict(labels=lbl, mask=np.isin(lbl, list(keep)), props=props,
+                area_pct=area_pct, n=len(props))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CUSTOM WIDGETS
 # ─────────────────────────────────────────────────────────────────────────────
 class RangeSlider(tk.Frame):
@@ -9619,44 +9743,15 @@ class ComponentAnalysisWindow(tk.Toplevel):
     def _worker(self):
         try:
             S = np.asarray(self.app.spectra, dtype=float)
-            Y, X, W = S.shape; N = Y * X
-            Fq = self._prep_mat(S.reshape(N, W))
-            R = self._prep_mat(np.stack([r["spec"] for r in self._refs], axis=0))
-            R = R.T                                  # W × K
-            K = R.shape[1]
-            A = R
-            bg = int(self._bg.get())
-            if self._prep.get() == "Spectrum" and bg > 0:
-                xn = np.linspace(-1, 1, W)
-                P = np.vander(xn, bg + 1, increasing=True)
-                A = np.hstack([R, P])
-            M = A.shape[1]
-            C = np.zeros((N, K)); recon = np.zeros((N, W))
-            if self._method.get() == "DCLS":
-                coef, *_ = np.linalg.lstsq(A, Fq.T, rcond=None)   # M × N
-                C = coef[:K].T
-                recon = (A @ coef).T
-            else:
-                from scipy.optimize import nnls
-                if M > K:                            # references ≥0, background free
-                    from scipy.optimize import lsq_linear
-                    lb = np.concatenate([np.zeros(K), -np.inf * np.ones(M - K)])
-                    ub = np.inf * np.ones(M)
-                    for i in range(N):
-                        sol = lsq_linear(A, Fq[i], bounds=(lb, ub), method="bvls")
-                        C[i] = sol.x[:K]; recon[i] = A @ sol.x
-                else:
-                    for i in range(N):
-                        c, _ = nnls(A, Fq[i]); C[i] = c; recon[i] = A @ c
-            resid = Fq - recon
-            lof = (np.linalg.norm(resid, axis=1) /
-                   (np.linalg.norm(Fq, axis=1) + 1e-9) * 100).reshape(Y, X)
-            Cc = np.clip(C, 0, None)
-            tot = Cc.sum(axis=1, keepdims=True)
-            rel = np.divide(Cc, tot, out=np.zeros_like(Cc), where=tot > 0) * 100
-            maps = [rel[:, k].reshape(Y, X) for k in range(K)]
-            overall = Cc.sum(axis=0) / (Cc.sum() + 1e-9) * 100
-            self._res = dict(maps=maps, lof=lof, overall=overall,
+            Y, X, W = S.shape; K = len(self._refs)
+            refs = np.stack([r["spec"] for r in self._refs], axis=0)
+            out = component_fit(
+                S.reshape(Y * X, W), refs,
+                method=self._method.get(), preprocess=self._prep.get(),
+                normalise=self._norm.get(), background_order=int(self._bg.get()))
+            maps = [out["rel"][:, k].reshape(Y, X) for k in range(K)]
+            lof = out["lof"].reshape(Y, X)
+            self._res = dict(maps=maps, lof=lof, overall=out["overall"],
                              names=[r["name"] for r in self._refs])
             self.after(0, self._draw)
         except Exception as exc:
@@ -9811,50 +9906,21 @@ class ParticleStatsWindow(tk.Toplevel):
 
     def _run(self, *_):
         try:
-            from scipy import ndimage
+            import scipy.ndimage  # noqa: F401
         except Exception:
             messagebox.showerror("SciPy required", "Particle statistics needs "
                                  "SciPy.", parent=self); return
-        img = self.img.copy()
-        finite = np.isfinite(img)
-        img[~finite] = np.nanmin(img[finite]) if finite.any() else 0.0
-        if self._auto.get():
-            thr = _otsu_threshold(img)
-        else:
-            lo, hi = np.nanmin(img), np.nanmax(img)
-            thr = lo + (hi - lo) * self._thr.get() / 100.0
-        mask = img >= thr
-        lbl, n = ndimage.label(mask)
-        if self._edge.get() and n:
-            border = set(lbl[0, :]) | set(lbl[-1, :]) | set(lbl[:, 0]) | set(lbl[:, -1])
-            for b in border:
-                if b: lbl[lbl == b] = 0
-        counts = np.bincount(lbl.ravel())
-        areas_px = {i: counts[i] for i in range(1, len(counts)) if counts[i] > 0}
-        if areas_px:
-            biggest = max(areas_px.values())
-            keep = {i for i, a in areas_px.items()
-                    if a >= biggest * self._minsz.get() / 100.0}
-        else:
-            keep = set()
-        px = float(self._px.get())
-        coms = ndimage.center_of_mass(mask, lbl, list(keep)) if keep else []
-        props = []
-        for idx, lab in enumerate(sorted(keep)):
-            a_px = areas_px[lab]; a_um = a_px * px * px
-            ecd = 2.0 * np.sqrt(a_um / np.pi)
-            cy, cx = coms[idx] if len(coms) else (0, 0)
-            props.append(dict(label=lab, area_px=a_px, area_um2=a_um,
-                              ecd_um=ecd, cx=cx, cy=cy))
-        self._props = props
-        total = mask.size
-        area_pct = sum(p["area_px"] for p in props) / total * 100 if total else 0
+        res = particle_stats(
+            self.img, auto=self._auto.get(), threshold_pct=self._thr.get(),
+            remove_edge=self._edge.get(), min_size_pct=self._minsz.get(),
+            px_um=float(self._px.get()))
+        props = res["props"]; self._props = props
+        area_pct = res["area_pct"]; keepmask = res["mask"]
         ecds = np.array([p["ecd_um"] for p in props]) if props else np.array([])
 
         self._fig.clf()
         ax1 = self._fig.add_subplot(2, 1, 1)
         ax1.imshow(self.img, cmap="turbo", origin="upper")
-        keepmask = np.isin(lbl, list(keep))
         ax1.contour(keepmask, levels=[0.5], colors="white", linewidths=0.6)
         for p in props:
             ax1.text(p["cx"], p["cy"], str(p["label"]), color="white",
