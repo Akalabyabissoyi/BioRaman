@@ -9349,6 +9349,7 @@ class ComponentAnalysisWindow(tk.Toplevel):
         self.x = np.asarray(app.xdata, dtype=float)
         self._refs = []
         self._res = None
+        self._lut = {}      # per-panel {index|'lof': {cmap, lo, hi}}
 
         left = tk.Frame(self, bg=C["sidebar"], width=300)
         left.pack(side="left", fill="y"); left.pack_propagate(False)
@@ -9413,6 +9414,33 @@ class ComponentAnalysisWindow(tk.Toplevel):
                     textvariable=self._dsig,
                     command=lambda: self._res and self._draw()).pack(
                         side="left", padx=6)
+
+        SectionDiv(left, "PANEL LUT").pack(fill="x")
+        cf = tk.Frame(left, bg=C["sidebar"]); cf.pack(fill="x", padx=10, pady=2)
+        tk.Label(cf, text="Colour map", width=9, anchor="w", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 9)).pack(side="left")
+        self._lut_cmap = tk.StringVar(value="turbo")
+        ttk.Combobox(cf, textvariable=self._lut_cmap, state="readonly", width=12,
+                     values=["turbo", "viridis", "plasma", "inferno", "magma",
+                             "cividis", "jet", "hot", "coolwarm", "RdBu_r",
+                             "gray", "gist_earth", "nipy_spectral"]).pack(
+                         side="left")
+        ct = tk.Frame(left, bg=C["sidebar"]); ct.pack(fill="x", padx=10, pady=2)
+        tk.Label(ct, text="Contrast %", width=9, anchor="w", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 9)).pack(side="left")
+        self._lut_lo = tk.DoubleVar(value=2.0)
+        self._lut_hi = tk.DoubleVar(value=98.0)
+        ttk.Spinbox(ct, from_=0, to=49, increment=1, width=5,
+                    textvariable=self._lut_lo).pack(side="left")
+        tk.Label(ct, text="–", bg=C["sidebar"], fg=C["text_dim"]).pack(side="left")
+        ttk.Spinbox(ct, from_=51, to=100, increment=1, width=5,
+                    textvariable=self._lut_hi).pack(side="left")
+        self._lut_all = tk.BooleanVar(value=False)
+        ttk.Checkbutton(left, variable=self._lut_all,
+                        text="Apply to all panels").pack(anchor="w", padx=12)
+        ttk.Button(left, text="🎨 Apply LUT to panel (use Component #)",
+                   command=self._apply_lut).pack(fill="x", padx=10, pady=2)
+
         ttk.Button(left, text="↓ Export maps + estimates",
                    command=self._export).pack(fill="x", padx=10, pady=2)
         self._status = tk.Label(left, text="", bg=C["sidebar"], fg=C["text_mid"],
@@ -9532,18 +9560,53 @@ class ComponentAnalysisWindow(tk.Toplevel):
         cols = min(3, n); rows = int(np.ceil(n / cols))
         ds = float(getattr(self, "_dsig", None).get()
                    if getattr(self, "_dsig", None) else 0.8)
+        def _clim(arr, s):
+            f = arr[np.isfinite(arr)]
+            if f.size == 0:
+                return None, None
+            lo, hi = np.percentile(f, [s["lo"], s["hi"]])
+            if hi <= lo:
+                lo, hi = float(f.min()), float(f.max())
+            return float(lo), float(hi)
         for k, (m, name) in enumerate(zip(maps, names)):
             ax = self._fig.add_subplot(rows, cols, k + 1)
-            show_map(ax, self._fig, m, cmap="turbo", sigma=ds, robust=True,
+            s = self._lut_for(k); vmin, vmax = _clim(m, s)
+            show_map(ax, self._fig, m, cmap=s["cmap"], sigma=ds, robust=False,
+                     vmin=vmin, vmax=vmax,
                      title=f"{name}  ({res['overall'][k]:.1f}%)")
         if show_lof:
             ax = self._fig.add_subplot(rows, cols, len(maps) + 1)
-            show_map(ax, self._fig, res["lof"], cmap="magma", sigma=ds,
-                     robust=True, title="% lack of fit")
+            s = self._lut_for("lof"); vmin, vmax = _clim(res["lof"], s)
+            show_map(ax, self._fig, res["lof"], cmap=s["cmap"], sigma=ds,
+                     robust=False, vmin=vmin, vmax=vmax, title="% lack of fit")
         self._fig.tight_layout(); self._cv.draw()
         self._conc.config(text="\n".join(
             f"{nm:<14}{v:6.2f}%" for nm, v in zip(names, res["overall"])))
         self._status.config(text="Done.")
+
+    def _lut_for(self, key):
+        d = self._lut.get(key)
+        if d:
+            return d
+        return {"cmap": "magma" if key == "lof" else "turbo",
+                "lo": 2.0, "hi": 98.0}
+
+    def _apply_lut(self):
+        if not self._res:
+            messagebox.showwarning("No result", "Run analysis first.", parent=self)
+            return
+        setting = {"cmap": self._lut_cmap.get(),
+                   "lo": float(self._lut_lo.get()),
+                   "hi": float(self._lut_hi.get())}
+        if self._lut_all.get():
+            for k in range(len(self._res["maps"])):
+                self._lut[k] = dict(setting)
+            self._lut["lof"] = dict(setting)
+        else:
+            k = int(self._pcomp.get()) - 1
+            n = len(self._res["maps"])
+            self._lut[k if k < n else "lof"] = dict(setting)
+        self._draw()
 
     def _to_particles(self):
         if not self._res:
