@@ -8669,22 +8669,58 @@ class VolumeRenderWindow(tk.Toplevel):
         self._reflbl.config(text="none loaded", fg=C["text_dim"])
         self._status.config(text="Reference spectra cleared.")
 
+    def _ref_from_file(self, path):
+        """Load a single reference spectrum from *any* supported format and
+        resample it onto the current data's wavenumber axis.
+
+        Works universally: WDF/WIP/SPC/JDX and ASCII (txt/csv/dpt/dat/asc),
+        single spectra or maps/volumes (averaged to a mean reference), with
+        any wavenumber ordering, spacing or range.
+        """
+        r = _open_raman_any(path)
+        sx = np.asarray(getattr(r, "xdata"), dtype=float).ravel()
+        sd = np.asarray(getattr(r, "spectra"), dtype=float)
+        # collapse any map/volume to one mean spectrum over the spectral axis
+        spec = sd.reshape(-1, sd.shape[-1]).mean(axis=0)
+        # reconcile axis/spectrum lengths
+        if sx.size != spec.size:
+            if sx.size > spec.size:
+                sx = sx[:spec.size]
+            else:
+                spec = spec[:sx.size]
+        if sx.size < 2:
+            raise RuntimeError("reference has too few points.")
+        # ascending axis, de-duplicated, finite values
+        order = np.argsort(sx)
+        sx, spec = sx[order], spec[order]
+        sx, uniq = np.unique(sx, return_index=True)
+        spec = spec[uniq]
+        spec = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
+        # warn (caller handles) if there is essentially no spectral overlap
+        overlap = min(sx.max(), float(self.xdata.max())) - \
+                  max(sx.min(), float(self.xdata.min()))
+        si = np.interp(self.xdata, sx, spec)   # clamps outside the ref range
+        return si, overlap
+
     def _load_refs(self):
         paths = filedialog.askopenfilenames(
-            parent=self, title="Load reference component spectra",
+            parent=self, title="Load reference component spectra (any format)",
             filetypes=[("Raman spectra",
-                        "*.txt *.csv *.dpt *.dat *.jdx *.asc *.wdf *.spc"),
-                       ("All", "*.*")])
+                        "*.txt *.csv *.dpt *.dat *.jdx *.asc *.wdf *.wip *.spc"),
+                       ("All files", "*.*")])
         if not paths:
             return
         added = 0
-        for i, p in enumerate(paths):
+        for p in paths:
             try:
-                r = _open_raman_any(p)
-                sx = np.asarray(r.xdata, dtype=float)
-                sd = np.asarray(r.spectra, dtype=float)
-                spec = sd.reshape(-1, sd.shape[-1]).mean(axis=0)   # mean spectrum
-                si = np.interp(self.xdata, sx, spec)               # onto data axis
+                si, overlap = self._ref_from_file(p)
+                if overlap <= 0:
+                    messagebox.showwarning(
+                        "No spectral overlap",
+                        f"{Path(p).name}: its wavenumber range does not overlap "
+                        "the loaded data, so it cannot be used as a reference.",
+                        parent=self)
+                    continue
                 col = self.REF_COLORS[len(self._refs) % len(self.REF_COLORS)]
                 self._refs.append({"name": Path(p).stem[:18],
                                    "color": col, "spec": si})
