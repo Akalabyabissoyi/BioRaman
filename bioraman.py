@@ -611,6 +611,16 @@ def _normalise_reader(r):
             if s2 is not None:
                 cube = _cube_from_positions(s2, xp, yp)
                 if cube is not None:
+                    # physical pixel size (µm) from stage-position spacing
+                    try:
+                        xs = np.unique(np.round(xp, 3)); ys = np.unique(np.round(yp, 3))
+                        dx = np.median(np.diff(xs)) if xs.size > 1 else 0
+                        dy = np.median(np.diff(ys)) if ys.size > 1 else 0
+                        vals = [v for v in (abs(dx), abs(dy)) if v > 0]
+                        if vals:
+                            r._px_um = float(np.mean(vals))
+                    except Exception:
+                        pass
                     # reconstruct the true confocal volume when a depth axis exists
                     zp = getattr(r, "zpos", None)
                     if zp is not None:
@@ -1077,12 +1087,34 @@ def _smooth_nan(a, sigma):
     return out
 
 
+def _add_scale_bar(ax, shape, px_um):
+    """Draw a µm scale bar (bottom-left) on a map axis."""
+    if not px_um or px_um <= 0:
+        return
+    import matplotlib.patheffects as pe
+    ny, nx = shape[:2]
+    target = nx * px_um * 0.25                      # ~quarter of the width
+    nice = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+    L = min(nice, key=lambda v: abs(v - target))
+    Lpx = L / px_um
+    if Lpx >= nx * 0.9:
+        return
+    x0 = nx * 0.06; y0 = ny * 0.92
+    ln = ax.plot([x0, x0 + Lpx], [y0, y0], color="white", lw=3,
+                 solid_capstyle="butt")[0]
+    ln.set_path_effects([pe.withStroke(linewidth=5, foreground="black")])
+    lbl = f"{L:g} µm"
+    tx = ax.text(x0 + Lpx / 2, y0 - ny * 0.02, lbl, color="white",
+                 ha="center", va="bottom", fontsize=8, fontweight="bold")
+    tx.set_path_effects([pe.withStroke(linewidth=2, foreground="black")])
+
+
 def show_map(ax, fig, arr, cmap="turbo", sigma=0.8, robust=True,
              vmin=None, vmax=None, title=None, title_color=None,
-             colorbar=True, equal=True):
+             colorbar=True, equal=True, px_um=None):
     """Render a 2-D map the way instrument software does: light NaN-aware
-    Gaussian smoothing, bilinear interpolation, robust percentile contrast and
-    an equal aspect ratio. Returns the AxesImage."""
+    Gaussian smoothing, bilinear interpolation, robust percentile contrast, an
+    equal aspect ratio and an optional µm scale bar. Returns the AxesImage."""
     a = _smooth_nan(arr, sigma)
     finite = a[np.isfinite(a)]
     if vmin is None or vmax is None:
@@ -1107,6 +1139,7 @@ def show_map(ax, fig, arr, cmap="turbo", sigma=0.8, robust=True,
     if colorbar:
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
                      shrink=0.85).ax.tick_params(labelsize=7)
+    _add_scale_bar(ax, a.shape, px_um)
     return im
 
 
@@ -4383,6 +4416,7 @@ class RamanApp(tk.Tk):
             # Retain the true confocal volume (Z×Y×X×W) when present
             self._volume = getattr(r, "_volume", None)
             self._zvals  = getattr(r, "_zvals", None)
+            self._px_um  = getattr(r, "_px_um", None)   # µm per pixel (scale bar)
             def cb(f):
                 self.after(0, lambda: self.progress.configure(value=f*100))
             proc, report = preprocess_map(r.spectra, params, cb)
@@ -7874,7 +7908,7 @@ class MCRWindow(tk.Toplevel):
                                  if getattr(self, "_dsig", None) else 0.8),
                      robust=False, vmin=vmin, vmax=vmax,
                      title=f"Abundance Map — C{c+1}", title_color=cols[c],
-                     colorbar=False)
+                     colorbar=False, px_um=getattr(self.master, "_px_um", None))
 
         self._canvas.draw_idle()
         self._status.config(
@@ -8156,7 +8190,8 @@ class NFindrWindow(tk.Toplevel):
                      sigma=float(getattr(self, "_dsig", None).get()
                                  if getattr(self, "_dsig", None) else 0.8),
                      robust=False, vmin=vmin, vmax=vmax,
-                     title=f"Abundance — EM {c+1}", title_color=cols[c])
+                     title=f"Abundance — EM {c+1}", title_color=cols[c],
+                     px_um=getattr(self.master, "_px_um", None))
 
         self._canvas.draw_idle()
         self._status.config(
@@ -9645,17 +9680,19 @@ class ComponentAnalysisWindow(tk.Toplevel):
             if hi <= lo:
                 lo, hi = float(f.min()), float(f.max())
             return float(lo), float(hi)
+        pxu = getattr(self.app, "_px_um", None)
         for k, (m, name) in enumerate(zip(maps, names)):
             ax = self._fig.add_subplot(rows, cols, k + 1)
             s = self._lut_for(k); vmin, vmax = _clim(m, s)
             show_map(ax, self._fig, m, cmap=s["cmap"], sigma=ds, robust=False,
-                     vmin=vmin, vmax=vmax,
+                     vmin=vmin, vmax=vmax, px_um=pxu,
                      title=f"{name}  ({res['overall'][k]:.1f}%)")
         if show_lof:
             ax = self._fig.add_subplot(rows, cols, len(maps) + 1)
             s = self._lut_for("lof"); vmin, vmax = _clim(res["lof"], s)
             show_map(ax, self._fig, res["lof"], cmap=s["cmap"], sigma=ds,
-                     robust=False, vmin=vmin, vmax=vmax, title="% lack of fit")
+                     robust=False, vmin=vmin, vmax=vmax, px_um=pxu,
+                     title="% lack of fit")
         self._fig.tight_layout(); self._cv.draw()
         self._conc.config(text="\n".join(
             f"{nm:<14}{v:6.2f}%" for nm, v in zip(names, res["overall"])))
