@@ -7615,6 +7615,14 @@ class MCRWindow(tk.Toplevel):
                    command=self._compare_comps).pack(fill="x", padx=12, pady=4)
         ttk.Button(left, text="⛯ Identify Peaks", style="N.TButton",
                    command=self._identify_peaks).pack(fill="x", padx=12, pady=4)
+        ds = tk.Frame(left, bg=C["sidebar"]); ds.pack(fill="x", padx=12, pady=4)
+        tk.Label(ds, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left")
+        self._dsig = tk.DoubleVar(value=0.8)
+        ttk.Spinbox(ds, from_=0.0, to=4.0, increment=0.2, width=5,
+                    textvariable=self._dsig,
+                    command=lambda: getattr(self, "_C", None) is not None
+                    and self._draw()).pack(side="left", padx=6)
 
         SectionDiv(left, "EXPORT").pack(fill="x")
         ttk.Button(left, text="↓ Save Figure", style="N.TButton",
@@ -7790,7 +7798,9 @@ class MCRWindow(tk.Toplevel):
         for c in range(k):
             ax_m = self._fig.add_subplot(gs[1, c])
             show_map(ax_m, self._fig, self._C[:, :, c], cmap="turbo",
-                     sigma=0.8, robust=True, title=f"Abundance Map — C{c+1}",
+                     sigma=float(getattr(self, "_dsig", None).get()
+                                 if getattr(self, "_dsig", None) else 0.8),
+                     robust=True, title=f"Abundance Map — C{c+1}",
                      title_color=cols[c], colorbar=False)
 
         self._canvas.draw_idle()
@@ -7908,6 +7918,14 @@ class NFindrWindow(tk.Toplevel):
                    command=self._compare_ems).pack(fill="x", padx=12, pady=4)
         ttk.Button(left, text="⛯ Identify Peaks", style="N.TButton",
                    command=self._identify_peaks).pack(fill="x", padx=12, pady=4)
+        ds = tk.Frame(left, bg=C["sidebar"]); ds.pack(fill="x", padx=12, pady=4)
+        tk.Label(ds, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left")
+        self._dsig = tk.DoubleVar(value=0.8)
+        ttk.Spinbox(ds, from_=0.0, to=4.0, increment=0.2, width=5,
+                    textvariable=self._dsig,
+                    command=lambda: self._abund is not None and self._draw()
+                    ).pack(side="left", padx=6)
 
         SectionDiv(left, "EXPORT").pack(fill="x")
         ttk.Button(left, text="↓ Save Figure", style="N.TButton",
@@ -8058,7 +8076,9 @@ class NFindrWindow(tk.Toplevel):
         for c in range(p):
             ax_m = self._fig.add_subplot(gs[1, c])
             show_map(ax_m, self._fig, self._abund[:, :, c], cmap="turbo",
-                     sigma=0.8, robust=True, title=f"Abundance — EM {c+1}",
+                     sigma=float(getattr(self, "_dsig", None).get()
+                                 if getattr(self, "_dsig", None) else 0.8),
+                     robust=True, title=f"Abundance — EM {c+1}",
                      title_color=cols[c])
 
         self._canvas.draw_idle()
@@ -9385,6 +9405,14 @@ class ComponentAnalysisWindow(tk.Toplevel):
         self._pspin.pack(side="left", padx=4)
         ttk.Button(left, text="◍ Particle statistics on component",
                    command=self._to_particles).pack(fill="x", padx=10, pady=2)
+        dsf = tk.Frame(left, bg=C["sidebar"]); dsf.pack(fill="x", padx=10, pady=2)
+        tk.Label(dsf, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._dsig = tk.DoubleVar(value=0.8)
+        ttk.Spinbox(dsf, from_=0.0, to=4.0, increment=0.2, width=5,
+                    textvariable=self._dsig,
+                    command=lambda: self._res and self._draw()).pack(
+                        side="left", padx=6)
         ttk.Button(left, text="↓ Export maps + estimates",
                    command=self._export).pack(fill="x", padx=10, pady=2)
         self._status = tk.Label(left, text="", bg=C["sidebar"], fg=C["text_mid"],
@@ -9502,13 +9530,15 @@ class ComponentAnalysisWindow(tk.Toplevel):
         show_lof = self._lof.get()
         n = len(maps) + (1 if show_lof else 0)
         cols = min(3, n); rows = int(np.ceil(n / cols))
+        ds = float(getattr(self, "_dsig", None).get()
+                   if getattr(self, "_dsig", None) else 0.8)
         for k, (m, name) in enumerate(zip(maps, names)):
             ax = self._fig.add_subplot(rows, cols, k + 1)
-            show_map(ax, self._fig, m, cmap="turbo", sigma=0.8, robust=True,
+            show_map(ax, self._fig, m, cmap="turbo", sigma=ds, robust=True,
                      title=f"{name}  ({res['overall'][k]:.1f}%)")
         if show_lof:
             ax = self._fig.add_subplot(rows, cols, len(maps) + 1)
-            show_map(ax, self._fig, res["lof"], cmap="magma", sigma=0.8,
+            show_map(ax, self._fig, res["lof"], cmap="magma", sigma=ds,
                      robust=True, title="% lack of fit")
         self._fig.tight_layout(); self._cv.draw()
         self._conc.config(text="\n".join(
