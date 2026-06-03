@@ -16,6 +16,8 @@ clustering (K-means, hierarchical), and 3D confocal volume rendering.
 - Interactive 2D Raman map exploration with band-ratio and peak-intensity maps
 - Baseline correction and Savitzky–Golay smoothing
 - Cluster analysis: K-means and agglomerative clustering with per-cluster mean spectra
+- Component analysis (DCLS / NNLS) with reference spectra: concentration maps, % lack-of-fit, and concentration estimates (WiRE-style)
+- Particle statistics: Otsu binarisation, equivalent circle diameter, area %, counts, histogram and CSV export
 - MCR-ALS multivariate curve resolution (non-negative factorisation)
 - N-FINDR endmember extraction with NNLS abundance maps
 - Spectral tools: resampling, spatial cropping, rotation, background subtraction

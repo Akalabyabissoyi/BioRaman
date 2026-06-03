@@ -2936,6 +2936,10 @@ class RamanApp(tk.Tk):
         am.add_command(label="⟠  MCR-ALS…",              command=self.open_mcr)
         am.add_command(label="◉  N-FINDR Endmembers…",   command=self.open_nfindr)
         am.add_separator()
+        am.add_command(label="⚗  Component Analysis (DCLS/NNLS)…",
+                       command=self.open_component_analysis)
+        am.add_command(label="◍  Particle Statistics…",
+                       command=self.open_particle_stats)
         am.add_command(label="🔎  Library Search (full-spectrum)…",
                        command=self.open_library_search)
         am.add_command(label="⚒  Spectral Tools…",       command=self.open_spectral_tools)
@@ -6558,6 +6562,30 @@ class RamanApp(tk.Tk):
             messagebox.showwarning("No data", "Load a file first."); return
         LibrarySearchWindow(self)
 
+    def open_component_analysis(self):
+        """Supervised component analysis (DCLS/NNLS) → concentration maps,
+        lack-of-fit and concentration estimates (WiRE-style)."""
+        if self.spectra is None:
+            messagebox.showwarning("No data", "Load a file first."); return
+        ComponentAnalysisWindow(self)
+
+    def open_particle_stats(self):
+        """Particle / domain statistics on the current single-band map."""
+        if self.spectra is None:
+            messagebox.showwarning("No data", "Load a file first."); return
+        try:
+            arr = np.asarray(self.im.get_array(), dtype=float)
+        except Exception:
+            arr = None
+        if arr is None or arr.ndim != 2:
+            messagebox.showinfo(
+                "Need a single-band map",
+                "Particle statistics needs a single-band intensity map. Build "
+                "one first (Univariate, Ratio, or a Component Analysis "
+                "concentration map), then try again.")
+            return
+        ParticleStatsWindow(self, arr, "current map")
+
     def save_report(self):
         """Write a self-contained HTML report of the current map + recipe."""
         if self.spectra is None:
@@ -9213,6 +9241,424 @@ class LibrarySearchWindow(tk.Toplevel):
             for i, (name, score, _) in enumerate(self._results, 1):
                 w.writerow([i, name, f"{score:.4f}"])
         messagebox.showinfo("Export", f"Saved {len(self._results)} matches.",
+                            parent=self)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v14: COMPONENT ANALYSIS (DCLS / NNLS) + PARTICLE STATISTICS  (WiRE-style)
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_reference_spectrum(path, xaxis):
+    """Load a single reference spectrum (any format) onto a target axis."""
+    r = _open_raman_any(path)
+    sx = np.asarray(r.xdata, dtype=float).ravel()
+    sd = np.asarray(r.spectra, dtype=float)
+    spec = sd.reshape(-1, sd.shape[-1]).mean(axis=0)
+    if sx.size != spec.size:
+        m = min(sx.size, spec.size); sx, spec = sx[:m], spec[:m]
+    order = np.argsort(sx); sx, spec = sx[order], spec[order]
+    sx, uniq = np.unique(sx, return_index=True); spec = spec[uniq]
+    spec = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.interp(xaxis, sx, spec)
+
+
+def _otsu_threshold(img):
+    """Otsu's threshold for a 2-D image (numpy only, no skimage)."""
+    v = np.asarray(img, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0 or v.max() <= v.min():
+        return float(np.nanmedian(img))
+    hist, edges = np.histogram(v, bins=256)
+    centers = (edges[:-1] + edges[1:]) / 2
+    w = hist.astype(float); tot = w.sum()
+    wB = np.cumsum(w); wF = tot - wB
+    sumtot = (w * centers).sum(); sumB = np.cumsum(w * centers)
+    valid = (wB > 0) & (wF > 0)
+    mB = np.divide(sumB, wB, out=np.zeros_like(sumB), where=wB > 0)
+    mF = np.divide(sumtot - sumB, wF, out=np.zeros_like(sumB), where=wF > 0)
+    between = wB * wF * (mB - mF) ** 2
+    between[~valid] = -1
+    return float(centers[int(np.argmax(between))])
+
+
+class ComponentAnalysisWindow(tk.Toplevel):
+    """Supervised component analysis (DCLS / NNLS) on a 2-D map, producing
+    concentration maps, a percentage lack-of-fit map and overall concentration
+    estimates — the Renishaw WiRE \"Component analysis\" workflow."""
+    COLORS = ["#e8483b", "#2ecc55", "#3b7ae8", "#f59e0b", "#9b59b6", "#06b6d4"]
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.title("Component Analysis  (DCLS / NNLS)")
+        self.configure(bg=C["bg"]); self.geometry("1180x760")
+        self.app = app
+        self.x = np.asarray(app.xdata, dtype=float)
+        self._refs = []
+        self._res = None
+
+        left = tk.Frame(self, bg=C["sidebar"], width=300)
+        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        SectionDiv(left, "REFERENCE COMPONENTS").pack(fill="x")
+        ttk.Button(left, text="＋ Load reference spectra…",
+                   command=self._load_refs).pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Button(left, text="✕ Clear",
+                   command=self._clear).pack(fill="x", padx=10, pady=2)
+        self._refl = tk.Label(left, text="none loaded", bg=C["sidebar"],
+                              fg=C["text_dim"], font=("Segoe UI", 9),
+                              wraplength=270, justify="left")
+        self._refl.pack(fill="x", padx=10, pady=4)
+
+        SectionDiv(left, "FIT OPTIONS").pack(fill="x")
+        def combo(label, var, vals):
+            r = tk.Frame(left, bg=C["sidebar"]); r.pack(fill="x", padx=10, pady=3)
+            tk.Label(r, text=label, width=12, anchor="w", bg=C["sidebar"],
+                     fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+            ttk.Combobox(r, textvariable=var, state="readonly", width=15,
+                         values=vals).pack(side="left")
+        self._method = tk.StringVar(value="NNLS")
+        combo("Method", self._method, ["NNLS", "DCLS"])
+        self._prep = tk.StringVar(value="Spectrum")
+        combo("Spectrum", self._prep, ["Spectrum", "1st derivative",
+                                       "2nd derivative"])
+        self._norm = tk.StringVar(value="None (quantitative)")
+        combo("Normalise", self._norm, ["None (quantitative)", "Vector",
+                                        "Mean-centre + unit variance"])
+        rb = tk.Frame(left, bg=C["sidebar"]); rb.pack(fill="x", padx=10, pady=3)
+        tk.Label(rb, text="Background", width=12, anchor="w", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+        self._bg = tk.IntVar(value=4)
+        ttk.Spinbox(rb, from_=0, to=7, textvariable=self._bg,
+                    width=5).pack(side="left")
+        tk.Label(rb, text="poly order", bg=C["sidebar"], fg=C["text_dim"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=4)
+        self._lof = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, variable=self._lof,
+                        text="Calculate % lack of fit").pack(anchor="w", padx=12)
+        ttk.Button(left, text="▶ Run component analysis", style="ROI.TButton",
+                   command=self._run).pack(fill="x", padx=10, pady=(10, 4))
+
+        SectionDiv(left, "CONCENTRATION ESTIMATE").pack(fill="x")
+        self._conc = tk.Label(left, text="(run analysis)", bg=C["sidebar"],
+                              fg=C["text_hi"], font=("Consolas", 10),
+                              justify="left", anchor="w")
+        self._conc.pack(fill="x", padx=10, pady=4)
+        pf = tk.Frame(left, bg=C["sidebar"]); pf.pack(fill="x", padx=10, pady=2)
+        tk.Label(pf, text="Component", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._pcomp = tk.IntVar(value=1)
+        self._pspin = ttk.Spinbox(pf, from_=1, to=1, textvariable=self._pcomp,
+                                  width=5)
+        self._pspin.pack(side="left", padx=4)
+        ttk.Button(left, text="◍ Particle statistics on component",
+                   command=self._to_particles).pack(fill="x", padx=10, pady=2)
+        ttk.Button(left, text="↓ Export maps + estimates",
+                   command=self._export).pack(fill="x", padx=10, pady=2)
+        self._status = tk.Label(left, text="", bg=C["sidebar"], fg=C["text_mid"],
+                                font=("Segoe UI", 9), wraplength=270,
+                                justify="left")
+        self._status.pack(fill="x", padx=10, pady=6)
+
+        right = tk.Frame(self, bg=C["bg"]); right.pack(side="left", fill="both",
+                                                       expand=True)
+        self._fig = plt.Figure(figsize=(8, 7)); self._cv = FigureCanvasTkAgg(
+            self._fig, master=right)
+        self._cv.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=6)
+        note = ("Tip: load the map with Preprocessing → Normalisation = none and "
+                "use 'None (quantitative)' here for quantitative concentrations.")
+        tk.Label(right, text=note, bg=C["bg"], fg=C["text_dim"],
+                 font=("Segoe UI", 9)).pack(pady=(0, 4))
+
+    # ── references ──────────────────────────────────────────────────────────
+    def _load_refs(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Load reference component spectra (any format)",
+            filetypes=[("Spectra", "*.txt *.csv *.dpt *.dat *.asc *.jdx *.spc "
+                        "*.wdf *.wip"), ("All files", "*.*")])
+        for p in paths or []:
+            try:
+                spec = _load_reference_spectrum(p, self.x)
+                self._refs.append({"name": Path(p).stem[:18], "spec": spec})
+            except Exception as e:
+                messagebox.showwarning("Load error", f"{Path(p).name}: {e}",
+                                       parent=self)
+        if self._refs:
+            self._refl.config(text=f"{len(self._refs)}: " +
+                              ", ".join(r["name"] for r in self._refs),
+                              fg=C["success"])
+            self._pspin.config(to=len(self._refs))
+
+    def _clear(self):
+        self._refs = []; self._res = None
+        self._refl.config(text="none loaded", fg=C["text_dim"])
+        self._conc.config(text="(run analysis)")
+
+    # ── fit ─────────────────────────────────────────────────────────────────
+    def _prep_mat(self, M):
+        mode = self._prep.get(); norm = self._norm.get()
+        if mode == "1st derivative":
+            M = np.gradient(M, axis=-1)
+        elif mode == "2nd derivative":
+            M = np.gradient(np.gradient(M, axis=-1), axis=-1)
+        if norm == "Vector":
+            n = np.linalg.norm(M, axis=-1, keepdims=True)
+            M = np.divide(M, n, out=np.zeros_like(M), where=n > 0)
+        elif norm.startswith("Mean"):
+            mu = M.mean(axis=-1, keepdims=True); sd = M.std(axis=-1, keepdims=True)
+            M = np.divide(M - mu, sd, out=np.zeros_like(M), where=sd > 0)
+        return M
+
+    def _run(self):
+        if len(self._refs) < 1:
+            messagebox.showwarning("References",
+                "Load at least one reference component.", parent=self); return
+        self._status.config(text="Fitting…"); self.update_idletasks()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        try:
+            S = np.asarray(self.app.spectra, dtype=float)
+            Y, X, W = S.shape; N = Y * X
+            Fq = self._prep_mat(S.reshape(N, W))
+            R = self._prep_mat(np.stack([r["spec"] for r in self._refs], axis=0))
+            R = R.T                                  # W × K
+            K = R.shape[1]
+            A = R
+            bg = int(self._bg.get())
+            if self._prep.get() == "Spectrum" and bg > 0:
+                xn = np.linspace(-1, 1, W)
+                P = np.vander(xn, bg + 1, increasing=True)
+                A = np.hstack([R, P])
+            M = A.shape[1]
+            C = np.zeros((N, K)); recon = np.zeros((N, W))
+            if self._method.get() == "DCLS":
+                coef, *_ = np.linalg.lstsq(A, Fq.T, rcond=None)   # M × N
+                C = coef[:K].T
+                recon = (A @ coef).T
+            else:
+                from scipy.optimize import nnls
+                if M > K:                            # references ≥0, background free
+                    from scipy.optimize import lsq_linear
+                    lb = np.concatenate([np.zeros(K), -np.inf * np.ones(M - K)])
+                    ub = np.inf * np.ones(M)
+                    for i in range(N):
+                        sol = lsq_linear(A, Fq[i], bounds=(lb, ub), method="bvls")
+                        C[i] = sol.x[:K]; recon[i] = A @ sol.x
+                else:
+                    for i in range(N):
+                        c, _ = nnls(A, Fq[i]); C[i] = c; recon[i] = A @ c
+            resid = Fq - recon
+            lof = (np.linalg.norm(resid, axis=1) /
+                   (np.linalg.norm(Fq, axis=1) + 1e-9) * 100).reshape(Y, X)
+            Cc = np.clip(C, 0, None)
+            tot = Cc.sum(axis=1, keepdims=True)
+            rel = np.divide(Cc, tot, out=np.zeros_like(Cc), where=tot > 0) * 100
+            maps = [rel[:, k].reshape(Y, X) for k in range(K)]
+            overall = Cc.sum(axis=0) / (Cc.sum() + 1e-9) * 100
+            self._res = dict(maps=maps, lof=lof, overall=overall,
+                             names=[r["name"] for r in self._refs])
+            self.after(0, self._draw)
+        except Exception as exc:
+            self.after(0, lambda exc=exc: messagebox.showerror(
+                "Component analysis failed", str(exc), parent=self))
+            self.after(0, lambda: self._status.config(text=""))
+
+    def _draw(self):
+        res = self._res; self._fig.clf()
+        maps = res["maps"]; names = res["names"]
+        show_lof = self._lof.get()
+        n = len(maps) + (1 if show_lof else 0)
+        cols = min(3, n); rows = int(np.ceil(n / cols))
+        for k, (m, name) in enumerate(zip(maps, names)):
+            ax = self._fig.add_subplot(rows, cols, k + 1)
+            im = ax.imshow(m, cmap="turbo", origin="upper", vmin=0, vmax=100)
+            ax.set_title(f"{name}  ({res['overall'][k]:.1f}%)", fontsize=10)
+            ax.set_xticks([]); ax.set_yticks([])
+            self._fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        if show_lof:
+            ax = self._fig.add_subplot(rows, cols, len(maps) + 1)
+            im = ax.imshow(res["lof"], cmap="magma", origin="upper")
+            ax.set_title("% lack of fit", fontsize=10)
+            ax.set_xticks([]); ax.set_yticks([])
+            self._fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        self._fig.tight_layout(); self._cv.draw()
+        self._conc.config(text="\n".join(
+            f"{nm:<14}{v:6.2f}%" for nm, v in zip(names, res["overall"])))
+        self._status.config(text="Done.")
+
+    def _to_particles(self):
+        if not self._res:
+            messagebox.showwarning("No result", "Run analysis first.", parent=self)
+            return
+        k = int(self._pcomp.get()) - 1
+        k = max(0, min(k, len(self._res["maps"]) - 1))
+        ParticleStatsWindow(self.app, self._res["maps"][k],
+                            f"{self._res['names'][k]} concentration")
+
+    def _export(self):
+        if not self._res:
+            messagebox.showwarning("No result", "Run analysis first.", parent=self)
+            return
+        d = filedialog.askdirectory(parent=self, title="Export folder")
+        if not d:
+            return
+        for nm, m in zip(self._res["names"], self._res["maps"]):
+            np.savetxt(os.path.join(d, f"conc_{nm}.csv"), m, fmt="%.4f",
+                       delimiter=",")
+        if self._lof.get():
+            np.savetxt(os.path.join(d, "lack_of_fit.csv"), self._res["lof"],
+                       fmt="%.4f", delimiter=",")
+        import csv
+        with open(os.path.join(d, "concentration_estimates.csv"), "w",
+                  newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh); w.writerow(["component", "percent"])
+            for nm, v in zip(self._res["names"], self._res["overall"]):
+                w.writerow([nm, f"{v:.3f}"])
+        self._status.config(text=f"Exported to {Path(d).name}")
+
+
+class ParticleStatsWindow(tk.Toplevel):
+    """Particle / domain statistics on a 2-D image: Otsu (or manual) binarise,
+    label connected regions, and report area, equivalent circle diameter and
+    counts with a size histogram and CSV export (WiRE Particle Statistics)."""
+
+    def __init__(self, app, image, name="image"):
+        super().__init__(app)
+        self.title(f"Particle Statistics — {name}")
+        self.configure(bg=C["bg"]); self.geometry("1080x720")
+        self.app = app
+        self.img = np.asarray(image, dtype=float)
+        self.name = name
+        self._props = []
+
+        left = tk.Frame(self, bg=C["sidebar"], width=290)
+        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        SectionDiv(left, "BINARISATION").pack(fill="x")
+        self._auto = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, variable=self._auto, text="Auto-binarise (Otsu)",
+                        command=self._run).pack(anchor="w", padx=12, pady=2)
+        tk.Label(left, text="Threshold (% of max)", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 9)).pack(anchor="w", padx=12)
+        self._thr = tk.DoubleVar(value=50.0)
+        ttk.Scale(left, from_=1, to=99, variable=self._thr, orient="horizontal",
+                  command=lambda _e: self._run()).pack(fill="x", padx=12)
+        SectionDiv(left, "FILTERS").pack(fill="x")
+        self._edge = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, variable=self._edge, text="Remove edge particles",
+                        command=self._run).pack(anchor="w", padx=12)
+        rf = tk.Frame(left, bg=C["sidebar"]); rf.pack(fill="x", padx=12, pady=3)
+        tk.Label(rf, text="Min size (% of largest)", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 9)).pack(side="left")
+        self._minsz = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(rf, from_=0, to=100, textvariable=self._minsz, width=6,
+                    command=self._run).pack(side="left", padx=4)
+        rp = tk.Frame(left, bg=C["sidebar"]); rp.pack(fill="x", padx=12, pady=3)
+        tk.Label(rp, text="Pixel size (µm)", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._px = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(rp, from_=0.01, to=1000, increment=0.1, textvariable=self._px,
+                    width=7, command=self._run).pack(side="left", padx=4)
+        ttk.Button(left, text="↻ Recompute", style="ROI.TButton",
+                   command=self._run).pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Button(left, text="↓ Export particle table (CSV)",
+                   command=self._export).pack(fill="x", padx=10, pady=2)
+        self._summary = tk.Label(left, text="", bg=C["sidebar"], fg=C["text_hi"],
+                                 font=("Consolas", 9), justify="left", anchor="w")
+        self._summary.pack(fill="x", padx=10, pady=8)
+
+        right = tk.Frame(self, bg=C["bg"]); right.pack(side="left", fill="both",
+                                                       expand=True)
+        self._fig = plt.Figure(figsize=(8, 6.6)); self._cv = FigureCanvasTkAgg(
+            self._fig, master=right)
+        self._cv.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=6)
+        self._run()
+
+    def _run(self, *_):
+        try:
+            from scipy import ndimage
+        except Exception:
+            messagebox.showerror("SciPy required", "Particle statistics needs "
+                                 "SciPy.", parent=self); return
+        img = self.img.copy()
+        finite = np.isfinite(img)
+        img[~finite] = np.nanmin(img[finite]) if finite.any() else 0.0
+        if self._auto.get():
+            thr = _otsu_threshold(img)
+        else:
+            lo, hi = np.nanmin(img), np.nanmax(img)
+            thr = lo + (hi - lo) * self._thr.get() / 100.0
+        mask = img >= thr
+        lbl, n = ndimage.label(mask)
+        if self._edge.get() and n:
+            border = set(lbl[0, :]) | set(lbl[-1, :]) | set(lbl[:, 0]) | set(lbl[:, -1])
+            for b in border:
+                if b: lbl[lbl == b] = 0
+        counts = np.bincount(lbl.ravel())
+        areas_px = {i: counts[i] for i in range(1, len(counts)) if counts[i] > 0}
+        if areas_px:
+            biggest = max(areas_px.values())
+            keep = {i for i, a in areas_px.items()
+                    if a >= biggest * self._minsz.get() / 100.0}
+        else:
+            keep = set()
+        px = float(self._px.get())
+        coms = ndimage.center_of_mass(mask, lbl, list(keep)) if keep else []
+        props = []
+        for idx, lab in enumerate(sorted(keep)):
+            a_px = areas_px[lab]; a_um = a_px * px * px
+            ecd = 2.0 * np.sqrt(a_um / np.pi)
+            cy, cx = coms[idx] if len(coms) else (0, 0)
+            props.append(dict(label=lab, area_px=a_px, area_um2=a_um,
+                              ecd_um=ecd, cx=cx, cy=cy))
+        self._props = props
+        total = mask.size
+        area_pct = sum(p["area_px"] for p in props) / total * 100 if total else 0
+        ecds = np.array([p["ecd_um"] for p in props]) if props else np.array([])
+
+        self._fig.clf()
+        ax1 = self._fig.add_subplot(2, 1, 1)
+        ax1.imshow(self.img, cmap="turbo", origin="upper")
+        keepmask = np.isin(lbl, list(keep))
+        ax1.contour(keepmask, levels=[0.5], colors="white", linewidths=0.6)
+        for p in props:
+            ax1.text(p["cx"], p["cy"], str(p["label"]), color="white",
+                     fontsize=6, ha="center", va="center")
+        ax1.set_title(f"{self.name}: {len(props)} particles", fontsize=10)
+        ax1.set_xticks([]); ax1.set_yticks([])
+        ax2 = self._fig.add_subplot(2, 1, 2)
+        if ecds.size:
+            ax2.hist(ecds, bins=min(30, max(5, ecds.size)), color="#2563eb",
+                     alpha=0.85)
+            ax2.set_xlabel("Equivalent circle diameter (µm)")
+            ax2.set_ylabel("Count")
+        ax2.set_title("Size distribution", fontsize=10)
+        self._fig.tight_layout(); self._cv.draw()
+
+        if ecds.size:
+            self._summary.config(text=(
+                f"particles : {len(props)}\n"
+                f"area %     : {area_pct:6.2f}\n"
+                f"mean ECD   : {ecds.mean():6.2f} µm\n"
+                f"median ECD : {np.median(ecds):6.2f} µm\n"
+                f"min / max  : {ecds.min():.2f} / {ecds.max():.2f} µm"))
+        else:
+            self._summary.config(text="no particles above threshold")
+
+    def _export(self):
+        if not self._props:
+            messagebox.showwarning("Export", "No particles to export.", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+            initialfile="particles")
+        if not path:
+            return
+        import csv
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["label", "area_px", "area_um2", "ecd_um", "cx", "cy"])
+            for p in self._props:
+                w.writerow([p["label"], p["area_px"], f"{p['area_um2']:.3f}",
+                            f"{p['ecd_um']:.3f}", f"{p['cx']:.1f}", f"{p['cy']:.1f}"])
+        messagebox.showinfo("Export", f"Saved {len(self._props)} particles.",
                             parent=self)
 
 

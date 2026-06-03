@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Gaussian smoothing/upsampling, Z-stretch, opacity and background; robust
   percentile contrast; interactive HTML + high-resolution PNG export. Plotly
   (and kaleido for PNG) are auto-installed on first use.
+- **Component Analysis (DCLS / NNLS)** (`Analysis → Component Analysis`) —
+  supervised least-squares fitting of reference spectra to a 2-D map, producing
+  per-component **concentration maps**, a **% lack-of-fit** map and overall
+  **concentration estimates**, matching the Renishaw WiRE workflow. Options:
+  NNLS or DCLS, Spectrum / 1st / 2nd derivative, normalisation
+  (none / vector / mean-centre+unit-variance), and a modelled polynomial
+  background. Export maps + estimates to CSV.
+- **Particle Statistics** (`Analysis → Particle Statistics`) — Otsu (or manual)
+  binarisation of any single-band / concentration map, connected-component
+  labelling, per-particle area and **equivalent circle diameter**, area %,
+  counts, a size-distribution histogram, edge/size filtering and CSV export.
 - **Full-spectrum library search** (`Analysis → Library Search`) — identify a
   pixel / ROI / whole-map spectrum by Pearson-correlation matching against a
   user-supplied reference library (RRUFF, Raman Open Database, SLoPP, or any
