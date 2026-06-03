@@ -7908,7 +7908,7 @@ class MCRWindow(tk.Toplevel):
                                  if getattr(self, "_dsig", None) else 0.8),
                      robust=False, vmin=vmin, vmax=vmax,
                      title=f"Abundance Map — C{c+1}", title_color=cols[c],
-                     colorbar=False, px_um=getattr(self.master, "_px_um", None))
+                     colorbar=True, px_um=getattr(self.master, "_px_um", None))
 
         self._canvas.draw_idle()
         self._status.config(
