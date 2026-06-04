@@ -223,6 +223,9 @@ if not any("wip" in pat.lower() for _, pat in SUPPORTED_PATTERNS):
         + [p for p in SUPPORTED_PATTERNS if "wdf" not in p[1].lower()]
     )
 
+# Files at or above this size (MB) trigger a "this may be slow" caution on load.
+LARGE_FILE_WARN_MB = 500.0
+
 
 class _WITecReader:
     """Adapter for WITec ``.wip`` files exposing the same minimal interface as
@@ -4508,6 +4511,27 @@ class RamanApp(tk.Tk):
     def _load_path(self, path, display_name=None):
         """Load a single spectrum/map file by path (reused by the dataset dialog)."""
         label = display_name or Path(path).name
+
+        # Caution for large mapping files: loading + multivariate/3D analyses on a
+        # big hyperspectral cube can be slow and memory-hungry. Let the user decide.
+        try:
+            size_mb = Path(path).stat().st_size / (1024 * 1024)
+        except OSError:
+            size_mb = 0.0
+        if size_mb >= LARGE_FILE_WARN_MB:
+            proceed = messagebox.askyesno(
+                "Large file — this may be slow",
+                f"“{label}” is {size_mb:.0f} MB.\n\n"
+                "Large hyperspectral maps are fully supported, but loading and the "
+                "heavier analyses (MCR-ALS, N-FINDR, clustering, 3D rendering) can be "
+                "slow and use a lot of memory. The window may appear to freeze while "
+                "it computes — this is normal.\n\n"
+                "Load this file now?",
+                icon="warning", default="yes", parent=self)
+            if not proceed:
+                self._status.set("Load cancelled.")
+                return
+
         self._status.set(f"Loading  {label}…")
         self._show_progress(True)
         self.progress["value"] = 0

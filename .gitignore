@@ -35,3 +35,11 @@ Thumbs.db
 # Testing
 .pytest_cache/
 .coverage
+
+# Keep the bundled example dataset (small enough to ship; see example/README.md)
+!example/
+!example/*.wdf
+!example/*.pdf
+!example/*.png
+example/.DS_Store
+example/paracetamol.wdf
