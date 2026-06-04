@@ -7,8 +7,6 @@ Sample datasets for trying out BioRaman.
 | `caffeine.wdf` | ~8 KB | Single-point spectrum — fast, good first test |
 | `aspirin.wdf` | ~72 KB | Small map |
 | `Tablet.wdf` | ~11 MB | **Large hyperspectral map** |
-| `Advanced map analysis 1 - slides.pdf` | ~1 MB | Walkthrough slides |
-| `my results.png` | ~1 MB | Example output |
 
 > ⚠️ **Caution — `Tablet.wdf` is large.**
 > It is a full hyperspectral map (~11 MB) and is included so you can test the
