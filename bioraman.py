@@ -119,7 +119,7 @@ __email__   = "akalabya.bissoyi@manchester.ac.uk, bissoyi.akalabya@gmail.com"
 __affiliation__ = "Gibson Group, University of Manchester"
 __url__     = "https://gibsongroupresearch.com/"
 __license__ = "MIT"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import os, sys, time, threading, queue
@@ -141,7 +141,10 @@ def _ensure_package(import_name, pip_name=None):
         return importlib.import_module(import_name)
     except Exception:
         pass
-    if os.environ.get("BIORAMAN_NO_AUTOINSTALL"):
+    # Never attempt a pip install from inside a frozen/standalone build
+    # (sys.executable is the app itself, so the install hangs and can leave
+    # readers unavailable). All needed packages are bundled at build time.
+    if os.environ.get("BIORAMAN_NO_AUTOINSTALL") or getattr(sys, "frozen", False):
         return None
     pip_name = pip_name or import_name
     try:

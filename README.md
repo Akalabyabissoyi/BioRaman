@@ -3,7 +3,7 @@
 *Raman Hyperspectral Map Analysis for Biophysics*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)
 
 Developed in the [Gibson Group, University of Manchester](https://gibsongroupresearch.com/).
 
@@ -43,7 +43,8 @@ clustering (K-means, hierarchical), and 3D confocal volume rendering.
 Pre-built, double-click applications are attached to each
 [release](../../releases/latest):
 
-- **Windows** — download `BioRaman-Windows.zip`, unzip, and run `BioRaman.exe`.
+- **Windows** — download `BioRaman-Windows.zip`, unzip, open the `BioRaman`
+  folder and run `BioRaman.exe`.
 - **macOS** — download `BioRaman-macOS.zip`, unzip, and open `BioRaman.app`.
   Because the app is not code-signed, the first time you open it macOS will
   warn you. **Right-click the app → Open → Open**, or allow it under
