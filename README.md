@@ -7,9 +7,7 @@
 
 Developed in the [Gibson Group, University of Manchester](https://gibsongroupresearch.com/).
 
-<!-- DOI: after minting on Zenodo, replace XXXXXXX below (both places) with your
-     Zenodo record ID and uncomment this badge line. -->
-<!-- [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20562222.svg)](https://doi.org/10.5281/zenodo.20562222)
 
 A desktop GUI (Tkinter + matplotlib) for exploring and analysing Raman
 hyperspectral maps. It loads Renishaw WiRE / HORIBA LabSpec data and provides
@@ -137,9 +135,10 @@ public workflow are **MAJOR**. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Citing
 
-If you use this tool in a publication, please cite it. Release-linked DOIs are
-minted via Zenodo — see [CITATION.cff](CITATION.cff) and the Zenodo badge once
-the repository is connected.
+If you use this tool in a publication, please cite it via its archived Zenodo
+record. The concept DOI [10.5281/zenodo.20562222](https://doi.org/10.5281/zenodo.20562222)
+always resolves to the latest release; see [CITATION.cff](CITATION.cff) for the
+full metadata.
 
 ## License
 

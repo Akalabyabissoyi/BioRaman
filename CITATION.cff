@@ -26,6 +26,5 @@ keywords:
   - MCR-ALS
   - spectral unmixing
   - chemometrics
-# After connecting Zenodo, add the concept DOI here so every release cites
-# the same record, e.g.:
-# doi: 10.5281/zenodo.XXXXXXX
+# Concept DOI — always resolves to the latest release ("Cite all versions").
+doi: 10.5281/zenodo.20562222
