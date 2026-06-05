@@ -119,7 +119,7 @@ __email__   = "akalabya.bissoyi@manchester.ac.uk, bissoyi.akalabya@gmail.com"
 __affiliation__ = "Gibson Group, University of Manchester"
 __url__     = "https://gibsongroupresearch.com/"
 __license__ = "MIT"
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import os, sys, time, threading, queue
@@ -897,15 +897,46 @@ def preprocess_map(data, params=None, cb=None):
     done     = 0
     n_workers = min(os.cpu_count() or 1, 8)
 
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_process_one, item): item[0] for item in flat}
-        for fut in as_completed(futures):
-            idx, s_proc, spike = fut.result()
+    def _run_serial():
+        """Process every spectrum in-process. Always works; the safe fallback."""
+        nonlocal cosmic_n, done
+        for item in flat:
+            idx, s_proc, spike = _process_one(item)
             out_flat[idx] = s_proc
             if spike: cosmic_n += 1
             done += 1
             if cb and done % max(1, total // 200) == 0:
                 cb(done / total)
+
+    # Process-based parallelism is only worth it for large maps AND is unsafe in
+    # a frozen/standalone build: with the "spawn" start method each worker
+    # re-launches sys.executable (here the BioRaman app itself), which commonly
+    # hangs and leaves the loader stuck on "Loading…" forever. So: run serially
+    # when frozen or for small jobs, and fall back to serial if the pool errors.
+    use_pool = (not getattr(sys, "frozen", False)) and total >= 64 and n_workers > 1
+    if use_pool:
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_process_one, item): item[0]
+                           for item in flat}
+                for fut in as_completed(futures):
+                    idx, s_proc, spike = fut.result()
+                    out_flat[idx] = s_proc
+                    if spike: cosmic_n += 1
+                    done += 1
+                    if cb and done % max(1, total // 200) == 0:
+                        cb(done / total)
+        except Exception as exc:
+            # Pool unavailable (frozen app, sandbox, pickling/spawn failure …) —
+            # reset partial state and reprocess everything serially.
+            print(f"[BioRaman] Parallel preprocessing unavailable "
+                  f"({exc!r}); falling back to serial.", flush=True)
+            out_flat = [None] * total
+            cosmic_n = 0
+            done     = 0
+            _run_serial()
+    else:
+        _run_serial()
     if cb: cb(1.0)
 
     out = np.empty((Y, X, W), dtype=float)
@@ -4553,6 +4584,7 @@ class RamanApp(tk.Tk):
         self.update_idletasks()
 
         def worker():
+          try:
             r = _open_raman_any(path)
 
             # Try to extract embedded white-light microscope image (if present)
@@ -4584,6 +4616,22 @@ class RamanApp(tk.Tk):
                 self.after(0, lambda: self.progress.configure(value=f*100))
             proc, report = preprocess_map(r.spectra, params, cb)
             self.after(0, lambda: self._finish_load(r.xdata, proc, report, path, wl_raw))
+          except Exception as exc:
+            # Surface the failure instead of leaving the UI stuck on "Loading…".
+            import traceback
+            traceback.print_exc()
+            msg = f"{type(exc).__name__}: {exc}"
+            def _fail():
+                self._show_progress(False)
+                self._status.set(f"Failed to load {label}: {msg}")
+                messagebox.showerror(
+                    "Could not load file",
+                    f"BioRaman could not load:\n{label}\n\n{msg}\n\n"
+                    "If this is a map file, check that it is a supported format "
+                    "(.wdf / .wip / ASCII table). The full traceback was printed "
+                    "to the console.",
+                    parent=self)
+            self.after(0, _fail)
 
         threading.Thread(target=worker, daemon=True).start()
 
