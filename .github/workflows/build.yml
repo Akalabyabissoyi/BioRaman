@@ -1,9 +1,5 @@
 name: Build standalone apps
 
-# Builds double-click executables for Windows and macOS and attaches them to
-# the GitHub Release. Triggers automatically when you push a version tag
-# (e.g. v1.0.1), or can be run manually from the Actions tab.
-
 on:
   push:
     tags:
@@ -11,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed to upload assets to the Release
+  contents: write
 
 jobs:
   build:
@@ -46,13 +42,12 @@ jobs:
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path dist/BioRaman.exe -DestinationPath dist/BioRaman-Windows.zip
+        run: Compress-Archive -Path dist/BioRaman -DestinationPath dist/BioRaman-Windows.zip
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           cd dist
-          # Remove the quarantine-prone extended attributes before zipping
           xattr -cr BioRaman.app || true
           zip -r -y BioRaman-macOS.zip BioRaman.app
 
