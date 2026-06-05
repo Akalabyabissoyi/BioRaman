@@ -13,9 +13,17 @@ missed.
 
     pyinstaller --noconfirm bioraman.spec
 """
+import os, sys
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
+# Packages that MUST be present for a functional build. A missing entry here
+# means the standalone app would ship broken (e.g. without renishawWiRE the
+# app cannot decode .wdf map files), so we fail the build loudly instead of
+# silently skipping. Override by setting BIORAMAN_ALLOW_MISSING=1.
+CRITICAL_PKGS = {"renishawWiRE"}
+
 datas, binaries, hiddenimports = [], [], []
+_missing = []
 for _pkg in ("sklearn", "scipy", "pybaselines", "renishawWiRE",
              "matplotlib", "seaborn", "pandas", "openpyxl", "PIL"):
     try:
@@ -23,17 +31,36 @@ for _pkg in ("sklearn", "scipy", "pybaselines", "renishawWiRE",
         datas += d
         binaries += b
         hiddenimports += h
-    except Exception:
-        # Optional dependency not installed in the build env — skip it.
-        pass
+        print(f"[bioraman.spec] collected '{_pkg}' "
+              f"({len(d)} data, {len(b)} binaries, {len(h)} hidden imports)")
+    except Exception as exc:
+        _missing.append(_pkg)
+        print(f"[bioraman.spec] WARNING: could not collect '{_pkg}': {exc}")
 
 # Make sure the native Renishaw .wdf reader and its submodules are bundled so
 # the standalone app can open map files without any runtime install.
 try:
-    hiddenimports += collect_submodules("renishawWiRE")
-except Exception:
-    pass
+    _wdf_subs = collect_submodules("renishawWiRE")
+    hiddenimports += _wdf_subs
+    print(f"[bioraman.spec] collected {len(_wdf_subs)} renishawWiRE submodules")
+except Exception as exc:
+    if "renishawWiRE" not in _missing:
+        _missing.append("renishawWiRE")
+    print(f"[bioraman.spec] WARNING: could not collect renishawWiRE "
+          f"submodules: {exc}")
 hiddenimports += ["renishawWiRE", "multiprocessing", "multiprocessing.pool"]
+
+# Fail the build if anything critical is missing, unless explicitly overridden.
+_critical_missing = sorted(CRITICAL_PKGS.intersection(_missing))
+if _critical_missing and not os.environ.get("BIORAMAN_ALLOW_MISSING"):
+    raise SystemExit(
+        "\n[bioraman.spec] BUILD ABORTED — critical package(s) not found in "
+        "the build environment:\n    " + ", ".join(_critical_missing) + "\n"
+        "These are required for the app to function (renishawWiRE decodes "
+        ".wdf map files).\nInstall them into the SAME Python you build with:\n"
+        f"    {sys.executable} -m pip install " + " ".join(_critical_missing) +
+        "\nThen rebuild. To build anyway (NOT recommended) set "
+        "BIORAMAN_ALLOW_MISSING=1.\n")
 
 block_cipher = None
 
