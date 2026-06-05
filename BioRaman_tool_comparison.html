@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>BioRaman — Free Raman Tool Comparison</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --ink:#1a2332; --muted:#5a6470; --hint:#8a93a0;
+    --line:#dfe4ea; --accent:#2563a8; --accent-bg:#e6f1fb;
+    --full:#1D9E75; --part:#EF9F27; --none:#B4B2A9;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+       background:var(--bg);color:var(--ink);line-height:1.5;}
+  header{padding:22px 26px 8px;}
+  h1{font-size:24px;font-weight:600;margin:0;}
+  .sub{color:var(--muted);font-size:14px;margin-top:4px;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 18px 40px;}
+  .tabs{display:flex;gap:6px;margin:18px 0 16px;flex-wrap:wrap;}
+  .tab{padding:8px 16px;border-radius:9px;border:1px solid var(--line);background:var(--card);
+       cursor:pointer;font-size:14px;color:var(--muted);}
+  .tab.active{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:500;}
+  .panel{display:none;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;}
+  .panel.active{display:block;}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-bottom:12px;align-items:center;}
+  .sw{width:13px;height:13px;border-radius:3px;display:inline-block;vertical-align:-1px;margin-right:5px;}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:14px;}
+  .chip{font-size:12px;padding:5px 11px;border-radius:8px;cursor:pointer;border:1px solid var(--line);
+        background:transparent;color:var(--muted);}
+  .chip.on{border-color:var(--accent);background:var(--accent-bg);color:var(--accent);font-weight:500;}
+  .scroll{overflow-x:auto;border:1px solid var(--line);border-radius:12px;}
+  table{border-collapse:collapse;font-size:13px;min-width:920px;width:100%;}
+  th.tool,td.tool{position:sticky;left:0;background:var(--card);text-align:left;padding:9px 12px;
+                  min-width:158px;border-bottom:1px solid var(--line);}
+  th.cap{padding:9px 5px;writing-mode:vertical-rl;transform:rotate(180deg);height:86px;
+         font-weight:500;color:var(--muted);white-space:nowrap;border-bottom:1px solid var(--line);}
+  th.sc,td.sc{text-align:right;padding:9px 12px;border-bottom:1px solid var(--line);font-weight:600;}
+  td.cell{text-align:center;padding:6px 5px;border-bottom:1px solid #eef1f4;}
+  .dot{display:inline-block;width:22px;height:22px;line-height:22px;border-radius:5px;font-size:13px;}
+  tr.me td.tool{background:var(--accent-bg);box-shadow:inset 3px 0 0 var(--accent);}
+  tr.me td.tool .nm{color:var(--accent);font-weight:600;}
+  .nm{font-weight:500;} .ty{font-size:11px;color:var(--hint);}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:12px;}
+  select{padding:7px 10px;border-radius:9px;border:1px solid var(--line);font-size:14px;background:var(--card);color:var(--ink);}
+  .chartbox{position:relative;height:420px;}
+  .note{font-size:12px;color:var(--hint);margin-top:14px;}
+  .dim{opacity:.28;transition:opacity .2s;}
+</style>
+</head>
+<body>
+<header>
+  <h1>BioRaman vs free Raman analysis tools</h1>
+  <div class="sub">Capability comparison across 13 features · ✓ full · ~ partial · – none</div>
+</header>
+<div class="wrap">
+  <div class="tabs">
+    <div class="tab active" data-p="matrix">Capability matrix</div>
+    <div class="tab" data-p="rank">Capability score</div>
+    <div class="tab" data-p="radar">Head-to-head radar</div>
+  </div>
+
+  <div class="legend">
+    <span><span class="sw" style="background:var(--full)"></span>Full</span>
+    <span><span class="sw" style="background:var(--part)"></span>Partial</span>
+    <span><span class="sw" style="background:var(--none)"></span>None</span>
+    <span style="color:var(--hint)">Score = full ×1 + partial ×0.5 (max 13)</span>
+  </div>
+
+  <div class="panel active" id="matrix">
+    <div class="chips" id="chips"></div>
+    <div class="scroll"><table><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div>
+    <div class="note">Tap a capability chip to keep only tools with full support. Hover a column header for its full name.</div>
+  </div>
+
+  <div class="panel" id="rank">
+    <div class="chartbox"><canvas id="bar" role="img" aria-label="Bar chart ranking tools by capability score"></canvas></div>
+  </div>
+
+  <div class="panel" id="radar">
+    <div class="row">
+      <label for="cmp" style="color:var(--muted);font-size:14px;">Compare BioRaman with</label>
+      <select id="cmp"></select>
+    </div>
+    <div class="chartbox"><canvas id="rad" role="img" aria-label="Radar chart comparing BioRaman with the selected tool across capability groups"></canvas></div>
+  </div>
+</div>
+
+<script>
+const caps=["No-code GUI","Native instrument files","Preprocessing","Hyperspectral imaging/maps","Univariate / ratio maps","PCA","Clustering","MCR-ALS","Endmember (N-FINDR)","Peak ID / library match","Curve fitting","3D / confocal volume","Built-in spectral library"];
+const short=["GUI","Files","Prep","Imaging","Uni/ratio","PCA","Cluster","MCR-ALS","N-FINDR","Peak ID","Curve fit","3D","Library"];
+const Y=2,P=1,N=0;
+const tools=[
+ {n:"BioRaman",t:"Desktop GUI · Python",c:[Y,Y,Y,Y,Y,Y,Y,Y,Y,Y,Y,Y,P],me:true},
+ {n:"RamanSPy",t:"Python library",c:[N,Y,Y,Y,P,Y,Y,P,N,P,P,N,N]},
+ {n:"Orange + Quasar",t:"Desktop GUI · visual",c:[Y,P,Y,Y,P,Y,Y,P,N,P,P,N,N]},
+ {n:"Vespucci",t:"Desktop GUI",c:[Y,P,Y,Y,Y,Y,Y,Y,N,P,P,N,N]},
+ {n:"SpectraGuru",t:"Web app",c:[Y,N,Y,P,N,Y,Y,N,N,Y,P,N,P]},
+ {n:"Open Specy",t:"Web / R",c:[Y,N,Y,N,N,N,P,N,N,Y,N,N,Y]},
+ {n:"Spectragryph",t:"Desktop · freeware",c:[Y,Y,Y,P,P,N,N,N,N,Y,Y,N,Y]},
+ {n:"hyperSpec",t:"R library",c:[N,P,Y,Y,Y,Y,Y,P,N,P,P,N,N]},
+ {n:"ramanchada2",t:"Python library",c:[N,Y,Y,P,N,P,P,N,N,Y,Y,N,P]},
+];
+const COL=v=>v===2?"#1D9E75":v===1?"#EF9F27":"#B4B2A9";
+const TXT=v=>v===2?"#04342C":v===1?"#633806":"#5F5E5A";
+const MK=v=>v===2?"✓":v===1?"~":"–";
+const score=c=>c.reduce((a,b)=>a+b,0)/2;
+let req=new Set();
+
+function head(){
+ let h="<tr><th class='tool'>Tool</th>";
+ short.forEach((s,i)=>h+=`<th class='cap' title="${caps[i]}">${s}</th>`);
+ h+="<th class='sc'>Score</th></tr>";
+ document.getElementById('mhead').innerHTML=h;
+}
+function body(){
+ let b="";
+ tools.forEach(t=>{
+  const pass=[...req].every(i=>t.c[i]===2);
+  b+=`<tr class="${t.me?'me':''} ${pass?'':'dim'}">`;
+  b+=`<td class='tool'><div class='nm'>${t.n}</div><div class='ty'>${t.t}</div></td>`;
+  t.c.forEach((v,i)=>{const hl=req.has(i)?"outline:1.5px solid var(--accent);outline-offset:-3px;":"";
+    b+=`<td class='cell' style="${hl}"><span class='dot' style="background:${COL(v)};color:${TXT(v)}">${MK(v)}</span></td>`;});
+  b+=`<td class='sc'>${score(t.c).toFixed(1)}</td></tr>`;
+ });
+ document.getElementById('mbody').innerHTML=b;
+}
+function chips(){
+ let h="";
+ short.forEach((s,i)=>h+=`<button class="chip ${req.has(i)?'on':''}" data-i="${i}">${s}</button>`);
+ const c=document.getElementById('chips');c.innerHTML=h;
+ c.querySelectorAll('.chip').forEach(el=>el.onclick=()=>{const i=+el.dataset.i;req.has(i)?req.delete(i):req.add(i);chips();body();});
+}
+head();chips();body();
+
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+ document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+ document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
+ t.classList.add('active');document.getElementById(t.dataset.p).classList.add('active');
+ if(t.dataset.p==='rank')drawBar(); if(t.dataset.p==='radar')drawRadar();
+});
+
+let barC,radC;
+function drawBar(){
+ const sorted=[...tools].sort((a,b)=>score(b.c)-score(a.c));
+ if(barC)barC.destroy();
+ barC=new Chart(document.getElementById('bar'),{type:'bar',
+  data:{labels:sorted.map(t=>t.n),datasets:[{label:'Capability score',
+    data:sorted.map(t=>score(t.c)),
+    backgroundColor:sorted.map(t=>t.me?'#2563a8':'#9fb6cf'),borderRadius:5}]},
+  options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+   plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'Score '+c.parsed.x.toFixed(1)+' / 13'}}},
+   scales:{x:{max:13,grid:{color:'#eef1f4'},title:{display:true,text:'Capability score (max 13)'}},y:{grid:{display:false}}}}});
+}
+const groups={"GUI / usability":[0],"Data I/O":[1,2],"Imaging & maps":[3,4],"Chemometrics":[5,6,7,8],"Peaks & fitting":[9,10],"3D & library":[11,12]};
+const gkeys=Object.keys(groups);
+function gval(t){return gkeys.map(k=>{const idx=groups[k];return idx.reduce((a,i)=>a+t.c[i],0)/(idx.length*2);});}
+function fillSel(){const s=document.getElementById('cmp');s.innerHTML=tools.filter(t=>!t.me).map(t=>`<option>${t.n}</option>`).join('');s.onchange=drawRadar;}
+function drawRadar(){
+ const me=tools.find(t=>t.me);const other=tools.find(t=>t.n===document.getElementById('cmp').value)||tools[1];
+ if(radC)radC.destroy();
+ radC=new Chart(document.getElementById('rad'),{type:'radar',
+  data:{labels:gkeys,datasets:[
+   {label:'BioRaman',data:gval(me),borderColor:'#2563a8',backgroundColor:'rgba(37,99,168,.18)',pointBackgroundColor:'#2563a8'},
+   {label:other.n,data:gval(other),borderColor:'#EF9F27',backgroundColor:'rgba(239,159,39,.16)',pointBackgroundColor:'#EF9F27',borderDash:[5,4]}]},
+  options:{responsive:true,maintainAspectRatio:false,
+   scales:{r:{min:0,max:1,ticks:{stepSize:.25,callback:v=>(v*100)+'%'},grid:{color:'#e3e8ee'},pointLabels:{font:{size:13}}}},
+   plugins:{legend:{position:'top'}}}});
+}
+fillSel();
+</script>
+</body>
+</html>

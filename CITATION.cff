@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "BioRaman — Raman Hyperspectral Map Analysis for Biophysics"
+abstract: >-
+  A desktop GUI for exploring and analysing Raman hyperspectral maps,
+  with baseline correction, peak fitting, spectral unmixing (MCR-ALS,
+  N-FINDR), clustering, and 3D confocal volume rendering.
+type: software
+authors:
+  - given-names: Akalabya
+    family-names: Bissoyi
+    email: akalabya.bissoyi@manchester.ac.uk
+    affiliation: "Gibson Group, University of Manchester"
+contact:
+  - given-names: Akalabya
+    family-names: Bissoyi
+    email: bissoyi.akalabya@gmail.com
+    affiliation: "Gibson Group, University of Manchester"
+url: "https://gibsongroupresearch.com/"
+version: 1.0.1
+date-released: "2026-06-05"
+license: MIT
+keywords:
+  - Raman spectroscopy
+  - hyperspectral imaging
+  - MCR-ALS
+  - spectral unmixing
+  - chemometrics
+# After connecting Zenodo, add the concept DOI here so every release cites
+# the same record, e.g.:
+# doi: 10.5281/zenodo.XXXXXXX
