@@ -1117,18 +1117,17 @@ def _add_scale_bar(ax, shape, px_um):
     tx.set_path_effects([pe.withStroke(linewidth=2, foreground="black")])
 
 
-def show_map(ax, fig, arr, cmap="turbo", sigma=0.0, robust=True,
+def show_map(ax, fig, arr, cmap="turbo", sigma=0.8, robust=True,
              vmin=None, vmax=None, title=None, title_color=None,
-             colorbar=True, equal=True, px_um=None, interpolation="nearest"):
-    """Render a 2-D map faithfully: every measured pixel is shown as a discrete
-    cell (``interpolation="nearest"``) with NO display smoothing by default
-    (``sigma=0``), robust percentile contrast, an equal aspect ratio and an
-    optional µm scale bar. Pass ``sigma>0`` and/or ``interpolation="bilinear"``
-    only for a deliberately cosmetic, smoothed view. Returns the AxesImage.
+             colorbar=True, equal=True, px_um=None, interpolation="bilinear"):
+    """Render a 2-D map the way instrument software does: light NaN-aware
+    Gaussian smoothing and bilinear interpolation for a smooth, presentation-
+    quality view, robust percentile contrast, an equal aspect ratio and an
+    optional µm scale bar. Returns the AxesImage.
 
-    Scientific note: Gaussian smoothing and bilinear interpolation invent
-    values between measured pixels and can make a coarse map look like a
-    continuous field, so they are opt-in rather than the default here."""
+    For a faithful, pixel-exact view (each measured pixel shown as a discrete
+    cell) set the window's *Display σ* control to 0 and/or pass
+    ``interpolation="nearest"``."""
     a = _smooth_nan(arr, sigma)
     finite = a[np.isfinite(a)]
     if vmin is None or vmax is None:
@@ -7881,7 +7880,7 @@ class MCRWindow(tk.Toplevel):
         ds = tk.Frame(left, bg=C["sidebar"]); ds.pack(fill="x", padx=12, pady=4)
         tk.Label(ds, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
                  font=("Segoe UI", 10)).pack(side="left")
-        self._dsig = tk.DoubleVar(value=0.0)   # 0 = faithful pixels; raise only for cosmetic smoothing
+        self._dsig = tk.DoubleVar(value=0.8)   # display smoothing; set to 0 for faithful pixels
         ttk.Spinbox(ds, from_=0.0, to=4.0, increment=0.2, width=5,
                     textvariable=self._dsig,
                     command=lambda: getattr(self, "_C", None) is not None
@@ -8066,7 +8065,7 @@ class MCRWindow(tk.Toplevel):
             vmin, vmax = _lut_clim(self._C[:, :, c], s)
             show_map(ax_m, self._fig, self._C[:, :, c], cmap=s["cmap"],
                      sigma=float(getattr(self, "_dsig", None).get()
-                                 if getattr(self, "_dsig", None) else 0.0),
+                                 if getattr(self, "_dsig", None) else 0.8),
                      robust=False, vmin=vmin, vmax=vmax,
                      title=f"Abundance Map — C{c+1}", title_color=cols[c],
                      colorbar=True, px_um=getattr(self.master, "_px_um", None))
@@ -8190,7 +8189,7 @@ class NFindrWindow(tk.Toplevel):
         ds = tk.Frame(left, bg=C["sidebar"]); ds.pack(fill="x", padx=12, pady=4)
         tk.Label(ds, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
                  font=("Segoe UI", 10)).pack(side="left")
-        self._dsig = tk.DoubleVar(value=0.0)   # 0 = faithful pixels; raise only for cosmetic smoothing
+        self._dsig = tk.DoubleVar(value=0.8)   # display smoothing; set to 0 for faithful pixels
         ttk.Spinbox(ds, from_=0.0, to=4.0, increment=0.2, width=5,
                     textvariable=self._dsig,
                     command=lambda: self._abund is not None and self._draw()
@@ -8349,7 +8348,7 @@ class NFindrWindow(tk.Toplevel):
             vmin, vmax = _lut_clim(self._abund[:, :, c], s)
             show_map(ax_m, self._fig, self._abund[:, :, c], cmap=s["cmap"],
                      sigma=float(getattr(self, "_dsig", None).get()
-                                 if getattr(self, "_dsig", None) else 0.0),
+                                 if getattr(self, "_dsig", None) else 0.8),
                      robust=False, vmin=vmin, vmax=vmax,
                      title=f"Abundance — EM {c+1}", title_color=cols[c],
                      px_um=getattr(self.master, "_px_um", None))
@@ -9682,7 +9681,7 @@ class ComponentAnalysisWindow(tk.Toplevel):
         dsf = tk.Frame(left, bg=C["sidebar"]); dsf.pack(fill="x", padx=10, pady=2)
         tk.Label(dsf, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
                  font=("Segoe UI", 9)).pack(side="left")
-        self._dsig = tk.DoubleVar(value=0.0)   # 0 = faithful pixels; raise only for cosmetic smoothing
+        self._dsig = tk.DoubleVar(value=0.8)   # display smoothing; set to 0 for faithful pixels
         ttk.Spinbox(dsf, from_=0.0, to=4.0, increment=0.2, width=5,
                     textvariable=self._dsig,
                     command=lambda: self._res and self._draw()).pack(

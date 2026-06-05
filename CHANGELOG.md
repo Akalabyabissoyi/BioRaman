@@ -24,15 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The About dialog now shows the live `__version__` instead of a hard-coded
   string.
 
-### Fixed **[OUTPUT]**
-- **Faithful map rendering** — `show_map()` now defaults to
-  `interpolation="nearest"` with **no** display smoothing (`sigma=0`), so each
-  measured pixel is shown as a discrete cell. Previously maps were drawn with
-  bilinear interpolation and Gaussian smoothing (`sigma=0.8`) by default, which
-  could make a coarse map look like a continuous field. The MCR-ALS, N-FINDR
-  and Component-analysis windows now default their *Display σ* control to 0;
-  raise it (or pass `interpolation="bilinear"`) only for a deliberately
-  cosmetic, smoothed view.
+### Added
+- **Faithful pixel view (optional)** — every map window's *Display σ* control
+  can be set to `0` to disable display smoothing and show each measured pixel
+  as a discrete cell (`interpolation="nearest"`). The default remains the
+  smooth, presentation-quality view (bilinear interpolation with light
+  Gaussian smoothing, `sigma=0.8`).
+
+### Fixed
 - Minor plot/robustness fixes: added axis units to the report mean-intensity
   map (`X (px)`/`Y (px)`); replaced bare `except:` clauses with
   `except Exception:`.

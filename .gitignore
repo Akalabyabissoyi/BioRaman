@@ -1,0 +1,52 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / output artefacts (keep large instrument data out of the repo)
+*.wdf
+*.spc
+*.png
+*.pdf
+*.csv
+*.xlsx
+!docs/**/*.png
+
+# Testing
+.pytest_cache/
+.coverage
+
+# Local working backups / generated presentation artefacts (not part of the release)
+bioraman_backup_*.py
+BioRaman_Live_Demo.pptx
+BioRaman_Interactive.html
+BioRaman_Tool_Comparison.pptx
+BioRaman_tool_comparison.html
+
+# Keep the bundled example dataset (small enough to ship; see example/README.md)
+!example/
+!example/*.wdf
+!example/*.pdf
+!example/*.png
+example/.DS_Store
+example/paracetamol.wdf

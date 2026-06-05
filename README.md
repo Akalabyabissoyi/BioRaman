@@ -40,7 +40,22 @@ clustering (K-means, hierarchical), and 3D confocal volume rendering.
 - One-click HTML analysis report and session save/restore
 - Cluster validation via mean silhouette score
 
-## Installation
+## Download (no Python needed)
+
+Pre-built, double-click applications are attached to each
+[release](../../releases/latest):
+
+- **Windows** — download `BioRaman-Windows.zip`, unzip, and run `BioRaman.exe`.
+- **macOS** — download `BioRaman-macOS.zip`, unzip, and open `BioRaman.app`.
+  Because the app is not code-signed, the first time you open it macOS will
+  warn you. **Right-click the app → Open → Open**, or allow it under
+  *System Settings → Privacy & Security*.
+
+These bundles include everything BioRaman needs — no separate Python install.
+The macOS build targets Apple Silicon; Intel-Mac users should run from source
+(below).
+
+## Install from source
 
 Requires Python 3.9+.
 
