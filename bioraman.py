@@ -2,22 +2,24 @@
 """
 BioRaman  —  Raman Hyperspectral Map Analysis for Biophysics
 ================================================
-Created by: Akalabya Bissoyi  <akalabya.bissoyi@manchester.ac.uk>
+Created by: Akalabya Bissoyi
+            <akalabya.bissoyi@manchester.ac.uk>  ·  <bissoyi.akalabya@gmail.com>
+Gibson Group, University of Manchester  ·  https://gibsongroupresearch.com/
 
-Copyright (C) 2026  Akalabya Bissoyi
+Copyright (c) 2026  Akalabya Bissoyi and the Gibson Group, University of Manchester
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. See the MIT
+License (LICENSE file) for the full text.
 ================================================
 NEW in v13 (Reproducibility, Batch & QC):
 • Preprocessing recipes — save_recipe() / load_recipe()
@@ -113,8 +115,11 @@ sklearn.cluster, sklearn.decomposition.NMF).
 """
 
 __author__  = "Akalabya Bissoyi"
-__email__   = "akalabya.bissoyi@manchester.ac.uk"
-__version__ = "0.10.0"
+__email__   = "akalabya.bissoyi@manchester.ac.uk, bissoyi.akalabya@gmail.com"
+__affiliation__ = "Gibson Group, University of Manchester"
+__url__     = "https://gibsongroupresearch.com/"
+__license__ = "MIT"
+__version__ = "1.0.2"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import os, sys, time, threading, queue
@@ -136,7 +141,10 @@ def _ensure_package(import_name, pip_name=None):
         return importlib.import_module(import_name)
     except Exception:
         pass
-    if os.environ.get("BIORAMAN_NO_AUTOINSTALL"):
+    # Never attempt a pip install from inside a frozen/standalone build
+    # (sys.executable is the app itself, so the install hangs and can leave
+    # readers unavailable). All needed packages are bundled at build time.
+    if os.environ.get("BIORAMAN_NO_AUTOINSTALL") or getattr(sys, "frozen", False):
         return None
     pip_name = pip_name or import_name
     try:
@@ -1114,10 +1122,15 @@ def _add_scale_bar(ax, shape, px_um):
 
 def show_map(ax, fig, arr, cmap="turbo", sigma=0.8, robust=True,
              vmin=None, vmax=None, title=None, title_color=None,
-             colorbar=True, equal=True, px_um=None):
+             colorbar=True, equal=True, px_um=None, interpolation="bilinear"):
     """Render a 2-D map the way instrument software does: light NaN-aware
-    Gaussian smoothing, bilinear interpolation, robust percentile contrast, an
-    equal aspect ratio and an optional µm scale bar. Returns the AxesImage."""
+    Gaussian smoothing and bilinear interpolation for a smooth, presentation-
+    quality view, robust percentile contrast, an equal aspect ratio and an
+    optional µm scale bar. Returns the AxesImage.
+
+    For a faithful, pixel-exact view (each measured pixel shown as a discrete
+    cell) set the window's *Display σ* control to 0 and/or pass
+    ``interpolation="nearest"``."""
     a = _smooth_nan(arr, sigma)
     finite = a[np.isfinite(a)]
     if vmin is None or vmax is None:
@@ -1134,7 +1147,7 @@ def show_map(ax, fig, arr, cmap="turbo", sigma=0.8, robust=True,
     cm = plt.get_cmap(cmap).copy(); cm.set_bad("#ffffff")
     im = ax.imshow(np.ma.masked_invalid(a), origin="upper",
                    aspect=("equal" if equal else "auto"), cmap=cm,
-                   interpolation="bilinear", vmin=vmin, vmax=vmax)
+                   interpolation=interpolation, vmin=vmin, vmax=vmax)
     if title:
         ax.set_title(title, fontsize=9, fontweight="semibold",
                      color=(title_color or "#1b2333"))
@@ -3229,13 +3242,15 @@ class RamanApp(tk.Tk):
         mb.add_cascade(label="Help", menu=hm)
         hm.add_command(label="About", command=lambda: messagebox.showinfo(
             "BioRaman",
-            "BioRaman — Raman Hyperspectral Map Analysis for Biophysics  (v0.8.0)\n\n"
+            f"BioRaman — Raman Hyperspectral Map Analysis for Biophysics  (v{__version__})\n\n"
             "Created by Akalabya Bissoyi\n"
-            "akalabya.bissoyi@manchester.ac.uk\n\n"
-            "Copyright (C) 2026 Akalabya Bissoyi.\n"
-            "Licensed under the GNU GPL v3.0 or later. This program comes with\n"
-            "ABSOLUTELY NO WARRANTY. This is free software, and you are welcome\n"
-            "to redistribute it under the GPL conditions.\n\n"
+            "Gibson Group, University of Manchester\n"
+            "https://gibsongroupresearch.com/\n"
+            "akalabya.bissoyi@manchester.ac.uk · bissoyi.akalabya@gmail.com\n\n"
+            "Copyright (c) 2026 Akalabya Bissoyi and the Gibson Group,\n"
+            "University of Manchester.\n"
+            "Released under the MIT License. This program comes with ABSOLUTELY\n"
+            "NO WARRANTY; see the LICENSE file for details.\n\n"
             "Shortcuts:\n"
             "  Ctrl+O  Open WDF\n  Ctrl+M  Save map\n"
             "  Ctrl+S  Save spectrum\n"
@@ -3507,7 +3522,7 @@ class RamanApp(tk.Tk):
         nav.config(background=C["panel"])
         for w in nav.winfo_children():
             try: w.config(background=C["panel"], foreground=C["text_mid"])
-            except: pass
+            except Exception: pass
         nav.update()
 
         self.canvas.mpl_connect("button_press_event",  self._click)
@@ -3632,7 +3647,7 @@ class RamanApp(tk.Tk):
         self.spec_roi.set_visible(False)
         if self._roi_patch:
             try: self._roi_patch.remove()
-            except: pass
+            except Exception: pass
             self._roi_patch = None
         self.canvas.draw_idle()
         self._roi_info.config(text="No ROI defined", fg=C["text_dim"])
@@ -3650,7 +3665,7 @@ class RamanApp(tk.Tk):
         # Draw filled ROI overlay on map
         if self._roi_patch:
             try: self._roi_patch.remove()
-            except: pass
+            except Exception: pass
         Y, X = mask.shape
         rgba = np.zeros((Y * ZOOM, X * ZOOM, 4), dtype=np.float32)
         from scipy.ndimage import zoom as _zoom
@@ -6924,7 +6939,7 @@ class RamanApp(tk.Tk):
         fig1 = plt.figure(figsize=(5, 4))
         ax1 = fig1.add_subplot(111)
         ax1.imshow(cube.mean(axis=2), cmap=self.cmap_var.get(), origin="upper")
-        ax1.set_title("Mean intensity map"); ax1.set_xlabel("X"); ax1.set_ylabel("Y")
+        ax1.set_title("Mean intensity map"); ax1.set_xlabel("X (px)"); ax1.set_ylabel("Y (px)")
         img_map = self._fig_to_b64(fig1)
 
         # mean spectrum +/- std
@@ -7868,7 +7883,7 @@ class MCRWindow(tk.Toplevel):
         ds = tk.Frame(left, bg=C["sidebar"]); ds.pack(fill="x", padx=12, pady=4)
         tk.Label(ds, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
                  font=("Segoe UI", 10)).pack(side="left")
-        self._dsig = tk.DoubleVar(value=0.8)
+        self._dsig = tk.DoubleVar(value=0.8)   # display smoothing; set to 0 for faithful pixels
         ttk.Spinbox(ds, from_=0.0, to=4.0, increment=0.2, width=5,
                     textvariable=self._dsig,
                     command=lambda: getattr(self, "_C", None) is not None
@@ -8177,7 +8192,7 @@ class NFindrWindow(tk.Toplevel):
         ds = tk.Frame(left, bg=C["sidebar"]); ds.pack(fill="x", padx=12, pady=4)
         tk.Label(ds, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
                  font=("Segoe UI", 10)).pack(side="left")
-        self._dsig = tk.DoubleVar(value=0.8)
+        self._dsig = tk.DoubleVar(value=0.8)   # display smoothing; set to 0 for faithful pixels
         ttk.Spinbox(ds, from_=0.0, to=4.0, increment=0.2, width=5,
                     textvariable=self._dsig,
                     command=lambda: self._abund is not None and self._draw()
@@ -9669,7 +9684,7 @@ class ComponentAnalysisWindow(tk.Toplevel):
         dsf = tk.Frame(left, bg=C["sidebar"]); dsf.pack(fill="x", padx=10, pady=2)
         tk.Label(dsf, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
                  font=("Segoe UI", 9)).pack(side="left")
-        self._dsig = tk.DoubleVar(value=0.8)
+        self._dsig = tk.DoubleVar(value=0.8)   # display smoothing; set to 0 for faithful pixels
         ttk.Spinbox(dsf, from_=0.0, to=4.0, increment=0.2, width=5,
                     textvariable=self._dsig,
                     command=lambda: self._res and self._draw()).pack(

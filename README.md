@@ -2,9 +2,12 @@
 
 *Raman Hyperspectral Map Analysis for Biophysics*
 
-<!-- DOI: after minting on Zenodo, replace XXXXXXX below (both places) with your
-     Zenodo record ID and uncomment this badge line. -->
-<!-- [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)
+
+Developed in the [Gibson Group, University of Manchester](https://gibsongroupresearch.com/).
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20562222.svg)](https://doi.org/10.5281/zenodo.20562222)
 
 A desktop GUI (Tkinter + matplotlib) for exploring and analysing Raman
 hyperspectral maps. It loads Renishaw WiRE / HORIBA LabSpec data and provides
@@ -35,7 +38,23 @@ clustering (K-means, hierarchical), and 3D confocal volume rendering.
 - One-click HTML analysis report and session save/restore
 - Cluster validation via mean silhouette score
 
-## Installation
+## Download (no Python needed)
+
+Pre-built, double-click applications are attached to each
+[release](../../releases/latest):
+
+- **Windows** — download `BioRaman-Windows.zip`, unzip, open the `BioRaman`
+  folder and run `BioRaman.exe`.
+- **macOS** — download `BioRaman-macOS.zip`, unzip, and open `BioRaman.app`.
+  Because the app is not code-signed, the first time you open it macOS will
+  warn you. **Right-click the app → Open → Open**, or allow it under
+  *System Settings → Privacy & Security*.
+
+These bundles include everything BioRaman needs — no separate Python install.
+The macOS build targets Apple Silicon; Intel-Mac users should run from source
+(below).
+
+## Install from source
 
 Requires Python 3.9+.
 
@@ -117,15 +136,23 @@ public workflow are **MAJOR**. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Citing
 
-If you use this tool in a publication, please cite it. Release-linked DOIs are
-minted via Zenodo — see [CITATION.cff](CITATION.cff) and the Zenodo badge once
-the repository is connected.
+If you use this tool in a publication, please cite it via its archived Zenodo
+record. The concept DOI [10.5281/zenodo.20562222](https://doi.org/10.5281/zenodo.20562222)
+always resolves to the latest release; see [CITATION.cff](CITATION.cff) for the
+full metadata.
 
 ## License
 
-Released under the GNU General Public License v3.0 — see [LICENSE](LICENSE).
+Released under the **MIT License** — see [LICENSE](LICENSE).
 
-This is copyleft: you are free to use, study, modify and redistribute
-BioRaman, but any distributed modified version (including under a new name)
-must also be released as open source under the GPL and must preserve the
-original authorship and copyright notices.
+You are free to use, study, modify and redistribute BioRaman, including in
+proprietary and commercial work, provided the copyright notice and permission
+notice are preserved.
+
+## Authors & contact
+
+Developed by **Akalabya Bissoyi** in the
+[Gibson Group, University of Manchester](https://gibsongroupresearch.com/).
+
+- akalabya.bissoyi@manchester.ac.uk
+- bissoyi.akalabya@gmail.com

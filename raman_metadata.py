@@ -3,9 +3,11 @@
 raman_metadata.py  —  RAMANMETRIX-compatible metadata workflow for BioRaman
 ===========================================================================
 
-Created by: Akalabya Bissoyi  <akalabya.bissoyi@manchester.ac.uk>
-Copyright (C) 2026  Akalabya Bissoyi
-Licensed under the GNU GPL v3.0-or-later.
+Created by: Akalabya Bissoyi
+            <akalabya.bissoyi@manchester.ac.uk>  ·  <bissoyi.akalabya@gmail.com>
+Gibson Group, University of Manchester  ·  https://gibsongroupresearch.com/
+Copyright (c) 2026  Akalabya Bissoyi and the Gibson Group, University of Manchester
+Released under the MIT License (see LICENSE).
 
 This module implements the data-input conventions described in the
 RAMANMETRIX software documentation ("Data Input" → "Providing Metadata"):

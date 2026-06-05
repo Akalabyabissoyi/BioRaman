@@ -36,6 +36,13 @@ Thumbs.db
 .pytest_cache/
 .coverage
 
+# Local working backups / generated presentation artefacts (not part of the release)
+bioraman_backup_*.py
+BioRaman_Live_Demo.pptx
+BioRaman_Interactive.html
+BioRaman_Tool_Comparison.pptx
+BioRaman_tool_comparison.html
+
 # Keep the bundled example dataset (small enough to ship; see example/README.md)
 !example/
 !example/*.wdf

@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > algorithms, numerical defaults, preprocessing) are flagged with **[OUTPUT]**
 > and always trigger at least a MINOR version bump.
 
+## [1.0.2] - 2026-06-05
+
+### Fixed
+- **Standalone app started very slowly and could not open map files.** Two
+  causes addressed:
+  - The PyInstaller build is now **one-folder** instead of one-file, so the app
+    no longer re-extracts its ~100 MB scientific stack to a temp directory on
+    every launch. Startup drops from minutes to seconds.
+  - The automatic dependency installer (`_ensure_package`) no longer runs inside
+    a frozen/standalone build (`sys.frozen`). Previously it tried to `pip
+    install renishawWiRE` using the app itself as the interpreter, which hung
+    and left the `.wdf` reader unavailable. All readers are now bundled at build
+    time, so map files open immediately.
+- Bundled `renishawWiRE` and its submodules explicitly in the build spec.
+- Updated the release workflow to package the one-folder Windows build
+  (the whole `BioRaman` folder rather than a single `.exe`).
+
+## [1.0.1] - 2026-06-05
+
+### Changed
+- **Relicensed from GNU GPL v3.0-or-later to the MIT License.** Updated
+  `LICENSE`, the source-file headers, the in-app About dialog, `CITATION.cff`
+  and `README.md` accordingly. BioRaman may now be used, modified and
+  redistributed (including in proprietary work) under MIT terms.
+- **Metadata / attribution** — added the group affiliation
+  *Gibson Group, University of Manchester* (https://gibsongroupresearch.com/)
+  and both maintainer addresses (`akalabya.bissoyi@manchester.ac.uk`,
+  `bissoyi.akalabya@gmail.com`) to the package metadata, About dialog,
+  `CITATION.cff` and `README`.
+- The About dialog now shows the live `__version__` instead of a hard-coded
+  string.
+
+### Added
+- **Faithful pixel view (optional)** — every map window's *Display σ* control
+  can be set to `0` to disable display smoothing and show each measured pixel
+  as a discrete cell (`interpolation="nearest"`). The default remains the
+  smooth, presentation-quality view (bilinear interpolation with light
+  Gaussian smoothing, `sigma=0.8`).
+
+### Fixed
+- Minor plot/robustness fixes: added axis units to the report mean-intensity
+  map (`X (px)`/`Y (px)`); replaced bare `except:` clauses with
+  `except Exception:`.
+
 ## [0.10.0] - 2026-06-02
 
 ### Added
@@ -183,7 +227,9 @@ informally and are summarised below.
 - v1–v5 — Core map exploration, baseline correction, peak fitting, smoothing,
   and export functionality.
 
-[Unreleased]: https://example.com/compare/v0.10.0...HEAD
+[Unreleased]: https://example.com/compare/v1.0.2...HEAD
+[1.0.2]: https://example.com/releases/tag/v1.0.2
+[1.0.1]: https://example.com/releases/tag/v1.0.1
 [0.10.0]: https://example.com/releases/tag/v0.10.0
 [0.9.0]: https://example.com/releases/tag/v0.9.0
 [0.8.0]: https://example.com/releases/tag/v0.8.0

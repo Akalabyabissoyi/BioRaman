@@ -1,0 +1,70 @@
+name: Build standalone apps
+
+# Builds double-click executables for Windows and macOS and attaches them to
+# the GitHub Release. Triggers automatically when you push a version tag
+# (e.g. v1.0.1), or can be run manually from the Actions tab.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to upload assets to the Release
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: BioRaman-Windows.zip
+          - os: macos-latest
+            asset: BioRaman-macOS.zip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm bioraman.spec
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        # One-folder build: zip the whole dist/BioRaman folder (exe + libraries)
+        run: Compress-Archive -Path dist/BioRaman -DestinationPath dist/BioRaman-Windows.zip
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          # Remove the quarantine-prone extended attributes before zipping
+          xattr -cr BioRaman.app || true
+          zip -r -y BioRaman-macOS.zip BioRaman.app
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}
