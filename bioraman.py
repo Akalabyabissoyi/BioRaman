@@ -169,6 +169,10 @@ import numpy as np
 from scipy.signal import savgol_filter, find_peaks
 from scipy.ndimage import gaussian_filter, zoom
 
+# NumPy 2.0 renamed ``np.trapz`` → ``np.trapezoid`` (the old name was removed).
+# Bind to whichever exists so the app works on both NumPy 1.x and 2.x.
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
@@ -858,7 +862,7 @@ def _process_one(args):
         pk = s.max()
         if pk > 0: s /= pk
     elif p.normalisation == "area":
-        area = float(np.trapz(np.clip(s, 0, None)))
+        area = float(_trapz(np.clip(s, 0, None)))
         if area > 0: s /= area
     elif p.normalisation == "snv":
         # Standard Normal Variate: (x - mean) / std per spectrum.
@@ -2800,7 +2804,7 @@ class PCAWindow(tk.Toplevel):
             m = (waves >= w_lo) & (waves <= w_hi)
             if not m.any():
                 return np.full(X.shape[0], np.nan)
-            return np.trapz(np.clip(X[:, m], 0, None), waves[m], axis=1)
+            return _trapz(np.clip(X[:, m], 0, None), waves[m], axis=1)
 
         # Diagnostic windows (cm⁻¹) — standard biological Raman assignments
         I2850 = band(2840, 2860)   # CH2 sym str (lipid acyl chains)
@@ -4081,7 +4085,7 @@ class RamanApp(tk.Tk):
             # negative areas from any residual baseline overshoot.
             per_px_min = corrected.min(axis=2, keepdims=True)
             corrected = corrected - np.minimum(per_px_min, 0)   # only shifts if negative
-            area = np.trapz(corrected, axis=2)
+            area = _trapz(corrected, axis=2)
             return area * float(gain)
 
         def _otsu_threshold(arr_flat):
@@ -5224,13 +5228,13 @@ class RamanApp(tk.Tk):
                 # baseline = straight line between endpoints
                 bl = sub[:, :, 0:1] + (sub[:, :, -1:] - sub[:, :, 0:1]) * \
                      np.linspace(0, 1, m.sum())
-                arr = np.trapz(np.clip(sub - bl, 0, None), axis=2)
+                arr = _trapz(np.clip(sub - bl, 0, None), axis=2)
                 desc = f"Signal to Baseline {min(l1,l2):.0f}–{max(l1,l2):.0f} cm⁻¹"
             else:  # signal_to_axis
                 m = (wn >= min(l1, l2)) & (wn <= max(l1, l2))
                 if not m.any():
                     messagebox.showwarning("Range", "No data in range.", parent=dlg); return
-                arr = np.trapz(np.clip(self.spectra[:, :, m], 0, None), axis=2)
+                arr = _trapz(np.clip(self.spectra[:, :, m], 0, None), axis=2)
                 desc = f"Signal to Axis {min(l1,l2):.0f}–{max(l1,l2):.0f} cm⁻¹"
 
             self._saved_maps[nm] = arr.copy()
@@ -5549,7 +5553,7 @@ class RamanApp(tk.Tk):
             if dm_type.get() == "signal_to_axis":
                 y = cube[:, :, i0:i1].astype(float)
                 x = xax[i0:i1].astype(float)
-                return np.trapz(y, x, axis=2)
+                return _trapz(y, x, axis=2)
             # signal_to_baseline: max of band after linear baseline
             y = cube[:, :, i0:i1].astype(float)
             n = y.shape[2]
@@ -6490,7 +6494,7 @@ class RamanApp(tk.Tk):
                 return sub[:, :, 0]
             bl = sub[:, :, 0:1] + (sub[:, :, -1:] - sub[:, :, 0:1]) * \
                  np.linspace(0, 1, m.sum())
-            return np.trapz(np.clip(sub - bl, 0, None), axis=2)
+            return _trapz(np.clip(sub - bl, 0, None), axis=2)
 
         def _build_volume():
             """
