@@ -1386,6 +1386,35 @@ def particle_stats(image, auto=True, threshold_pct=50.0, remove_edge=True,
                 area_pct=area_pct, n=len(props))
 
 
+def band_range_status(xdata, lo, hi):
+    """Classify a band window [lo, hi] against the acquired wavenumber axis.
+
+    Returns (status, message) where status is one of:
+      'ok'       — the whole window lies inside the measured range.
+      'partial'  — the window overlaps the data but extends past one/both ends
+                   (results are silently truncated to the data edge).
+      'outside'  — the window lies entirely beyond the measured range; there is
+                   NO data, so any intensity reported there is an artifact.
+    This is what catches the classic mistake of integrating e.g. an OH-stretch
+    band (~3100 cm⁻¹) when acquisition stopped at ~2500 cm⁻¹.
+    """
+    if xdata is None or np.size(xdata) == 0:
+        return ("outside", "No spectral axis loaded.")
+    lo, hi = (lo, hi) if lo <= hi else (hi, lo)
+    xmin = float(np.nanmin(xdata)); xmax = float(np.nanmax(xdata))
+    rng = f"data range {xmin:.0f}–{xmax:.0f} cm⁻¹"
+    if hi < xmin or lo > xmax:
+        return ("outside",
+                f"Band {lo:.0f}–{hi:.0f} cm⁻¹ is OUTSIDE the {rng}. "
+                f"No spectra were collected here — any signal shown is an "
+                f"artifact, not a measurement.")
+    if lo < xmin or hi > xmax:
+        return ("partial",
+                f"Band {lo:.0f}–{hi:.0f} cm⁻¹ extends past the {rng}; it is "
+                f"truncated to the measured edge — interpret with caution.")
+    return ("ok", f"Band {lo:.0f}–{hi:.0f} cm⁻¹ within {rng}.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CUSTOM WIDGETS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2229,9 +2258,9 @@ class PCAWindow(tk.Toplevel):
                 ev  = np.maximum(ev, 0)
                 ang = np.degrees(np.arctan2(*evec[:, 1][::-1]))
                 ax.add_patch(Ellipse((x.mean(), y.mean()),
-                             4*np.sqrt(ev[0]), 4*np.sqrt(ev[1]),
-                             angle=ang, edgecolor=col, facecolor=col,
-                             alpha=0.12, lw=1.5))
+                             2*np.sqrt(ev[1]), 2*np.sqrt(ev[0]),
+                             angle=ang, edgecolor=col, facecolor="none",
+                             alpha=0.9, lw=1.8))
 
         if use_factor:
             from matplotlib.lines import Line2D
@@ -2964,9 +2993,9 @@ class PCAWindow(tk.Toplevel):
                 ev = np.maximum(ev, 0)
                 ang = np.degrees(np.arctan2(*evec[:, 1][::-1]))
                 ax.add_patch(Ellipse((x.mean(), y.mean()),
-                             4*np.sqrt(ev[0]), 4*np.sqrt(ev[1]),
-                             angle=ang, edgecolor=col, facecolor=col,
-                             alpha=0.12, lw=1.5))
+                             2*np.sqrt(ev[1]), 2*np.sqrt(ev[0]),
+                             angle=ang, edgecolor=col, facecolor="none",
+                             alpha=0.9, lw=1.8))
 
         if kind == "scores":
             fig, ax = plt.subplots(figsize=(8.5, 6.5))
@@ -3266,11 +3295,19 @@ class RamanApp(tk.Tk):
         am.add_separator()
         am.add_command(label="⚗  Component Analysis (DCLS/NNLS)…",
                        command=self.open_component_analysis)
+        am.add_command(label="▦  Multi-Map Analysis…",  command=self.open_multimap)
         am.add_command(label="◍  Particle Statistics…",
                        command=self.open_particle_stats)
         am.add_command(label="🔎  Library Search (full-spectrum)…",
                        command=self.open_library_search)
         am.add_command(label="⚒  Spectral Tools…",       command=self.open_spectral_tools)
+
+        # ── PCRS (Particle Characterisation & Raman Spectroscopy) ──────────────
+        pm = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
+                     activebackground=C["accent"], activeforeground="white")
+        mb.add_cascade(label="PCRS", menu=pm)
+        pm.add_command(label="◍  ParticleFinder + IDFinder…",
+                       command=self.open_pcrs_particlefinder)
 
         hm = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
                      activebackground=C["accent"], activeforeground="white")
@@ -3631,7 +3668,32 @@ class RamanApp(tk.Tk):
     # ── band slider callbacks ─────────────────────────────────────────────────
     def _on_band_change(self):
         self._rebuild_band_spans()
+        self._warn_band_range()
         self.update_map()
+
+    def _warn_band_range(self):
+        """Flag, in the status bar, any active band that falls outside (or
+        partly outside) the acquired wavenumber range — so out-of-range bands
+        like an OH-stretch window beyond the cutoff can't masquerade as data."""
+        if self.xdata is None:
+            return
+        mode = self.mode_var.get() if hasattr(self, "mode_var") else "ratio"
+        if mode == "wl":          # white-light only — bands unused
+            return
+        checks = [("A", self.rs_a.low, self.rs_a.high)]
+        # Band B is used by the Ratio and A+B RGB modes.
+        if mode in ("ratio", "rgb"):
+            checks.append(("B", self.rs_b.low, self.rs_b.high))
+        worst = "ok"; msg = ""
+        rank = {"ok": 0, "partial": 1, "outside": 2}
+        for tag, lo, hi in checks:
+            status, m = band_range_status(self.xdata, lo, hi)
+            if rank[status] > rank[worst]:
+                worst, msg = status, f"Band {tag}: {m}"
+        if worst == "outside":
+            self._status.set("⛔  " + msg)
+        elif worst == "partial":
+            self._status.set("⚠  " + msg)
 
     def _rebuild_band_spans(self):
         if self.xdata is None: return
@@ -4054,7 +4116,9 @@ class RamanApp(tk.Tk):
             """
             m = (self.xdata >= lo_wn) & (self.xdata <= hi_wn)
             if not m.any():
-                return np.zeros((Y, X))
+                # Band entirely outside the acquired range — return NaN so the
+                # panel renders BLANK rather than a misleading flat-zero field.
+                return np.full((Y, X), np.nan)
             sub = self.spectra[:, :, m].astype(float)   # Y x X x W_sub
             n_pts = m.sum()
             band_width_cm = hi_wn - lo_wn
@@ -4122,6 +4186,33 @@ class RamanApp(tk.Tk):
             # 1. Compute peak-area maps with sensitivity controls
             al = a_lo_var.get(); ah = a_hi_var.get()
             bl = b_lo_var.get(); bh = b_hi_var.get()
+
+            # ── Out-of-range guard ─────────────────────────────────────────────
+            # Flag any band that falls outside the acquired wavenumber range so
+            # e.g. an ice OH-stretch window (3087-3162) requested on data that
+            # stops at ~2500 cm⁻¹ cannot masquerade as a real measurement.
+            _bad = []
+            for _tag, _lbl, _lo, _hi in (
+                    ("A", a_label_var.get(), al, ah),
+                    ("B", b_label_var.get(), bl, bh)):
+                _st, _msg = band_range_status(self.xdata, _lo, _hi)
+                if _st != "ok":
+                    _bad.append(f"Band {_tag} ({_lbl}): {_msg}")
+            if _bad:
+                _outside = any("OUTSIDE" in b for b in _bad)
+                _title = ("Band outside data range" if _outside
+                          else "Band partly outside data range")
+                _body = "\n\n".join(_bad)
+                if _outside:
+                    messagebox.showwarning(
+                        _title, _body + "\n\nThat band's panel will be left "
+                        "blank (no data exists there).", parent=win)
+                else:
+                    if not messagebox.askyesno(
+                            _title, _body + "\n\nRun the analysis anyway?",
+                            parent=win):
+                        return
+
             use_rbl = rolling_bl_var.get()
             map_a = _peak_area_map(al, ah, gain=gain_a_var.get(), rolling_bl=use_rbl)
             map_b_raw = _peak_area_map(bl, bh, gain=gain_b_var.get(), rolling_bl=use_rbl)
@@ -4707,7 +4798,10 @@ class RamanApp(tk.Tk):
     def _band_mean(self, lo, hi):
         if self.xdata is None: return np.zeros((1,1))
         mask = (self.xdata >= lo) & (self.xdata <= hi)
-        if not mask.any(): return np.zeros(self.spectra.shape[:2])
+        if not mask.any():
+            # Band is entirely outside the acquired range — return NaN so the
+            # map renders blank instead of a misleading flat-zero field.
+            return np.full(self.spectra.shape[:2], np.nan)
         return np.mean(self.spectra[:,:,mask], axis=2)
 
     def _smooth_zoom(self, arr):
@@ -5215,6 +5309,19 @@ class RamanApp(tk.Tk):
             l1 = lim1_var.get(); l2 = lim2_var.get()
             nm = name_var.get().strip() or f"Map {len(self._saved_maps)+1}"
             wn = self.xdata
+
+            # ── out-of-range guard ───────────────────────────────────────────
+            _lo, _hi = (l1, l1) if t == "intensity_at_point" else \
+                (min(l1, l2), max(l1, l2))
+            _st, _msg = band_range_status(wn, _lo, _hi)
+            if _st == "outside":
+                messagebox.showerror("Band outside data range", _msg, parent=dlg)
+                return
+            if _st == "partial":
+                if not messagebox.askyesno(
+                        "Band partly outside data range",
+                        _msg + "\n\nBuild the map anyway?", parent=dlg):
+                    return
 
             if t == "intensity_at_point":
                 idx = int(np.argmin(np.abs(wn - l1)))
@@ -6924,6 +7031,11 @@ class RamanApp(tk.Tk):
         """Open the batch-processing dialog (apply current recipe to a folder)."""
         BatchWindow(self)
 
+    def open_multimap(self):
+        """Multi-map analysis: compare average spectra across maps and build
+        band-ratio image series with a normalised quantification trend."""
+        MultiMapWindow(self)
+
     def open_library_search(self):
         """Full-spectrum library search against a user-supplied reference
         library (RRUFF / Raman Open Database / SLoPP / any spectra folder)."""
@@ -6954,6 +7066,32 @@ class RamanApp(tk.Tk):
                 "concentration map), then try again.")
             return
         ParticleStatsWindow(self, arr, "current map")
+
+    def open_pcrs_particlefinder(self):
+        """PCRS ParticleFinder + IDFinder: locate particles on the current
+        single-band map, extract each particle's mean Raman spectrum from the
+        full hyperspectral cube, and (optionally) identify every particle
+        against a user-supplied reference library — all in one panel."""
+        if self.spectra is None:
+            messagebox.showwarning("No data", "Load a file first."); return
+        if np.asarray(self.spectra).ndim != 3:
+            messagebox.showinfo(
+                "Need a hyperspectral map",
+                "ParticleFinder needs a 2-D hyperspectral map (a cube of "
+                "spectra), so it can extract a spectrum for each particle.")
+            return
+        try:
+            arr = np.asarray(self.im.get_array(), dtype=float)
+        except Exception:
+            arr = None
+        if arr is None or arr.ndim != 2:
+            messagebox.showinfo(
+                "Need a single-band map",
+                "ParticleFinder locates particles on a single-band intensity "
+                "map. Build one first (Univariate, Ratio, or a Component "
+                "Analysis concentration map), then try again.")
+            return
+        ParticleFinderWindow(self, arr, "current map")
 
     def save_report(self):
         """Write a self-contained HTML report of the current map + recipe."""
@@ -8725,6 +8863,503 @@ class SpectralToolsWindow(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MULTI-MAP ANALYSIS WINDOW
+#   • Average-spectra comparison (stacked / offset, labelled peaks)  — like Fig A
+#   • Band-ratio image series + normalised quantification trend      — like Fig B
+# ─────────────────────────────────────────────────────────────────────────────
+class MultiMapWindow(tk.Toplevel):
+    """Compare several Raman maps side by side.
+
+    Each entry in ``self.maps`` is a dict with keys:
+        name : str                  display label
+        wn   : 1-D ndarray (W,)     wavenumber axis
+        cube : 3-D ndarray (Y,X,W)  processed hyperspectral cube
+        mean : 1-D ndarray (W,)     mean spectrum over all pixels (cached)
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Multi-Map Analysis — compare maps")
+        self.configure(bg=C["bg"])
+        self.geometry("1180x760")
+        self.maps: list[dict] = []
+        self._ratio_cache = None          # (names, images, trend) for export
+
+        # ── header ────────────────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=C["header"], height=46)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="▦  MULTI-MAP ANALYSIS",
+                 bg=C["header"], fg="white",
+                 font=("Consolas", 13, "bold")).pack(side="left", padx=16, pady=12)
+
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill="both", expand=True)
+
+        # ── left: map list + loaders ──────────────────────────────────────────
+        left = tk.Frame(body, bg=C["sidebar"], width=270)
+        left.pack(side="left", fill="y"); left.pack_propagate(False)
+
+        tk.Label(left, text="Loaded maps", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12, pady=(12, 4))
+
+        lb_frame = tk.Frame(left, bg=C["sidebar"])
+        lb_frame.pack(fill="both", expand=True, padx=12)
+        self.lb = tk.Listbox(lb_frame, selectmode="extended",
+                             bg="white", fg=C["text_hi"],
+                             font=("Consolas", 10), relief="flat",
+                             highlightthickness=1,
+                             highlightbackground=C["border"], activestyle="none")
+        self.lb.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(lb_frame, orient="vertical", command=self.lb.yview)
+        sb.pack(side="right", fill="y")
+        self.lb.config(yscrollcommand=sb.set)
+
+        btns = tk.Frame(left, bg=C["sidebar"])
+        btns.pack(fill="x", padx=12, pady=8)
+        ttk.Button(btns, text="＋ Load map files…", style="Primary.TButton",
+                   command=self._load_files).pack(fill="x", pady=2)
+        ttk.Button(btns, text="＋ Add current map", style="Neutral.TButton",
+                   command=self._add_current).pack(fill="x", pady=2)
+        ttk.Button(btns, text="↑ Up", style="Neutral.TButton",
+                   command=lambda: self._move(-1)).pack(side="left", expand=True, fill="x", padx=(0, 2), pady=2)
+        ttk.Button(btns, text="↓ Down", style="Neutral.TButton",
+                   command=lambda: self._move(1)).pack(side="left", expand=True, fill="x", padx=(2, 0), pady=2)
+        ttk.Button(btns, text="✕ Remove selected", style="Neutral.TButton",
+                   command=self._remove).pack(fill="x", pady=2)
+
+        self._status = tk.Label(left, text="No maps loaded.",
+                                bg=C["sidebar"], fg=C["text_dim"],
+                                font=("Segoe UI", 9), wraplength=240, justify="left")
+        self._status.pack(fill="x", padx=12, pady=(4, 10))
+
+        # ── right: notebook with the two tools ────────────────────────────────
+        nb = ttk.Notebook(body)
+        nb.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self._build_avg_tab(nb)
+        self._build_ratio_tab(nb)
+
+    # ── map-list management ───────────────────────────────────────────────────
+    def _refresh_list(self):
+        self.lb.delete(0, "end")
+        for m in self.maps:
+            Y, X, W = m["cube"].shape
+            self.lb.insert("end", f"{m['name']}  [{X}×{Y}]")
+        n = len(self.maps)
+        self._status.config(
+            text=(f"{n} map{'s' if n != 1 else ''} loaded."
+                  if n else "No maps loaded."))
+
+    def _add_map(self, name, wn, cube):
+        cube = np.asarray(cube, dtype=float)
+        if cube.ndim == 2:
+            cube = cube[None, :, :]
+        # ensure unique name
+        base, i = name, 1
+        existing = {m["name"] for m in self.maps}
+        while name in existing:
+            i += 1; name = f"{base} ({i})"
+        first = not self.maps
+        self.maps.append({"name": name,
+                          "wn": np.asarray(wn, dtype=float),
+                          "cube": cube,
+                          "mean": cube.reshape(-1, cube.shape[-1]).mean(axis=0)})
+        if first:
+            self._apply_data_defaults(self.maps[0])
+
+    @staticmethod
+    def _auto_peaks(wn, y, n=4):
+        """Return up to ``n`` peak positions (cm⁻¹), strongest first, found
+        purely from the data — no assumptions about which bands are present."""
+        wn = np.asarray(wn, float); y = np.asarray(y, float)
+        if y.size < 3:
+            return []
+        # local maxima
+        idx = np.where((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:]))[0] + 1
+        if idx.size == 0:
+            return []
+        # prominence ≈ height above the lower of the two neighbouring minima
+        prom = []
+        for i in idx:
+            l = y[:i].min() if i > 0 else y[i]
+            r = y[i:].min() if i < y.size else y[i]
+            prom.append(y[i] - max(l, r))
+        order = np.argsort(prom)[::-1]
+        chosen, span = [], (wn.max() - wn.min())
+        for o in order:
+            p = wn[idx[o]]
+            if all(abs(p - c) > 0.03 * span for c in chosen):   # keep them separated
+                chosen.append(p)
+            if len(chosen) >= n:
+                break
+        return chosen
+
+    def _apply_data_defaults(self, m):
+        """Seed peak labels and ratio bands from the actual loaded spectrum so
+        nothing is tied to any specific Raman band."""
+        wn, y = m["wn"], m["mean"]
+        span = float(wn.max() - wn.min()) or 1.0
+        win = max(span * 0.02, (wn[1] - wn[0]) * 2 if wn.size > 1 else 1.0)
+        peaks = self._auto_peaks(wn, y, n=4)
+        if peaks:
+            self._avg_peaks.set(", ".join(f"{p:.0f}" for p in peaks))
+        # numerator = strongest peak; denominator = next strongest (else band edge)
+        if peaks:
+            c1 = peaks[0]
+            self._num_lo.set(round(c1 - win, 1)); self._num_hi.set(round(c1 + win, 1))
+            c2 = peaks[1] if len(peaks) > 1 else (wn.min() + 0.9 * span)
+            self._den_lo.set(round(c2 - win, 1)); self._den_hi.set(round(c2 + win, 1))
+        else:
+            lo, hi = float(wn.min()), float(wn.max())
+            self._num_lo.set(round(lo + 0.20 * span, 1)); self._num_hi.set(round(lo + 0.30 * span, 1))
+            self._den_lo.set(round(lo + 0.70 * span, 1)); self._den_hi.set(round(lo + 0.80 * span, 1))
+
+    def _add_current(self):
+        if self.app.spectra is None or self.app.xdata is None:
+            messagebox.showinfo("No map", "Load a map in the main window first.",
+                                parent=self); return
+        nm = Path(getattr(self.app, "_loaded_path", "current") or "current").stem or "current map"
+        self._add_map(nm, self.app.xdata, self.app.spectra)
+        self._refresh_list()
+
+    def _load_files(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Load Raman map files",
+            filetypes=SUPPORTED_PATTERNS)
+        if not paths: return
+        self._status.config(text="Loading…"); self.update_idletasks()
+        ok, fails = 0, []
+        for p in paths:
+            try:
+                r = _open_raman_any(p)
+                proc, _ = preprocess_map(r.spectra, self.app.pp_params)
+                self._add_map(Path(p).stem, r.xdata, proc)
+                ok += 1
+            except Exception as exc:
+                fails.append(f"{Path(p).name}: {exc}")
+        self._refresh_list()
+        if fails:
+            messagebox.showwarning(
+                "Some files failed",
+                f"Loaded {ok} map(s).\n\nFailed:\n" + "\n".join(fails[:8]),
+                parent=self)
+
+    def _selected_indices(self):
+        return list(self.lb.curselection())
+
+    def _remove(self):
+        for i in reversed(self._selected_indices()):
+            del self.maps[i]
+        self._refresh_list()
+
+    def _move(self, d):
+        sel = self._selected_indices()
+        if not sel: return
+        i = sel[0]; j = i + d
+        if 0 <= j < len(self.maps):
+            self.maps[i], self.maps[j] = self.maps[j], self.maps[i]
+            self._refresh_list()
+            self.lb.selection_set(j)
+
+    # ── tab 1: average-spectra comparison ─────────────────────────────────────
+    def _build_avg_tab(self, nb):
+        tab = tk.Frame(nb, bg=C["bg"]); nb.add(tab, text="  Average Spectra  ")
+
+        ctl = tk.Frame(tab, bg=C["panel"]); ctl.pack(fill="x", padx=6, pady=6)
+        tk.Label(ctl, text="Normalise:", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left", padx=(8, 4))
+        self._avg_norm = tk.StringVar(value="max")
+        ttk.Combobox(ctl, textvariable=self._avg_norm, state="readonly", width=8,
+                     values=["none", "max", "area", "minmax", "vector"]).pack(side="left")
+        tk.Label(ctl, text="Stat:", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left", padx=(12, 4))
+        self._avg_stat = tk.StringVar(value="mean")
+        ttk.Combobox(ctl, textvariable=self._avg_stat, state="readonly", width=8,
+                     values=["mean", "median"]).pack(side="left")
+        self._avg_band = tk.BooleanVar(value=False)
+        tk.Checkbutton(ctl, text="±1 SD", variable=self._avg_band, bg=C["panel"],
+                       fg=C["text_mid"], selectcolor="white", activebackground=C["panel"],
+                       command=self._draw_avg).pack(side="left", padx=(10, 0))
+        tk.Label(ctl, text="Offset:", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left", padx=(12, 4))
+        self._avg_offset = tk.DoubleVar(value=1.0)
+        tk.Scale(ctl, from_=0.0, to=3.0, resolution=0.1, orient="horizontal",
+                 variable=self._avg_offset, bg=C["panel"], length=130,
+                 showvalue=True, command=lambda _e: self._draw_avg()).pack(side="left")
+        tk.Label(ctl, text="Peak labels (cm⁻¹, comma-sep):", bg=C["panel"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left", padx=(12, 4))
+        self._avg_peaks = tk.StringVar(value="")   # auto-filled from data
+        tk.Entry(ctl, textvariable=self._avg_peaks, width=20, bg="white",
+                 relief="flat", highlightthickness=1,
+                 highlightbackground=C["border"]).pack(side="left")
+        ttk.Button(ctl, text="↻ Plot", style="Primary.TButton",
+                   command=self._draw_avg).pack(side="left", padx=8)
+        ttk.Button(ctl, text="↓ CSV", style="Neutral.TButton",
+                   command=self._export_avg).pack(side="right", padx=6)
+
+        self._avg_fig = plt.figure(figsize=(7, 5.4))
+        self._avg_ax = self._avg_fig.add_subplot(111)
+        self._avg_cv = FigureCanvasTkAgg(self._avg_fig, master=tab)
+        self._avg_cv.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=(0, 4))
+        NavigationToolbar2Tk(self._avg_cv, tab).update()
+
+    @staticmethod
+    def _norm_factors(y, mode, wn=None):
+        """Return (offset, scale) so the normalised spectrum is (y-offset)/scale.
+        Returning factors (rather than a normalised array) lets the same scale be
+        applied consistently to a spread/SD band."""
+        y = np.asarray(y, dtype=float)
+        if mode == "max":
+            s = np.nanmax(np.abs(y));            return 0.0, (s if s else 1.0)
+        if mode == "area":
+            s = np.trapz(np.clip(y, 0, None), wn) if wn is not None \
+                else np.trapz(np.clip(y, 0, None))
+            return 0.0, (s if s else 1.0)
+        if mode == "vector":                      # L2 / SNV-style vector norm
+            s = float(np.sqrt(np.nansum(y ** 2))); return 0.0, (s if s else 1.0)
+        if mode == "minmax":
+            lo, hi = np.nanmin(y), np.nanmax(y)
+            return float(lo), (float(hi - lo) if hi > lo else 1.0)
+        return 0.0, 1.0
+
+    def _repr_spec(self, m, stat):
+        """Representative spectrum (mean or robust median over all pixels) plus
+        the per-channel standard deviation across pixels (sample heterogeneity)."""
+        flat = m["cube"].reshape(-1, m["cube"].shape[-1])
+        center = np.nanmedian(flat, axis=0) if stat == "median" \
+            else np.nanmean(flat, axis=0)
+        sd = np.nanstd(flat, axis=0)
+        return center, sd
+
+    def _draw_avg(self):
+        ax = self._avg_ax; ax.cla()
+        if not self.maps:
+            ax.text(0.5, 0.5, "Load maps, then press Plot",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=C["text_dim"]); self._avg_cv.draw(); return
+        mode = self._avg_norm.get()
+        stat = self._avg_stat.get()
+        show_band = bool(self._avg_band.get())
+        off_step = float(self._avg_offset.get())
+        cmap = plt.cm.get_cmap("tab10")
+        try:
+            peaks = [float(p) for p in self._avg_peaks.get().split(",") if p.strip()]
+        except ValueError:
+            peaks = []
+        ymax_top = 0.0
+        for k, m in enumerate(self.maps):
+            center, sd = self._repr_spec(m, stat)
+            off, scale = self._norm_factors(center, mode, m["wn"])
+            y = (center - off) / scale + k * off_step
+            col = cmap(k % 10)
+            ax.plot(m["wn"], y, lw=1.2, color=col, label=m["name"])
+            if show_band:
+                sdn = sd / scale
+                ax.fill_between(m["wn"], y - sdn, y + sdn, color=col, alpha=0.18,
+                                linewidth=0)
+                ymax_top = max(ymax_top, np.nanmax(y + sdn))
+            else:
+                ymax_top = max(ymax_top, np.nanmax(y))
+        # peak guide lines + labels across the top
+        for pk in peaks:
+            ax.axvline(pk, color=C["text_dim"], lw=0.6, ls=":", alpha=0.7)
+            ax.text(pk, ymax_top * 1.02, f"{pk:g}", rotation=0, ha="center",
+                    va="bottom", fontsize=8, color=C["text_mid"])
+        ax.set_xlabel("Raman shift (cm⁻¹)")
+        ax.set_ylabel("Intensity (a.u.)" + ("  ·  offset stacked" if off_step else ""))
+        ax.set_title(f"Comparison of {stat} spectra"
+                     + ("  ·  shaded = ±1 SD across pixels" if show_band else ""))
+        ax.legend(fontsize=8, loc="upper right", framealpha=0.9)
+        ax.margins(x=0.01)
+        self._avg_fig.tight_layout()
+        self._avg_cv.draw()
+
+    def _export_avg(self):
+        if not self.maps:
+            messagebox.showinfo("No data", "Nothing to export.", parent=self); return
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Export average spectra", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")])
+        if not path: return
+        # interpolate every map onto the first map's axis for a tidy table
+        ref = self.maps[0]["wn"]
+        mode = self._avg_norm.get(); stat = self._avg_stat.get()
+        cols = [ref]; header = ["wavenumber_cm-1"]
+        for m in self.maps:
+            center, _ = self._repr_spec(m, stat)
+            off, scale = self._norm_factors(center, mode, m["wn"])
+            y = (center - off) / scale
+            cols.append(np.interp(ref, m["wn"], y))
+            header.append(m["name"])
+        arr = np.column_stack(cols)
+        np.savetxt(path, arr, delimiter=",", header=",".join(header),
+                   comments="", fmt="%.6g")
+        self._status.config(text=f"Saved {Path(path).name}")
+
+    # ── tab 2: band-ratio image series + trend ────────────────────────────────
+    def _build_ratio_tab(self, nb):
+        tab = tk.Frame(nb, bg=C["bg"]); nb.add(tab, text="  Ratio Series  ")
+
+        ctl = tk.Frame(tab, bg=C["panel"]); ctl.pack(fill="x", padx=6, pady=6)
+        tk.Label(ctl, text="Numerator band:", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left", padx=(8, 2))
+        self._num_lo = tk.DoubleVar(value=0.0); self._num_hi = tk.DoubleVar(value=0.0)
+        for v in (self._num_lo, self._num_hi):
+            tk.Entry(ctl, textvariable=v, width=6, bg="white", relief="flat",
+                     highlightthickness=1, highlightbackground=C["band_a"]).pack(side="left", padx=1)
+        tk.Label(ctl, text="÷ Denominator band:", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left", padx=(10, 2))
+        self._den_lo = tk.DoubleVar(value=0.0); self._den_hi = tk.DoubleVar(value=0.0)
+        for v in (self._den_lo, self._den_hi):
+            tk.Entry(ctl, textvariable=v, width=6, bg="white", relief="flat",
+                     highlightthickness=1, highlightbackground=C["band_b"]).pack(side="left", padx=1)
+        tk.Label(ctl, text="Stat:", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left", padx=(10, 2))
+        self._ratio_stat = tk.StringVar(value="mean")
+        ttk.Combobox(ctl, textvariable=self._ratio_stat, state="readonly", width=7,
+                     values=["mean", "median"]).pack(side="left")
+        tk.Label(ctl, text="Bkg %:", bg=C["panel"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left", padx=(10, 2))
+        self._ratio_bg = tk.DoubleVar(value=5.0)
+        tk.Entry(ctl, textvariable=self._ratio_bg, width=4, bg="white", relief="flat",
+                 highlightthickness=1, highlightbackground=C["border"]).pack(side="left")
+        self._ratio_bl = tk.BooleanVar(value=True)
+        tk.Checkbutton(ctl, text="Local baseline", variable=self._ratio_bl,
+                       bg=C["panel"], fg=C["text_mid"], selectcolor="white",
+                       activebackground=C["panel"]).pack(side="left", padx=(8, 0))
+        self._ratio_cmap = tk.StringVar(value="inferno")
+        ttk.Combobox(ctl, textvariable=self._ratio_cmap, state="readonly", width=9,
+                     values=COLORMAPS).pack(side="left", padx=(6, 0))
+        ttk.Button(ctl, text="↻ Compute", style="Primary.TButton",
+                   command=self._draw_ratio).pack(side="left", padx=8)
+        ttk.Button(ctl, text="↓ Trend CSV", style="Neutral.TButton",
+                   command=self._export_ratio).pack(side="right", padx=6)
+
+        self._ratio_fig = plt.figure(figsize=(8, 5.4))
+        self._ratio_cv = FigureCanvasTkAgg(self._ratio_fig, master=tab)
+        self._ratio_cv.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=(0, 4))
+        NavigationToolbar2Tk(self._ratio_cv, tab).update()
+
+    def _band_integral(self, cube, wn, lo, hi, local_baseline=False):
+        """Trapezoidal band area on each map's own wavenumber axis. Returns NaN
+        where the requested band lies outside the map's range (no silent
+        nearest-channel substitution). Optional local linear baseline subtracts
+        the straight line between the window endpoints per pixel, so the area is
+        insensitive to residual broadband offset."""
+        if hi < lo: lo, hi = hi, lo
+        mask = (wn >= lo) & (wn <= hi)
+        if mask.sum() < 2:                       # band not (sufficiently) covered
+            return np.full(cube.shape[:2], np.nan)
+        x = wn[mask]
+        sub = cube[:, :, mask].astype(float)
+        if local_baseline and x[-1] > x[0]:
+            y0 = sub[:, :, :1]; y1 = sub[:, :, -1:]
+            t = ((x - x[0]) / (x[-1] - x[0]))[None, None, :]
+            sub = sub - (y0 + (y1 - y0) * t)
+        return np.trapz(np.clip(sub, 0, None), x, axis=2)
+
+    def _ratio_image(self, m):
+        bl = bool(self._ratio_bl.get())
+        num = self._band_integral(m["cube"], m["wn"],
+                                  self._num_lo.get(), self._num_hi.get(), bl)
+        den = self._band_integral(m["cube"], m["wn"],
+                                  self._den_lo.get(), self._den_hi.get(), bl)
+        ratio = np.full(num.shape, np.nan, dtype=float)
+        # background rejection: drop pixels whose reference (denominator) band is
+        # below a fraction of that map's robust 99th-percentile signal — these are
+        # empty/noise pixels where a ratio is meaningless and explosively noisy.
+        dvalid = den[np.isfinite(den) & (den > 0)]
+        try:
+            bg_frac = max(0.0, float(self._ratio_bg.get())) / 100.0
+        except (tk.TclError, ValueError):
+            bg_frac = 0.05
+        thr = (np.percentile(dvalid, 99) * bg_frac) if dvalid.size else 0.0
+        good = np.isfinite(num) & np.isfinite(den) & (den > thr) & (den > 0)
+        ratio[good] = num[good] / den[good]
+        return ratio
+
+    def _draw_ratio(self):
+        fig = self._ratio_fig; fig.clf()
+        if not self.maps:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "Load maps, then press Compute",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=C["text_dim"]); self._ratio_cv.draw(); return
+        n = len(self.maps)
+        images = [self._ratio_image(m) for m in self.maps]
+        stat = self._ratio_stat.get()
+        # central value + spread per map (NaN background excluded everywhere)
+        trend = np.full(n, np.nan); spread = np.full(n, np.nan); npix = np.zeros(n, int)
+        for k, im in enumerate(images):
+            v = im[np.isfinite(im)]
+            npix[k] = v.size
+            if v.size:
+                if stat == "median":
+                    trend[k] = np.median(v)
+                    q1, q3 = np.percentile(v, [25, 75]); spread[k] = (q3 - q1) / 2.0
+                else:
+                    trend[k] = v.mean(); spread[k] = v.std(ddof=1) if v.size > 1 else 0.0
+        ref = trend[0]
+        if np.isfinite(ref) and ref != 0:
+            norm_trend = trend / ref; norm_spread = spread / abs(ref)
+        else:
+            norm_trend = trend; norm_spread = spread
+        # shared colour scale across the series
+        finite = np.concatenate([im[np.isfinite(im)].ravel() for im in images]) \
+            if any(np.isfinite(im).any() for im in images) else np.array([0, 1])
+        vmin, vmax = np.percentile(finite, [2, 98]) if finite.size else (0, 1)
+        cmap = self._ratio_cmap.get()
+
+        gs = fig.add_gridspec(2, n, height_ratios=[2.2, 1.4], hspace=0.35, wspace=0.08)
+        im0 = None
+        for k, im in enumerate(images):
+            ax = fig.add_subplot(gs[0, k])
+            im0 = ax.imshow(im, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
+            ax.set_title(self.maps[k]["name"], fontsize=8)
+            ax.set_xticks([]); ax.set_yticks([])
+        if im0 is not None:
+            cax = fig.add_axes([0.92, 0.55, 0.015, 0.33])
+            fig.colorbar(im0, cax=cax).ax.tick_params(labelsize=7)
+        axt = fig.add_subplot(gs[1, :])
+        spread_lbl = "IQR/2" if stat == "median" else "SD"
+        axt.errorbar(range(1, n + 1), norm_trend, yerr=norm_spread, fmt="o-",
+                     color=C["accent"], lw=1.5, capsize=3, ecolor=C["text_dim"],
+                     elinewidth=0.9)
+        axt.axhline(1.0, color=C["text_dim"], lw=0.7, ls="--")
+        axt.set_xticks(range(1, n + 1))
+        axt.set_xticklabels([m["name"] for m in self.maps], rotation=30,
+                            ha="right", fontsize=7)
+        axt.set_ylabel("Normalised value ratio", fontsize=9)
+        axt.set_title(f"Quantification ({stat} band ratio, normalised to first map · "
+                      f"error bars = {spread_lbl} across valid pixels)", fontsize=8)
+        axt.grid(alpha=0.25)
+        fig.subplots_adjust(left=0.06, right=0.90, top=0.93, bottom=0.18)
+        self._ratio_cv.draw()
+        self._ratio_cache = ([m["name"] for m in self.maps], trend, norm_trend,
+                             spread, norm_spread, npix, spread_lbl)
+        self._status.config(
+            text=f"Ratio: {self._num_lo.get():g}-{self._num_hi.get():g} ÷ "
+                 f"{self._den_lo.get():g}-{self._den_hi.get():g}")
+
+    def _export_ratio(self):
+        if not self._ratio_cache:
+            messagebox.showinfo("No data", "Press Compute first.", parent=self); return
+        names, trend, norm, spread, norm_spread, npix, spread_lbl = self._ratio_cache
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Export ratio trend", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")])
+        if not path: return
+        sl = spread_lbl.replace("/", "_over_")
+        with open(path, "w") as f:
+            f.write(f"map,index,band_ratio,{sl},normalised_ratio,"
+                    f"normalised_{sl},n_valid_pixels\n")
+            for i, nm in enumerate(names):
+                f.write(f"{nm},{i+1},{trend[i]:.6g},{spread[i]:.6g},"
+                        f"{norm[i]:.6g},{norm_spread[i]:.6g},{npix[i]}\n")
+        self._status.config(text=f"Saved {Path(path).name}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
@@ -10053,6 +10688,347 @@ class ParticleStatsWindow(tk.Toplevel):
             for p in self._props:
                 w.writerow([p["label"], p["area_px"], f"{p['area_um2']:.3f}",
                             f"{p['ecd_um']:.3f}", f"{p['cx']:.1f}", f"{p['cy']:.1f}"])
+        messagebox.showinfo("Export", f"Saved {len(self._props)} particles.",
+                            parent=self)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PCRS: ParticleFinder + IDFinder  (HORIBA PCRS-style integrated workflow)
+# ─────────────────────────────────────────────────────────────────────────────
+class ParticleFinderWindow(tk.Toplevel):
+    """PCRS-style integrated workflow.
+
+    ParticleFinder — automatically locate and characterise particles on the
+    current single-band map (area, equivalent-circle diameter, centroid),
+    then pull a mean Raman spectrum for each particle straight out of the
+    hyperspectral cube.
+
+    IDFinder — match every particle's spectrum against a user-supplied
+    reference library (RRUFF / Raman Open Database / SLoPP / any folder of
+    spectra) by Pearson correlation, and tag each particle with its best-match
+    identity and a confidence score.
+
+    No spectral library is bundled, so there are no licensing constraints —
+    the user loads a library they already have.
+    """
+    SPEC_EXTS = (".txt", ".csv", ".dpt", ".dat", ".asc", ".jdx", ".spc", ".wdf")
+
+    def __init__(self, app, image, name="image"):
+        super().__init__(app)
+        self.title(f"PCRS — ParticleFinder + IDFinder — {name}")
+        self.configure(bg=C["bg"]); self.geometry("1200x780")
+        self.app = app
+        self.img = np.asarray(image, dtype=float)
+        self.name = name
+        self.x = np.asarray(app.xdata, dtype=float)
+        self.cube = np.asarray(app.spectra, dtype=float)   # (H, W, n_wave)
+        self._props = []          # enriched particle dicts
+        self._lib = []            # [{name, spec(W,)}]
+        self._labels = None       # full integer label image
+
+        # ── left control panel ───────────────────────────────────────────────
+        left = tk.Frame(self, bg=C["sidebar"], width=300)
+        left.pack(side="left", fill="y"); left.pack_propagate(False)
+
+        SectionDiv(left, "PARTICLEFINDER").pack(fill="x")
+        self._auto = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, variable=self._auto, text="Auto-binarise (Otsu)",
+                        command=self._detect).pack(anchor="w", padx=12, pady=2)
+        tk.Label(left, text="Threshold (% of max)", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 9)).pack(anchor="w", padx=12)
+        self._thr = tk.DoubleVar(value=50.0)
+        ttk.Scale(left, from_=1, to=99, variable=self._thr, orient="horizontal",
+                  command=lambda _e: self._detect()).pack(fill="x", padx=12)
+        self._edge = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, variable=self._edge, text="Remove edge particles",
+                        command=self._detect).pack(anchor="w", padx=12)
+        rf = tk.Frame(left, bg=C["sidebar"]); rf.pack(fill="x", padx=12, pady=3)
+        tk.Label(rf, text="Min size (% of largest)", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 9)).pack(side="left")
+        self._minsz = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(rf, from_=0, to=100, textvariable=self._minsz, width=6,
+                    command=self._detect).pack(side="left", padx=4)
+        rp = tk.Frame(left, bg=C["sidebar"]); rp.pack(fill="x", padx=12, pady=3)
+        tk.Label(rp, text="Pixel size (µm)", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._px = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(rp, from_=0.01, to=1000, increment=0.1, textvariable=self._px,
+                    width=7, command=self._detect).pack(side="left", padx=4)
+        ttk.Button(left, text="◍ Find particles", style="ROI.TButton",
+                   command=self._detect).pack(fill="x", padx=10, pady=(8, 4))
+
+        SectionDiv(left, "IDFINDER LIBRARY").pack(fill="x")
+        ttk.Button(left, text="📁 Load library folder…",
+                   command=self._load_folder).pack(fill="x", padx=10, pady=(6, 2))
+        ttk.Button(left, text="＋ Load library files…",
+                   command=self._load_files).pack(fill="x", padx=10, pady=2)
+        self._libl = tk.Label(left, text="no library loaded", bg=C["sidebar"],
+                              fg=C["text_dim"], font=("Segoe UI", 9),
+                              wraplength=270, justify="left")
+        self._libl.pack(fill="x", padx=10, pady=4)
+        rpm = tk.Frame(left, bg=C["sidebar"]); rpm.pack(fill="x", padx=10, pady=3)
+        tk.Label(rpm, text="Preprocess", width=10, anchor="w", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+        self._prep = tk.StringVar(value="SNV")
+        ttk.Combobox(rpm, textvariable=self._prep, state="readonly", width=14,
+                     values=["raw", "SNV", "1st derivative"]).pack(side="left")
+        ttk.Button(left, text="⛯ Identify all particles", style="ROI.TButton",
+                   command=self._identify).pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Button(left, text="↓ Export particle table (CSV)",
+                   command=self._export).pack(fill="x", padx=10, pady=2)
+
+        self._summary = tk.Label(left, text="", bg=C["sidebar"], fg=C["text_hi"],
+                                 font=("Consolas", 9), justify="left", anchor="w")
+        self._summary.pack(fill="x", padx=10, pady=8)
+
+        # ── right: results table + figures ───────────────────────────────────
+        right = tk.Frame(self, bg=C["bg"]); right.pack(side="left", fill="both",
+                                                       expand=True)
+        cols = ("id", "ecd_um", "area_um2", "match", "score")
+        heads = ("#", "ECD µm", "Area µm²", "Best match (IDFinder)", "Score")
+        widths = (40, 70, 80, 320, 70)
+        self._tv = ttk.Treeview(right, columns=cols, show="headings", height=9)
+        for c, h, w in zip(cols, heads, widths):
+            self._tv.heading(c, text=h); self._tv.column(c, width=w)
+        self._tv.pack(fill="x", padx=8, pady=(8, 4))
+        self._tv.bind("<<TreeviewSelect>>", lambda _e: self._plot_selected())
+
+        self._fig = plt.Figure(figsize=(8.4, 5.4))
+        self._cv = FigureCanvasTkAgg(self._fig, master=right)
+        self._cv.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        self._detect()
+
+    # ── ParticleFinder ───────────────────────────────────────────────────────
+    def _detect(self, *_):
+        try:
+            import scipy.ndimage  # noqa: F401
+        except Exception:
+            messagebox.showerror("SciPy required",
+                                 "ParticleFinder needs SciPy.", parent=self)
+            return
+        res = particle_stats(
+            self.img, auto=self._auto.get(), threshold_pct=self._thr.get(),
+            remove_edge=self._edge.get(), min_size_pct=self._minsz.get(),
+            px_um=float(self._px.get()))
+        self._labels = res["labels"]
+        props = res["props"]
+        # Extract a mean spectrum per particle from the cube (if shapes align).
+        H, W = self.img.shape
+        cube_ok = (self.cube.ndim == 3 and self.cube.shape[0] == H
+                   and self.cube.shape[1] == W)
+        for p in props:
+            p["match"] = ""
+            p["score"] = float("nan")
+            if cube_ok:
+                pmask = (self._labels == p["label"])
+                if pmask.any():
+                    p["spec"] = self.cube[pmask].mean(axis=0)
+                else:
+                    p["spec"] = None
+            else:
+                p["spec"] = None
+        self._props = props
+        if not cube_ok:
+            self._libl.config(
+                text="map/cube shape mismatch — spectra unavailable",
+                fg=C["text_dim"])
+        self._refresh_table()
+        self._draw_overview()
+        self._update_summary(res["area_pct"])
+
+    # ── IDFinder library ─────────────────────────────────────────────────────
+    @staticmethod
+    def _prep_vec(v, mode):
+        v = np.asarray(v, dtype=float)
+        if mode == "1st derivative":
+            v = np.gradient(v)
+        if mode in ("SNV", "1st derivative"):
+            mu = np.nanmean(v); sd = np.nanstd(v)
+            if sd > 0:
+                v = (v - mu) / sd
+        return v
+
+    def _ingest(self, paths):
+        n = 0
+        for p in paths:
+            try:
+                r = _open_raman_any(str(p))
+                sx = np.asarray(r.xdata, dtype=float).ravel()
+                sd = np.asarray(r.spectra, dtype=float)
+                spec = sd.reshape(-1, sd.shape[-1]).mean(axis=0)
+                if sx.size != spec.size:
+                    m = min(sx.size, spec.size); sx, spec = sx[:m], spec[:m]
+                if sx.size < 4:
+                    continue
+                order = np.argsort(sx); sx, spec = sx[order], spec[order]
+                sx, uniq = np.unique(sx, return_index=True); spec = spec[uniq]
+                spec = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
+                si = np.interp(self.x, sx, spec, left=np.nan, right=np.nan)
+                if np.isfinite(si).sum() >= 10:
+                    self._lib.append({"name": Path(p).stem[:60], "spec": si})
+                    n += 1
+            except Exception:
+                continue
+        if n:
+            self._libl.config(text=f"{len(self._lib)} reference spectra loaded",
+                              fg=C["success"])
+        else:
+            messagebox.showwarning(
+                "Library", "No usable spectra found (need spectra overlapping "
+                "your data's wavenumber range).", parent=self)
+
+    def _load_folder(self):
+        d = filedialog.askdirectory(parent=self, title="Reference library folder")
+        if not d:
+            return
+        paths = [p for p in Path(d).rglob("*")
+                 if p.is_file() and p.suffix.lower() in self.SPEC_EXTS]
+        if not paths:
+            messagebox.showwarning("Library", "No spectra files in that folder.",
+                                   parent=self); return
+        self._libl.config(text=f"loading {len(paths)} files…", fg=C["text_mid"])
+        self.update_idletasks()
+        self._ingest(paths)
+
+    def _load_files(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Reference library files",
+            filetypes=[("Spectra", " ".join("*" + e for e in self.SPEC_EXTS)),
+                       ("All files", "*.*")])
+        if paths:
+            self._ingest([Path(p) for p in paths])
+
+    def _best_match(self, spec, mode):
+        """Return (name, score) of best library match for one spectrum."""
+        if spec is None or not self._lib:
+            return ("", float("nan"))
+        q = self._prep_vec(spec, mode)
+        best_name, best_score = "", -2.0
+        for entry in self._lib:
+            L = self._prep_vec(entry["spec"], mode)
+            m = np.isfinite(L) & np.isfinite(q)
+            if m.sum() < 10:
+                continue
+            a = q[m] - q[m].mean(); b = L[m] - L[m].mean()
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            if denom <= 0:
+                continue
+            score = float(a @ b / denom)
+            if score > best_score:
+                best_name, best_score = entry["name"], score
+        if best_name == "":
+            return ("", float("nan"))
+        return (best_name, best_score)
+
+    def _identify(self):
+        if not self._props:
+            messagebox.showinfo("IDFinder", "Find particles first.", parent=self)
+            return
+        if not self._lib:
+            messagebox.showwarning("IDFinder",
+                "Load a reference library first.", parent=self); return
+        if all(p.get("spec") is None for p in self._props):
+            messagebox.showwarning("IDFinder",
+                "No per-particle spectra available (map/cube shape mismatch).",
+                parent=self); return
+        mode = self._prep.get()
+        for p in self._props:
+            p["match"], p["score"] = self._best_match(p.get("spec"), mode)
+        self._refresh_table()
+        self._draw_overview()
+
+    # ── views ────────────────────────────────────────────────────────────────
+    def _refresh_table(self):
+        self._tv.delete(*self._tv.get_children())
+        for p in self._props:
+            sc = p.get("score")
+            sc_s = f"{sc:.3f}" if sc == sc else ""   # NaN check
+            self._tv.insert("", "end", iid=str(p["label"]),
+                            values=(p["label"], f"{p['ecd_um']:.2f}",
+                                    f"{p['area_um2']:.1f}",
+                                    p.get("match", ""), sc_s))
+
+    def _draw_overview(self):
+        self._fig.clf()
+        ax = self._fig.add_subplot(111)
+        ax.imshow(self.img, cmap="turbo", origin="upper")
+        if self._labels is not None:
+            keep = np.isin(self._labels, [p["label"] for p in self._props])
+            ax.contour(keep, levels=[0.5], colors="white", linewidths=0.6)
+        for p in self._props:
+            tag = p.get("match") or str(p["label"])
+            if p.get("match"):
+                tag = f"{p['label']}:{p['match'][:14]}"
+            ax.text(p["cx"], p["cy"], tag, color="white", fontsize=6,
+                    ha="center", va="center")
+        ax.set_title(f"{self.name}: {len(self._props)} particles", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        self._fig.tight_layout(); self._cv.draw()
+
+    def _plot_selected(self):
+        sel = self._tv.selection()
+        if not sel:
+            return
+        lab = int(sel[0])
+        p = next((q for q in self._props if q["label"] == lab), None)
+        if p is None or p.get("spec") is None:
+            return
+        self._fig.clf()
+        ax = self._fig.add_subplot(111)
+        q = np.asarray(p["spec"], dtype=float)
+        qn = (q - np.nanmin(q)) / (np.nanmax(q) - np.nanmin(q) + 1e-9)
+        ax.plot(self.x, qn, color="#2563eb", lw=1.1,
+                label=f"particle {lab}")
+        match = p.get("match")
+        if match:
+            entry = next((e for e in self._lib if e["name"] == match), None)
+            if entry is not None:
+                s = np.asarray(entry["spec"], dtype=float)
+                sn = (s - np.nanmin(s)) / (np.nanmax(s) - np.nanmin(s) + 1e-9)
+                ax.plot(self.x, sn, color="#ef4444", lw=1.0, alpha=0.8,
+                        label=f"{match} (r={p['score']:.3f})")
+        ax.set_xlabel("Raman shift (cm⁻¹)")
+        ax.set_ylabel("Normalised intensity")
+        ax.set_title(f"Particle {lab} spectrum", fontsize=10)
+        ax.legend(fontsize=8)
+        self._fig.tight_layout(); self._cv.draw()
+
+    def _update_summary(self, area_pct):
+        ecds = np.array([p["ecd_um"] for p in self._props]) if self._props else \
+            np.array([])
+        n_id = sum(1 for p in self._props if p.get("match"))
+        if ecds.size:
+            self._summary.config(text=(
+                f"particles : {len(self._props)}\n"
+                f"identified : {n_id}\n"
+                f"area %     : {area_pct:6.2f}\n"
+                f"mean ECD   : {ecds.mean():6.2f} µm\n"
+                f"median ECD : {np.median(ecds):6.2f} µm\n"
+                f"min / max  : {ecds.min():.2f} / {ecds.max():.2f} µm"))
+        else:
+            self._summary.config(text="no particles above threshold")
+
+    def _export(self):
+        if not self._props:
+            messagebox.showwarning("Export", "No particles to export.",
+                                   parent=self); return
+        path = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+            initialfile="pcrs_particles")
+        if not path:
+            return
+        import csv
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["label", "area_px", "area_um2", "ecd_um", "cx", "cy",
+                        "best_match", "score"])
+            for p in self._props:
+                sc = p.get("score")
+                w.writerow([p["label"], p["area_px"], f"{p['area_um2']:.3f}",
+                            f"{p['ecd_um']:.3f}", f"{p['cx']:.1f}",
+                            f"{p['cy']:.1f}", p.get("match", ""),
+                            f"{sc:.4f}" if sc == sc else ""])
         messagebox.showinfo("Export", f"Saved {len(self._props)} particles.",
                             parent=self)
 
