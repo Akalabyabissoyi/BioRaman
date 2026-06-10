@@ -115,7 +115,7 @@ app = BUNDLE(
     bundle_identifier="com.gibsongroupresearch.bioraman",
     info_plist={
         "NSHighResolutionCapable": True,
-        "CFBundleShortVersionString": "1.0.2",
-        "CFBundleVersion": "1.0.2",
+        "CFBundleShortVersionString": "1.0.5",
+        "CFBundleVersion": "1.0.5",
     },
 )
