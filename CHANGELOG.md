@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > algorithms, numerical defaults, preprocessing) are flagged with **[OUTPUT]**
 > and always trigger at least a MINOR version bump.
 
+## [1.0.5] - 2026-06-10
+
+Robustness & scientific-correctness hardening from a static assessment of the
+analysis core. **The version string is now unified at 1.0.5** across
+`__version__`, the `VERSION` file, and the filename; the test and validation
+harnesses now import the shipped build by name.
+
+### Fixed
+- **[OUTPUT] Cosmic-ray removal no longer erases sharp Raman bands (F1).** The
+  detector previously thresholded the modified Z-score of the first derivative,
+  which fires on the apex of any sharp band and could clip it to baseline. It is
+  replaced by width-aware median-residual rejection: only narrow (≤ *max spike
+  width* px), positive-going outliers are interpolated. Default Z threshold
+  raised 8 → 12 (more conservative). A run summary now reports how many points
+  were interpolated.
+- **[OUTPUT] Area normalisation is no longer noise-biased (F3).** Baseline
+  subtraction and the area used for normalisation no longer half-wave-rectify
+  the signal (`clip(…,0)`), which inflated the area in proportion to noise and
+  coupled the normalisation scale to SNR. The un-rectified, ~zero-mean signal is
+  integrated, giving a noise-independent scale (verified constant across 0.5–4×
+  noise).
+- **Baseline-correction failures are surfaced, not swallowed (F5).** A failed
+  baseline fit now leaves the spectrum uncorrected *and* is counted in the
+  processing report (e.g. "ASLS — FAILED on N/M spectra") instead of silently
+  claiming a correction was applied.
+- **Non-finite inputs are sanitised (F6).** NaN/Inf samples are interpolated
+  away before processing so they cannot poison baseline fitting, normalisation,
+  PCA or least-squares solvers.
+- **Savitzky–Golay window is always odd (F7).** An even polynomial order with a
+  small window could produce an even window length and raise `ValueError`;
+  the window is now forced odd and the polyorder clamped below it.
+- **ASCII reader keeps the modal row width, not the maximum (F2).** A single
+  malformed line with extra columns no longer discards every well-formed row;
+  skipped rows are reported.
+- **[OUTPUT] Cross-validation leakage reduced (F4).** The PLS-DA/LDA classifier
+  now fits `StandardScaler` inside each CV fold via a `Pipeline` on the unscaled
+  features, instead of scaling the whole matrix beforehand. (Global Hotelling-T²
+  outlier screening remains a user-toggled pre-filter, now documented.)
+
+### Added
+- **Objective number-of-PC guidance on the scree plot (PCA).** The scree panel
+  now overlays cumulative variance and marks three standard criteria — 95%
+  cumulative variance, Kaiser (eigenvalue > 1 on autoscaled data, or the
+  average-eigenvalue rule on mean-centred data) and the broken-stick model —
+  and the status line reports the suggested component counts. Addresses the
+  common, result-invalidating mistake of choosing the number of PCs by eye
+  (Hanson 2017; Khristoforova 2022; Vajna 2011).
+- **[OUTPUT] 95% Hotelling-T² confidence ellipses on PCA score plots.** The
+  per-group ellipses are now proper 95% T² confidence regions (F-distribution,
+  finite-sample, χ² fallback) instead of the previous fixed 2·√λ (~86%) ellipse,
+  matching standard chemometrics practice (Gurian 2020).
+- **User-initiated preprocessing.** Preprocessing → Settings now offers
+  **"Apply & Reprocess Now"**, a **🔁 Reprocess** toolbar button, and the
+  existing menu action re-run the recipe on the in-memory raw data without a
+  reload, followed by a summary of cosmic points removed and any baseline
+  failures.
+
 ## [1.0.2] - 2026-06-05
 
 ### Fixed

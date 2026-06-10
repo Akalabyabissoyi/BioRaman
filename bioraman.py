@@ -119,7 +119,7 @@ __email__   = "akalabya.bissoyi@manchester.ac.uk, bissoyi.akalabya@gmail.com"
 __affiliation__ = "Gibson Group, University of Manchester"
 __url__     = "https://gibsongroupresearch.com/"
 __license__ = "MIT"
-__version__ = "1.0.3"
+__version__ = "1.0.5"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import os, sys, time, threading, queue
@@ -167,11 +167,31 @@ def _ensure_package(import_name, pip_name=None):
 # ── numeric / scientific ──────────────────────────────────────────────────────
 import numpy as np
 from scipy.signal import savgol_filter, find_peaks
-from scipy.ndimage import gaussian_filter, zoom
+from scipy.ndimage import gaussian_filter, zoom, median_filter
 
 # NumPy 2.0 renamed ``np.trapz`` → ``np.trapezoid`` (the old name was removed).
 # Bind to whichever exists so the app works on both NumPy 1.x and 2.x.
 _trapz = getattr(np, "trapezoid", None) or np.trapz
+
+
+def _bundled_library_dir():
+    """Return the path to the bundled PCRS starter reference library, or None.
+
+    Looks for a ``pcrs_library`` folder next to this script (and next to a
+    PyInstaller bundle, via ``sys._MEIPASS``)."""
+    cands = []
+    try:
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "pcrs_library"))
+    except Exception:
+        pass
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        cands.append(os.path.join(meipass, "pcrs_library"))
+    for d in cands:
+        if os.path.isdir(d):
+            return d
+    return None
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 import tkinter as tk
@@ -369,8 +389,17 @@ class _TextReader:
         rows = [v for v in (to_float(split(ln)) for ln in body) if v]
         if not rows:
             raise RuntimeError("Could not parse any numeric rows.")
-        width = max(len(r) for r in rows)
-        arr = np.asarray([r for r in rows if len(r) == width], dtype=float)
+        # F2 — keep the MODAL (most common) row width, not the maximum. A single
+        # corrupt line with extra columns must not be allowed to discard every
+        # well-formed row and silently return the lone anomalous one.
+        from collections import Counter
+        width = Counter(len(r) for r in rows).most_common(1)[0][0]
+        kept  = [r for r in rows if len(r) == width]
+        if len(kept) != len(rows):
+            print(f"[BioRaman] ASCII reader: skipped {len(rows) - len(kept)} row(s) "
+                  f"with a non-standard column count (kept {len(kept)} rows of "
+                  f"width {width}).", flush=True)
+        arr = np.asarray(kept, dtype=float)
 
         if arr.shape[1] == 2:                    # single spectrum: wn, intensity
             order = np.argsort(arr[:, 0])
@@ -405,8 +434,15 @@ class _TextReader:
                 continue
         if not rows:
             raise RuntimeError("No numeric data rows after the header.")
-        ncol = max(len(r) for r in rows)
-        arr = np.asarray([r for r in rows if len(r) == ncol], dtype=float)
+        # F2 — modal column count (see _parse_numeric); guard against one stray
+        # over-wide line wiping out the whole table.
+        from collections import Counter
+        ncol = Counter(len(r) for r in rows).most_common(1)[0][0]
+        kept = [r for r in rows if len(r) == ncol]
+        if len(kept) != len(rows):
+            print(f"[BioRaman] Renishaw reader: skipped {len(rows) - len(kept)} "
+                  f"row(s) with a non-standard column count.", flush=True)
+        arr = np.asarray(kept, dtype=float)
 
         wave = arr[:, wi]
         inten = arr[:, ii]
@@ -795,8 +831,8 @@ def parse_pupae_label(stem):
 @dataclass
 class PreprocessParams:
     cosmic_removal:   bool  = True
-    cosmic_threshold: float = 8.0
-    cosmic_width:     int   = 3
+    cosmic_threshold: float = 12.0  # median-residual modified-Z; higher = more conservative
+    cosmic_width:     int   = 3     # max contiguous width (px) treated as a cosmic spike
     dark_removal:     bool  = True
     baseline_method:  str   = "asls"   # asls|arpls|drpls|none
     asls_lam:         float = 1e5
@@ -807,37 +843,74 @@ class PreprocessParams:
     normalisation:    str   = "area"   # max|area|snv|vector|none  — SNV/vector best when CH-stretch dominates
 
 
+def _detect_cosmic(s, thr, width):
+    """Width-aware cosmic-ray detector (F1).
+
+    Cosmic rays are sub-resolution (1-2 px) POSITIVE spikes. We flag points
+    whose residual from a size-3 median filter is a strong positive outlier
+    (modified Z-score > ``thr``), then only correct contiguous runs no wider
+    than ``width`` px — so genuine, multi-point Raman bands are preserved.
+    The previous detector used the modified Z-score of the first derivative,
+    which fires on the apex of any sharp real band and could erase it.
+
+    Returns (corrected_spectrum, n_points_removed, removed_index_list).
+    """
+    s = s.astype(float).copy()
+    removed = []
+    if len(s) < 5:
+        return s, 0, removed
+    med   = median_filter(s, size=3, mode="nearest")
+    resid = s - med
+    rmad  = np.median(np.abs(resid - np.median(resid))) or 1e-10
+    sigma = 1.4826 * rmad                          # robust noise scale
+    flag  = resid > thr * sigma                    # positive-going only
+    if not flag.any():
+        return s, 0, removed
+    width = max(1, int(width))
+    idx   = np.where(flag)[0]
+    # group consecutive flagged indices; correct only narrow (cosmic) runs
+    for g in np.split(idx, np.where(np.diff(idx) > 1)[0] + 1):
+        if len(g) <= width:
+            lo, hi = int(g[0]), int(g[-1])
+            lft = max(0, lo - 1); rgt = min(len(s) - 1, hi + 1)
+            if lft != rgt:
+                s[lo:hi + 1] = np.interp(np.arange(lo, hi + 1),
+                                         [lft, rgt], [s[lft], s[rgt]])
+                removed.extend(range(lo, hi + 1))
+    return s, len(removed), removed
+
+
 def _process_one(args):
-    """Top-level worker for ProcessPoolExecutor (must be picklable)."""
+    """Top-level worker for ProcessPoolExecutor (must be picklable).
+
+    Returns ``(idx, s, info)`` where ``info`` is a dict with keys
+    ``spike`` (bool), ``n_removed`` (int) and ``baseline_ok`` (bool|None,
+    None when no baseline was requested).
+    """
     idx, s_raw, p = args
     s = s_raw.astype(float)
-    had_spike = False
+    # F6 — sanitise non-finite input so NaN/Inf cannot poison downstream maths
+    if not np.all(np.isfinite(s)):
+        finite = np.isfinite(s)
+        if finite.any():
+            xi = np.arange(len(s))
+            s = np.interp(xi, xi[finite], s[finite])
+        else:
+            s = np.zeros_like(s)
+    n_removed = 0; baseline_ok = None
 
-    # 1. Cosmic-ray removal — modified Z-score on 1st derivative
-    if p.cosmic_removal and len(s) >= 10:
-        dy  = np.diff(s)
-        med = np.median(dy)
-        mad = np.median(np.abs(dy - med)) or 1e-10
-        z   = 0.6745 * (dy - med) / mad
-        for i in range(len(z) - 1):
-            if (abs(z[i]) > p.cosmic_threshold and
-                    abs(z[i+1]) > p.cosmic_threshold and
-                    z[i] * z[i+1] < 0):
-                had_spike = True
-                lo = max(0,        i + 1 - p.cosmic_width)
-                hi = min(len(s)-1, i + 1 + p.cosmic_width)
-                lft = max(0,        lo - 1)
-                rgt = min(len(s)-1, hi + 1)
-                if lft != rgt:
-                    xi = np.arange(lo, hi + 1)
-                    s[lo:hi+1] = np.interp(xi, [lft, rgt], [s[lft], s[rgt]])
+    # 1. Cosmic-ray removal — width-aware median-residual outlier rejection (F1)
+    if p.cosmic_removal:
+        s, n_removed, _ = _detect_cosmic(s, p.cosmic_threshold, p.cosmic_width)
+    had_spike = n_removed > 0
 
     # 2. Dark / pedestal
     if p.dark_removal:
-        s -= s.min()
+        s = s - s.min()
 
     # 3. Baseline correction
     if p.baseline_method != "none" and HAS_PYBL:
+        baseline_ok = False
         try:
             if   p.baseline_method == "asls":
                 bl, _ = whittaker.asls(s,  lam=p.asls_lam, p=p.asls_p, max_iter=50)
@@ -847,22 +920,38 @@ def _process_one(args):
                 bl, _ = whittaker.drpls(s, lam=p.asls_lam, max_iter=50)
             else:
                 bl, _ = whittaker.asls(s,  lam=p.asls_lam, p=p.asls_p, max_iter=50)
-            s = np.clip(s - bl, 0, None)
+            # F3 — subtract the baseline WITHOUT clipping negatives to zero.
+            # Half-wave rectifying the noise floor here biases the area used
+            # for normalisation upward in proportion to the noise level. We
+            # keep the (small, zero-mean) residual noise so area/normalisation
+            # stay quantitatively faithful; downstream solvers tolerate it.
+            s = s - bl
+            baseline_ok = True
         except Exception:
-            pass
+            # F5 — do not silently swallow. Leave the spectrum uncorrected and
+            # record the failure so the report reflects what actually happened.
+            baseline_ok = False
 
     # 4. Savitzky-Golay smoothing
     if p.smoothing and len(s) > p.sg_window:
         w = p.sg_window if p.sg_window % 2 == 1 else p.sg_window + 1
         w = max(w, p.sg_poly + 2)
-        s = savgol_filter(s, window_length=w, polyorder=p.sg_poly)
+        if w % 2 == 0:                 # F7 — savgol requires an ODD window
+            w += 1
+        poly = min(p.sg_poly, w - 1)   # and polyorder < window_length
+        if w <= len(s):
+            s = savgol_filter(s, window_length=w, polyorder=poly)
 
     # 5. Normalisation
     if p.normalisation == "max":
         pk = s.max()
         if pk > 0: s /= pk
     elif p.normalisation == "area":
-        area = float(_trapz(np.clip(s, 0, None)))
+        # F3 — integrate the un-rectified signal. With baseline-corrected,
+        # roughly zero-mean noise this is an unbiased estimate of the true
+        # band area and is independent of the noise level (unlike clip-then-
+        # integrate, which inflates the denominator for noisier spectra).
+        area = float(_trapz(s))
         if area > 0: s /= area
     elif p.normalisation == "snv":
         # Standard Normal Variate: (x - mean) / std per spectrum.
@@ -875,7 +964,8 @@ def _process_one(args):
         nrm = float(np.sqrt(np.sum(s ** 2)))
         if nrm > 0: s = s / nrm
 
-    return idx, s, had_spike
+    info = {"spike": had_spike, "n_removed": n_removed, "baseline_ok": baseline_ok}
+    return idx, s, info
 
 
 def preprocess_spectrum(s, params=None):
@@ -897,17 +987,25 @@ def preprocess_map(data, params=None, cb=None):
     flat     = [(i, data[y, x], params)
                 for i, (y, x) in enumerate(np.ndindex(Y, X))]
     out_flat = [None] * total
-    cosmic_n = 0
+    cosmic_n = 0          # spectra with >=1 cosmic spike removed
+    cosmic_pts = 0        # total cosmic points interpolated
+    baseline_fail = 0     # spectra where baseline correction was requested but failed
     done     = 0
     n_workers = min(os.cpu_count() or 1, 8)
 
+    def _tally(info):
+        nonlocal cosmic_n, cosmic_pts, baseline_fail
+        if info.get("spike"):            cosmic_n   += 1
+        cosmic_pts += int(info.get("n_removed", 0))
+        if info.get("baseline_ok") is False: baseline_fail += 1
+
     def _run_serial():
         """Process every spectrum in-process. Always works; the safe fallback."""
-        nonlocal cosmic_n, done
+        nonlocal done
         for item in flat:
-            idx, s_proc, spike = _process_one(item)
+            idx, s_proc, info = _process_one(item)
             out_flat[idx] = s_proc
-            if spike: cosmic_n += 1
+            _tally(info)
             done += 1
             if cb and done % max(1, total // 200) == 0:
                 cb(done / total)
@@ -924,9 +1022,9 @@ def preprocess_map(data, params=None, cb=None):
                 futures = {pool.submit(_process_one, item): item[0]
                            for item in flat}
                 for fut in as_completed(futures):
-                    idx, s_proc, spike = fut.result()
+                    idx, s_proc, info = fut.result()
                     out_flat[idx] = s_proc
-                    if spike: cosmic_n += 1
+                    _tally(info)
                     done += 1
                     if cb and done % max(1, total // 200) == 0:
                         cb(done / total)
@@ -936,10 +1034,14 @@ def preprocess_map(data, params=None, cb=None):
             print(f"[BioRaman] Parallel preprocessing unavailable "
                   f"({exc!r}); falling back to serial.", flush=True)
             out_flat = [None] * total
-            cosmic_n = 0
+            cosmic_n = 0; cosmic_pts = 0; baseline_fail = 0
             done     = 0
+            ran_pool = False
             _run_serial()
+        else:
+            ran_pool = True
     else:
+        ran_pool = False
         _run_serial()
     if cb: cb(1.0)
 
@@ -948,21 +1050,31 @@ def preprocess_map(data, params=None, cb=None):
         out[y, x] = out_flat[i]
 
     elapsed = time.perf_counter() - t0
+    if params.baseline_method == "none":
+        baseline_status = "SKIPPED"
+    elif baseline_fail == 0:
+        baseline_status = params.baseline_method.upper()
+    elif baseline_fail >= total:
+        baseline_status = f"{params.baseline_method.upper()} — FAILED on all spectra (left uncorrected)"
+    else:
+        baseline_status = (f"{params.baseline_method.upper()} — "
+                           f"FAILED on {baseline_fail}/{total} spectra (those left uncorrected)")
     report = {
         "total_spectra":    total,
         "map_shape":        f"{X} × {Y}",
         "spectral_points":  W,
         "cosmic_removed":   cosmic_n,
+        "cosmic_points":    cosmic_pts,
         "dark_subtraction": "yes" if params.dark_removal else "no",
-        "baseline_method":  params.baseline_method.upper()
-                            if params.baseline_method != "none" else "SKIPPED",
+        "baseline_method":  baseline_status,
+        "baseline_failures": baseline_fail,
         "baseline_lam":     f"{params.asls_lam:.0e}",
         "baseline_p":       f"{params.asls_p}",
         "smoothing":        (f"Savitzky-Golay  window={params.sg_window}"
                              f"  poly={params.sg_poly}")
                             if params.smoothing else "SKIPPED",
         "normalisation":    params.normalisation.upper(),
-        "workers":          n_workers,
+        "workers":          n_workers if ran_pool else 1,
         "elapsed_s":        f"{elapsed:.1f}",
     }
     return out, report
@@ -1265,6 +1377,68 @@ def _build_lut_panel(win, parent, ready_fn, n_panels=8):
 # ─────────────────────────────────────────────────────────────────────────────
 # TESTABLE CORE ANALYSIS  (used by the GUI, the validation harness and tests)
 # ─────────────────────────────────────────────────────────────────────────────
+def pca_component_suggestions(evr, eigvals, scaled, var_target=0.95):
+    """Objective number-of-PC criteria for a scree plot.
+
+    Improper selection of the number of principal components is one of the
+    most common, result-invalidating mistakes in Raman chemometrics
+    (Hanson 2017; Khristoforova 2022; Vajna 2011). This returns three
+    standard, transparent criteria so the user is not left guessing.
+
+    Parameters
+    ----------
+    evr : 1-D explained-variance-ratio array (length = #components computed).
+    eigvals : 1-D eigenvalues (explained_variance_) for the same components.
+    scaled : whether the data were autoscaled (correlation-matrix PCA).
+    var_target : cumulative-variance target (default 0.95).
+
+    Returns a dict with keys ``cumvar``, ``kaiser`` and ``broken_stick``
+    (each an int #PCs, clamped to ≥1), plus ``var_target``.
+    """
+    evr = np.asarray(evr, dtype=float)
+    eig = np.asarray(eigvals, dtype=float)
+    p   = len(evr)
+    out = {"var_target": var_target}
+
+    # 1) Cumulative variance — smallest k reaching the target.
+    cum = np.cumsum(evr)
+    k_cum = int(np.searchsorted(cum, var_target) + 1)
+    out["cumvar"] = int(min(max(k_cum, 1), p))
+
+    # 2) Kaiser rule. On autoscaled (correlation) data: eigenvalue > 1.
+    #    On mean-centred (covariance) data the equivalent is the
+    #    average-eigenvalue rule: eigenvalue > mean(eigenvalues).
+    thresh = 1.0 if scaled else float(np.mean(eig)) if eig.size else 0.0
+    out["kaiser"] = int(min(max(int(np.sum(eig > thresh)), 1), p))
+
+    # 3) Broken-stick: keep PCs whose variance share exceeds the expected
+    #    share under a random partition  b_k = (1/p) Σ_{i=k..p} 1/i.
+    idx = np.arange(1, p + 1)
+    bstick = np.array([np.sum(1.0 / idx[k:]) / p for k in range(p)])
+    keep = evr > bstick
+    out["broken_stick"] = int(max(1, np.argmin(keep) if (not keep.all() and keep.any())
+                                  else (np.sum(keep) if keep.any() else 1)))
+    return out
+
+
+def hotelling_t2_radius(n, conf=0.95):
+    """Scale factor for a Hotelling-T² confidence ellipse of 2-D scores.
+
+    A point lies inside the ellipse if its Mahalanobis distance ≤ this radius.
+    Uses the finite-sample F-distribution form for an individual observation;
+    falls back to the χ² form when n is too small or SciPy is unavailable.
+    Multiply each covariance eigenvalue's sqrt by this radius for the semi-axes.
+    """
+    try:
+        from scipy.stats import f as _f, chi2 as _chi2
+        if n > 3:
+            return float(np.sqrt(2 * (n - 1) / (n - 2) * _f.ppf(conf, 2, n - 2)))
+        return float(np.sqrt(_chi2.ppf(conf, df=2)))
+    except Exception:
+        # χ²(0.95, 2) ≈ 5.991 → radius ≈ 2.448; safe constant fallback.
+        return 2.4477
+
+
 def prep_spectra(M, preprocess="Spectrum", normalise="None"):
     """Apply derivative + normalisation to a spectra matrix (last axis = W)."""
     M = np.asarray(M, dtype=float)
@@ -2191,11 +2365,21 @@ class PCAWindow(tk.Toplevel):
         temps = np.array(temps, dtype=object) if temps is not None else None
         pupae = np.array(pupae, dtype=object) if pupae is not None else None
 
+        scaled = bool(self._scale_var.get())
+        # Retain the UNSCALED features. The supervised classifier (F4) must fit
+        # its scaler inside each CV fold; scaling the whole matrix here would
+        # leak test-fold statistics into training. PCA/plotting below still use
+        # the globally-scaled matrix, which is fine (unsupervised, descriptive).
+        X_unscaled = X.copy()
         # Scale BEFORE outlier screening so both use the same feature space
-        if self._scale_var.get():
+        if scaled:
             X = StandardScaler().fit_transform(X)
 
-        # Outlier removal — Hotelling T² across the first k PCs (95% χ² limit)
+        # Outlier removal — Hotelling T² across the first k PCs (95% χ² limit).
+        # NOTE: this is a global, unsupervised screen applied before CV. It can
+        # still exert a mild optimistic bias on cross-validated metrics; it is
+        # user-toggled (Outlier removal) and can be disabled for a strictly
+        # leak-free estimate.
         if self._outlier_var.get() and X.shape[0] > 5:
             from scipy.stats import chi2
             k = int(min(self._n_comp.get(), X.shape[0] - 1, X.shape[1]))
@@ -2204,20 +2388,31 @@ class PCAWindow(tk.Toplevel):
             sd[sd == 0] = 1.0
             t2   = np.sum((sc_tmp / sd) ** 2, axis=1)
             keep = t2 <= chi2.ppf(0.975, df=k)
-            X = X[keep]; labels = labels[keep]
+            X = X[keep]; X_unscaled = X_unscaled[keep]; labels = labels[keep]
             if diets is not None: diets = diets[keep]
             if temps is not None: temps = temps[keep]
             if pupae is not None: pupae = pupae[keep]
 
         n_comp = min(self._n_comp.get(), X.shape[0], X.shape[1])
-        pca    = PCA(n_components=n_comp)
-        scores = pca.fit_transform(X)
-        expl   = pca.explained_variance_ratio_
-        loads  = pca.components_
+        # Fit enough components (capped) to drive objective scree guidance,
+        # then expose the user-selected n_comp for scores/loadings.
+        k_guide = int(min(X.shape[0] - 1, X.shape[1], 30))
+        k_guide = max(k_guide, n_comp)
+        pca    = PCA(n_components=k_guide)
+        scores_full = pca.fit_transform(X)
+        expl_full   = pca.explained_variance_ratio_
+        eig_full    = pca.explained_variance_
+        scores = scores_full[:, :n_comp]
+        expl   = expl_full[:n_comp]
+        loads  = pca.components_[:n_comp]
+        suggest = pca_component_suggestions(expl_full, eig_full, scaled)
 
         self._results = {
             "pca": pca, "scores": scores, "labels": labels,
             "waves": waves, "expl": expl, "loads": loads, "X": X,
+            "expl_full": expl_full, "eig_full": eig_full, "suggest": suggest,
+            "n_comp": n_comp,
+            "X_unscaled": X_unscaled, "scaled": scaled,
             "diets": diets, "temps": temps, "pupae": pupae,
             "spatial_shapes": getattr(self, "_spatial_shapes", []),
         }
@@ -2227,7 +2422,9 @@ class PCAWindow(tk.Toplevel):
         n_kept = len(labels)
         self._status_lbl.config(
             text=f"Done.  {n_kept} spectra from {len(self._files)} files.\n"
-                 f"PC1={expl[0]*100:.1f}%  PC2={expl[1]*100:.1f}%")
+                 f"PC1={expl[0]*100:.1f}%  PC2={expl[1]*100:.1f}%  ·  "
+                 f"suggested PCs: {suggest['cumvar']} (95% var) / "
+                 f"{suggest['kaiser']} (Kaiser) / {suggest['broken_stick']} (broken-stick)")
 
     def _draw_pca(self):
         r = self._results
@@ -2252,15 +2449,19 @@ class PCAWindow(tk.Toplevel):
                       and any(d is not None for d in diets))
 
         def _draw_ellipse(x, y, col):
+            # 95% Hotelling-T² confidence ellipse (F-distribution, finite n).
+            # Replaces the old fixed 2·√λ (~86%) ellipse; T² is the chemometrics
+            # standard for PCA score plots and is interpretable as a 95% region.
             if len(x) >= 3:
                 cov = np.cov(x, y)
                 ev, evec = np.linalg.eigh(cov)
                 ev  = np.maximum(ev, 0)
                 ang = np.degrees(np.arctan2(*evec[:, 1][::-1]))
+                rad = hotelling_t2_radius(len(x), conf=0.95)
                 ax.add_patch(Ellipse((x.mean(), y.mean()),
-                             2*np.sqrt(ev[1]), 2*np.sqrt(ev[0]),
+                             2*rad*np.sqrt(ev[1]), 2*rad*np.sqrt(ev[0]),
                              angle=ang, edgecolor=col, facecolor="none",
-                             alpha=0.9, lw=1.8))
+                             alpha=0.9, lw=1.8, ls="-"))
 
         if use_factor:
             from matplotlib.lines import Line2D
@@ -2303,7 +2504,8 @@ class PCAWindow(tk.Toplevel):
         ax.axvline(0, color=C["border"], lw=0.7)
         ax.set_xlabel(f"PC1  ({expl[0]*100:.1f}%)", fontsize=10)
         ax.set_ylabel(f"PC2  ({expl[1]*100:.1f}%)", fontsize=10)
-        ax.set_title("A: PCA Scores (PC1 vs PC2)", fontsize=11, fontweight="semibold")
+        ax.set_title("A: PCA Scores (PC1 vs PC2) · 95% T² ellipse",
+                     fontsize=11, fontweight="semibold")
         ax.grid(True, ls="--", lw=0.4, alpha=0.5)
 
         # ── B: Loadings — colour-coded positive/negative ──────────────────────
@@ -2427,19 +2629,42 @@ class PCAWindow(tk.Toplevel):
                      fontsize=11, fontweight="semibold")
         ax.grid(True, axis="y", ls="--", lw=0.4, alpha=0.5)
 
-        # ── D: Explained variance scree ───────────────────────────────────────
+        # ── D: Explained variance scree + objective PC-number guidance ─────────
         ax = self.axes[1, 1]
-        n = len(expl)
-        ax.bar(range(1, n+1), expl*100, color=C["accent"], alpha=0.8)
-        ax.plot(range(1, n+1), np.cumsum(expl)*100,
-                "o-", color=C["danger"], lw=1.5, ms=5, label="Cumulative")
-        ax.axhline(90, ls="--", color=C["text_dim"], lw=0.8)
+        evr_full = r.get("expl_full", expl)
+        sug      = r.get("suggest", {})
+        nshow    = int(min(len(evr_full), 15))     # keep the bar plot readable
+        ev = np.asarray(evr_full[:nshow]) * 100
+        xs = range(1, nshow + 1)
+        ax.bar(xs, ev, color=C["accent"], alpha=0.8)
+        ax.plot(xs, np.cumsum(evr_full)[:nshow] * 100,
+                "o-", color=C["danger"], lw=1.5, ms=4, label="Cumulative")
+        tgt = sug.get("var_target", 0.95) * 100
+        ax.axhline(tgt, ls="--", color=C["text_dim"], lw=0.8)
+        ax.text(nshow, tgt, f" {tgt:.0f}%", fontsize=7, color=C["text_dim"],
+                va="bottom", ha="right")
+        # mark the three objective criteria
+        crit = [("cumvar", "95% var", C["danger"]),
+                ("kaiser", "Kaiser", "#2E8B57"),
+                ("broken_stick", "broken-stick", "#8E44AD")]
+        seen = {}
+        for key, lab, col in crit:
+            k = sug.get(key)
+            if k and k <= nshow:
+                off = seen.get(k, 0); seen[k] = off + 1
+                ax.axvline(k, ls=":", color=col, lw=1.3, alpha=0.9)
+                ax.text(k, 96 - off*9, f"{lab}={k}", rotation=90, fontsize=6.5,
+                        color=col, ha="right", va="top")
+        # mark the currently-selected n_comp
+        ncs = r.get("n_comp")
+        if ncs and ncs <= nshow:
+            ax.axvline(ncs, color="#222222", lw=1.0, alpha=0.5)
         ax.set_xlabel("Principal Component", fontsize=10)
         ax.set_ylabel("Explained Variance  (%)", fontsize=10)
-        ax.set_title("D: Explained Variance (Scree)",
-                     fontsize=11, fontweight="semibold")
-        ax.set_xticks(range(1, n+1))
-        ax.legend(fontsize=9)
+        ax.set_title("D: Scree + suggested #PCs", fontsize=11, fontweight="semibold")
+        ax.set_xticks(list(xs))
+        ax.set_ylim(0, 105)
+        ax.legend(fontsize=8, loc="center right")
         ax.grid(True, ls="--", lw=0.4, alpha=0.5)
 
         # ── 6th panel → dedicated legend area (never overlaps data) ───────────
@@ -2574,7 +2799,8 @@ class PCAWindow(tk.Toplevel):
             from sklearn.cross_decomposition import PLSRegression
             from sklearn.model_selection import (StratifiedKFold, GroupKFold,
                                                  cross_val_predict)
-            from sklearn.preprocessing import LabelBinarizer
+            from sklearn.preprocessing import LabelBinarizer, StandardScaler
+            from sklearn.pipeline import make_pipeline
             from sklearn.metrics import (accuracy_score, confusion_matrix,
                                          balanced_accuracy_score)
         except Exception as ex:
@@ -2583,7 +2809,14 @@ class PCAWindow(tk.Toplevel):
             return
 
         r = self._results
-        X = np.asarray(r["X"]); y = np.asarray(r["labels"])
+        # F4 — classify the UNSCALED features and fold scaling into a per-fold
+        # Pipeline, so StandardScaler is fit on training data only (no leakage).
+        # Fall back to the stored matrix for older sessions without the key.
+        X = np.asarray(r.get("X_unscaled", r["X"]))
+        clf_scaled = bool(r.get("scaled", False))
+        def _pipe(est):
+            return make_pipeline(StandardScaler(), est) if clf_scaled else est
+        y = np.asarray(r["labels"])
         classes = np.unique(y)
         if len(classes) < 2:
             messagebox.showwarning("Classification",
@@ -2685,13 +2918,13 @@ class PCAWindow(tk.Toplevel):
                             if Yv.shape[1] == 1:
                                 Yv = np.hstack([1 - Yv, Yv])
                             Yh = cross_val_predict(
-                                PLSRegression(n_components=n_comp), X, Yv,
+                                _pipe(PLSRegression(n_components=n_comp)), X, Yv,
                                 cv=cvv, groups=cv_groups)
                             if len(classes) > 2:
                                 return np.array(classes)[np.argmax(Yh, axis=1)]
                             return lb.classes_[(Yh[:, 1] > Yh[:, 0]).astype(int)]
                         return cross_val_predict(
-                            LinearDiscriminantAnalysis(), X, yv,
+                            _pipe(LinearDiscriminantAnalysis()), X, yv,
                             cv=cvv, groups=cv_groups)
 
                     _tick(f"{name}: observed fit…")
@@ -2992,8 +3225,9 @@ class PCAWindow(tk.Toplevel):
                 ev, evec = np.linalg.eigh(cov)
                 ev = np.maximum(ev, 0)
                 ang = np.degrees(np.arctan2(*evec[:, 1][::-1]))
+                rad = hotelling_t2_radius(len(x), conf=0.95)   # 95% T² ellipse
                 ax.add_patch(Ellipse((x.mean(), y.mean()),
-                             2*np.sqrt(ev[1]), 2*np.sqrt(ev[0]),
+                             2*rad*np.sqrt(ev[1]), 2*rad*np.sqrt(ev[0]),
                              angle=ang, edgecolor=col, facecolor="none",
                              alpha=0.9, lw=1.8))
 
@@ -3102,17 +3336,27 @@ class PCAWindow(tk.Toplevel):
 
         elif kind == "scree":
             fig, ax = plt.subplots(figsize=(8, 5.5))
-            n = len(expl)
-            ax.bar(range(1, n+1), expl*100, color=C["accent"], alpha=0.8)
-            ax.plot(range(1, n+1), np.cumsum(expl)*100, "o-",
+            evr_full = r.get("expl_full", expl)
+            sug      = r.get("suggest", {})
+            nshow = int(min(len(evr_full), 15))
+            xs = range(1, nshow + 1)
+            ax.bar(xs, np.asarray(evr_full[:nshow])*100, color=C["accent"], alpha=0.8)
+            ax.plot(xs, np.cumsum(evr_full)[:nshow]*100, "o-",
                     color=C["danger"], lw=1.5, ms=5, label="Cumulative")
-            ax.axhline(90, ls="--", color=C["text_dim"], lw=0.8)
+            tgt = sug.get("var_target", 0.95)*100
+            ax.axhline(tgt, ls="--", color=C["text_dim"], lw=0.8)
+            for key, lab, col in (("cumvar","95% var",C["danger"]),
+                                  ("kaiser","Kaiser","#2E8B57"),
+                                  ("broken_stick","broken-stick","#8E44AD")):
+                k = sug.get(key)
+                if k and k <= nshow:
+                    ax.axvline(k, ls=":", color=col, lw=1.4, alpha=0.9, label=f"{lab}={k}")
             ax.set_xlabel("Principal Component", fontsize=12)
             ax.set_ylabel("Explained Variance  (%)", fontsize=12)
-            ax.set_title("Explained Variance (Scree)", fontsize=13,
+            ax.set_title("Explained Variance (Scree) + suggested #PCs", fontsize=13,
                          fontweight="semibold")
-            ax.set_xticks(range(1, n+1))
-            ax.legend(fontsize=10)
+            ax.set_xticks(list(xs)); ax.set_ylim(0, 105)
+            ax.legend(fontsize=9)
             ax.grid(True, ls="--", lw=0.4, alpha=0.5)
 
         elif kind == "spatial":
@@ -3365,6 +3609,7 @@ class RamanApp(tk.Tk):
         actions = [
             ("⊕ Open file",     self.load_file,              "Primary.TButton"),
             ("⚙ Preprocess",   self.open_pp_settings,       "Neutral.TButton"),
+            ("🔁 Reprocess",    self.reprocess,              "Neutral.TButton"),
             ("⊞ White Light",   self.load_wl,                "Neutral.TButton"),
             ("◈ PCA",          self.open_pca,               "Neutral.TButton"),
             ("🧊 3D Volume",    self.open_3d_viewer,         "Neutral.TButton"),
@@ -5030,15 +5275,16 @@ class RamanApp(tk.Tk):
         row(c1,"Enable", lambda f: tk.Checkbutton(f, variable=cr_var,
             bg=C["panel"], activebackground=C["panel"], selectcolor=C["accent"]))
         ct_var = tk.DoubleVar(value=p.cosmic_threshold)
-        row(c1,"Z-score threshold (6–15)",
-            lambda f: ttk.Spinbox(f, from_=3, to=30, increment=0.5,
+        row(c1,"Z-score threshold (10–20)",
+            lambda f: ttk.Spinbox(f, from_=4, to=40, increment=0.5,
                                   textvariable=ct_var, width=9))
         cw_var = tk.IntVar(value=p.cosmic_width)
-        row(c1,"Spike half-width (px)",
+        row(c1,"Max spike width (px)",
             lambda f: ttk.Spinbox(f, from_=1, to=10, increment=1,
                                   textvariable=cw_var, width=9))
-        tk.Label(c1, text="  Modified Z-score on first derivative (Whitaker & Hayes 2018)",
-                 bg=C["panel"], fg=C["text_dim"],
+        tk.Label(c1, text="  Median-residual outlier rejection: removes narrow (≤width px)\n"
+                          "  positive spikes only; higher threshold = safer for sharp bands",
+                 bg=C["panel"], fg=C["text_dim"], justify="left",
                  font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(0,6))
 
         # Stage 2
@@ -5101,7 +5347,7 @@ class RamanApp(tk.Tk):
         btn_row = tk.Frame(dlg, bg=C["bg"])
         btn_row.pack(fill="x", padx=12, pady=8)
 
-        def apply_close():
+        def _commit():
             p.cosmic_removal  = cr_var.get()
             p.cosmic_threshold= ct_var.get()
             p.cosmic_width    = cw_var.get()
@@ -5113,13 +5359,31 @@ class RamanApp(tk.Tk):
             p.sg_window       = sgw_var.get()
             p.sg_poly         = sgp_var.get()
             p.normalisation   = nm_var.get()
+
+        def apply_close():
+            _commit()
             dlg.destroy()
 
-        ttk.Button(btn_row, text="Apply & Close", style="Primary.TButton",
+        def apply_reprocess():
+            # User-initiated preprocessing: commit the recipe and immediately
+            # re-run it on the raw data kept in memory, then show what it did.
+            _commit()
+            if getattr(self, "_raw_spectra", None) is None:
+                messagebox.showinfo(
+                    "Nothing loaded yet",
+                    "Recipe saved. Load a file to apply it — or reopen this "
+                    "dialog after loading to reprocess on demand.", parent=dlg)
+                dlg.destroy(); return
+            dlg.destroy()
+            self.reprocess(show_summary=True)
+
+        ttk.Button(btn_row, text="Apply & Reprocess Now", style="Primary.TButton",
+                   command=apply_reprocess).pack(side="right", padx=4)
+        ttk.Button(btn_row, text="Apply (next load)", style="Neutral.TButton",
                    command=apply_close).pack(side="right", padx=4)
         ttk.Button(btn_row, text="Cancel", style="Neutral.TButton",
                    command=dlg.destroy).pack(side="right", padx=4)
-        tk.Label(btn_row, text="Changes apply on next file load",
+        tk.Label(btn_row, text="“Reprocess Now” re-runs on the loaded raw data",
                  bg=C["bg"], fg=C["text_dim"],
                  font=("Segoe UI", 10)).pack(side="left", padx=4)
 
@@ -6983,8 +7247,17 @@ class RamanApp(tk.Tk):
                 "Reprocess", "Re-apply the loaded recipe to the current data now?"):
             self.reprocess()
 
-    def reprocess(self):
-        """Re-run preprocessing on the retained raw cube (no disk reload)."""
+    def reprocess(self, show_summary=True):
+        """Re-run preprocessing on the retained raw cube (no disk reload).
+
+        This is the user-initiated preprocessing entry point: the recipe in
+        Preprocessing → Settings is applied on demand to the raw data that was
+        kept in memory at load time, so the user can tune and re-run the
+        pipeline interactively without re-opening the file. When
+        ``show_summary`` is true a short report of what the run actually did
+        (cosmic points removed, any baseline failures) is shown afterwards so
+        aggressive settings cannot silently alter the spectra.
+        """
         raw = getattr(self, "_raw_spectra", None)
         if raw is None:
             messagebox.showwarning(
@@ -7002,9 +7275,44 @@ class RamanApp(tk.Tk):
             proc, report = preprocess_map(raw, params, cb)
             xdata = getattr(self, "_raw_xdata", self.xdata)
             path = getattr(self, "_loaded_path", "reprocessed")
-            self.after(0, lambda: self._finish_load(
-                xdata, proc, report, path, None))
+            def _done():
+                self._finish_load(xdata, proc, report, path, None)
+                if show_summary:
+                    self._show_reprocess_summary(report)
+            self.after(0, _done)
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_reprocess_summary(self, report):
+        """Concise, user-facing summary of what the preprocessing run did —
+        the 'report/preview removed points' safety net for cosmic removal."""
+        total = report.get("total_spectra", 0) or 1
+        cn    = report.get("cosmic_removed", 0)
+        cpts  = report.get("cosmic_points", 0)
+        bfail = report.get("baseline_failures", 0)
+        lines = [
+            f"Spectra processed: {report.get('total_spectra', '?')}",
+            f"Cosmic spikes removed: {cn} spectra ({cpts} points interpolated)",
+            f"Baseline: {report.get('baseline_method', '—')}",
+            f"Normalisation: {report.get('normalisation', '—')}",
+        ]
+        warn = []
+        if cpts > 0.05 * total * max(1, report.get("spectral_points", 1)) / 100:
+            pass  # placeholder; fraction check below is the meaningful one
+        frac_spectra = cn / total
+        if frac_spectra > 0.5:
+            warn.append(
+                f"Cosmic removal touched {frac_spectra*100:.0f}% of spectra — if "
+                "your bands are very sharp, raise the Z-score threshold in "
+                "Preprocessing → Settings or disable cosmic removal.")
+        if bfail > 0:
+            warn.append(f"Baseline correction FAILED on {bfail} spectrum(s); "
+                        "those were left uncorrected.")
+        msg = "\n".join(lines)
+        if warn:
+            messagebox.showwarning("Preprocessing applied",
+                                   msg + "\n\n⚠ " + "\n\n⚠ ".join(warn))
+        else:
+            messagebox.showinfo("Preprocessing applied", msg)
 
     def open_qc_map(self):
         """Show per-pixel quality-control maps (SNR, total intensity,
@@ -10067,8 +10375,10 @@ class LibrarySearchWindow(tk.Toplevel):
         left = tk.Frame(self, bg=C["sidebar"], width=300)
         left.pack(side="left", fill="y"); left.pack_propagate(False)
         SectionDiv(left, "REFERENCE LIBRARY").pack(fill="x")
+        ttk.Button(left, text="★ Load bundled library",
+                   command=self._load_bundled).pack(fill="x", padx=10, pady=(8, 2))
         ttk.Button(left, text="📁 Load library folder…",
-                   command=self._load_folder).pack(fill="x", padx=10, pady=(8, 2))
+                   command=self._load_folder).pack(fill="x", padx=10, pady=(2, 2))
         ttk.Button(left, text="＋ Load library files…",
                    command=self._load_files).pack(fill="x", padx=10, pady=2)
         self._libl = tk.Label(left, text="no library loaded", bg=C["sidebar"],
@@ -10166,6 +10476,25 @@ class LibrarySearchWindow(tk.Toplevel):
                        ("All files", "*.*")])
         if paths:
             self._ingest([Path(p) for p in paths])
+
+    def _load_bundled(self):
+        d = _bundled_library_dir()
+        if not d:
+            messagebox.showwarning(
+                "Bundled library",
+                "Bundled PCRS library not found. Expected a 'pcrs_library' "
+                "folder next to the application.", parent=self)
+            return
+        paths = [p for p in Path(d).rglob("*")
+                 if p.is_file() and p.suffix.lower() in self.SPEC_EXTS]
+        if not paths:
+            messagebox.showwarning("Bundled library",
+                "No spectra in the bundled library folder.", parent=self)
+            return
+        self._libl.config(text=f"loading bundled library ({len(paths)})…",
+                          fg=C["text_mid"])
+        self.update_idletasks()
+        self._ingest(paths)
 
     # ── query + matching ────────────────────────────────────────────────────
     def _query_spectrum(self):
@@ -10294,7 +10623,13 @@ def _otsu_threshold(img):
     mF = np.divide(sumtot - sumB, wF, out=np.zeros_like(sumB), where=wF > 0)
     between = wB * wF * (mB - mF) ** 2
     between[~valid] = -1
-    return float(centers[int(np.argmax(between))])
+    # For well-separated (e.g. bimodal) data the between-class variance is flat
+    # across the empty gap between clusters; argmax would return the left edge
+    # (right at the upper tail of the dark cluster). Return the MIDPOINT of the
+    # maximizing plateau instead — the conventional, better-centred threshold.
+    mx = between.max()
+    plateau = np.flatnonzero(between >= mx - 1e-9 * max(1.0, abs(mx)))
+    return float(centers[int(plateau[len(plateau) // 2])])
 
 
 class ComponentAnalysisWindow(tk.Toplevel):
@@ -10758,8 +11093,10 @@ class ParticleFinderWindow(tk.Toplevel):
                    command=self._detect).pack(fill="x", padx=10, pady=(8, 4))
 
         SectionDiv(left, "IDFINDER LIBRARY").pack(fill="x")
+        ttk.Button(left, text="★ Load bundled library",
+                   command=self._load_bundled).pack(fill="x", padx=10, pady=(6, 2))
         ttk.Button(left, text="📁 Load library folder…",
-                   command=self._load_folder).pack(fill="x", padx=10, pady=(6, 2))
+                   command=self._load_folder).pack(fill="x", padx=10, pady=(2, 2))
         ttk.Button(left, text="＋ Load library files…",
                    command=self._load_files).pack(fill="x", padx=10, pady=2)
         self._libl = tk.Label(left, text="no library loaded", bg=C["sidebar"],
@@ -10898,6 +11235,25 @@ class ParticleFinderWindow(tk.Toplevel):
                        ("All files", "*.*")])
         if paths:
             self._ingest([Path(p) for p in paths])
+
+    def _load_bundled(self):
+        d = _bundled_library_dir()
+        if not d:
+            messagebox.showwarning(
+                "Bundled library",
+                "Bundled PCRS library not found. Expected a 'pcrs_library' "
+                "folder next to the application.", parent=self)
+            return
+        paths = [p for p in Path(d).rglob("*")
+                 if p.is_file() and p.suffix.lower() in self.SPEC_EXTS]
+        if not paths:
+            messagebox.showwarning("Bundled library",
+                "No spectra in the bundled library folder.", parent=self)
+            return
+        self._libl.config(text=f"loading bundled library ({len(paths)})…",
+                          fg=C["text_mid"])
+        self.update_idletasks()
+        self._ingest(paths)
 
     def _best_match(self, spec, mode):
         """Return (name, score) of best library match for one spectrum."""
