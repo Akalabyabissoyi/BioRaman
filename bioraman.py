@@ -10623,7 +10623,13 @@ def _otsu_threshold(img):
     mF = np.divide(sumtot - sumB, wF, out=np.zeros_like(sumB), where=wF > 0)
     between = wB * wF * (mB - mF) ** 2
     between[~valid] = -1
-    return float(centers[int(np.argmax(between))])
+    # For well-separated (e.g. bimodal) data the between-class variance is flat
+    # across the empty gap between clusters; argmax would return the left edge
+    # (right at the upper tail of the dark cluster). Return the MIDPOINT of the
+    # maximizing plateau instead — the conventional, better-centred threshold.
+    mx = between.max()
+    plateau = np.flatnonzero(between >= mx - 1e-9 * max(1.0, abs(mx)))
+    return float(centers[int(plateau[len(plateau) // 2])])
 
 
 class ComponentAnalysisWindow(tk.Toplevel):

@@ -96,8 +96,9 @@ def test_write_cube_long_format(br, tmp_path):
 
 # ── Otsu ────────────────────────────────────────────────────────────────────
 def test_otsu_separates_bimodal(br):
-    img = np.concatenate([np.random.normal(0.2, 0.03, 1000),
-                          np.random.normal(0.8, 0.03, 1000)]).reshape(40, 50)
+    rng = np.random.default_rng(0)          # deterministic
+    img = np.concatenate([rng.normal(0.2, 0.03, 1000),
+                          rng.normal(0.8, 0.03, 1000)]).reshape(40, 50)
     thr = br._otsu_threshold(img)
     assert 0.3 < thr < 0.7
 
