@@ -119,7 +119,7 @@ __email__   = "akalabya.bissoyi@manchester.ac.uk, bissoyi.akalabya@gmail.com"
 __affiliation__ = "Gibson Group, University of Manchester"
 __url__     = "https://gibsongroupresearch.com/"
 __license__ = "MIT"
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import os, sys, time, threading, queue

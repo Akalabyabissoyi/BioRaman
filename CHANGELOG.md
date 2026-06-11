@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > algorithms, numerical defaults, preprocessing) are flagged with **[OUTPUT]**
 > and always trigger at least a MINOR version bump.
 
+## [1.0.6] - 2026-06-11
+
+Usability improvements to the PCA window. No analytical results are affected.
+
+### Added
+- **Adjustable marker size on the PC1 vs PC2 scores plot.** A new *Point size*
+  control lets dense score clouds resolve instead of overlapping into a single
+  blob; the default marker size is reduced accordingly. The setting also applies
+  to the publication-quality panel export.
+- **Manual aspect ratio for the scores plot.** A new *Aspect (H/W)* control sets
+  the panel's height-to-width ratio (`0` = auto). Stretching the plot helps
+  separate clusters that are compressed along one principal component.
+
+### Changed
+- **The PCA window's left control panel is now scrollable.** Previously the
+  lower controls could be clipped off the bottom edge on shorter windows; all
+  options are now reachable via scrollbar or mouse wheel.
+
 ## [1.0.5] - 2026-06-10
 
 Robustness & scientific-correctness hardening from a static assessment of the

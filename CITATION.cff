@@ -17,8 +17,8 @@ contact:
     email: bissoyi.akalabya@gmail.com
     affiliation: "Gibson Group, University of Manchester"
 url: "https://gibsongroupresearch.com/"
-version: 1.0.2
-date-released: "2026-06-05"
+version: 1.0.6
+date-released: "2026-06-11"
 license: MIT
 keywords:
   - Raman spectroscopy
