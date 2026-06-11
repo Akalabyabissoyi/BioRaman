@@ -2019,10 +2019,43 @@ class PCAWindow(tk.Toplevel):
                  bg=C["header"], fg="white",
                  font=("Consolas", 12, "bold")).pack(side="left", padx=16, pady=12)
 
-        # Left panel: file list + controls
-        left = tk.Frame(self, bg=C["sidebar"], width=320)
-        left.pack(side="left", fill="y")
-        left.pack_propagate(False)
+        # Left panel: file list + controls (scrollable so nothing clips off)
+        left_outer = tk.Frame(self, bg=C["sidebar"], width=320)
+        left_outer.pack(side="left", fill="y")
+        left_outer.pack_propagate(False)
+
+        _lcanvas = tk.Canvas(left_outer, bg=C["sidebar"],
+                             highlightthickness=0, width=320)
+        _lscroll = ttk.Scrollbar(left_outer, orient="vertical",
+                                 command=_lcanvas.yview)
+        _lcanvas.configure(yscrollcommand=_lscroll.set)
+        _lscroll.pack(side="right", fill="y")
+        _lcanvas.pack(side="left", fill="both", expand=True)
+
+        # All controls go into this inner frame (keeps every .pack(in left) below)
+        left = tk.Frame(_lcanvas, bg=C["sidebar"])
+        _lcanvas.create_window((0, 0), window=left, anchor="nw", width=302)
+        left.bind("<Configure>",
+                  lambda e: _lcanvas.configure(scrollregion=_lcanvas.bbox("all")))
+
+        # Mouse-wheel scrolling while the pointer is over the sidebar
+        def _wheel(e):
+            delta = -1 if getattr(e, "num", None) == 4 else (
+                1 if getattr(e, "num", None) == 5 else int(-e.delta / 120))
+            _lcanvas.yview_scroll(delta, "units")
+
+        def _bind_wheel(_):
+            _lcanvas.bind_all("<MouseWheel>", _wheel)
+            _lcanvas.bind_all("<Button-4>", _wheel)
+            _lcanvas.bind_all("<Button-5>", _wheel)
+
+        def _unbind_wheel(_):
+            _lcanvas.unbind_all("<MouseWheel>")
+            _lcanvas.unbind_all("<Button-4>")
+            _lcanvas.unbind_all("<Button-5>")
+
+        left_outer.bind("<Enter>", _bind_wheel)
+        left_outer.bind("<Leave>", _unbind_wheel)
 
         # File list
         SectionDiv(left, "MAP FILES").pack(fill="x")
@@ -2138,6 +2171,30 @@ class PCAWindow(tk.Toplevel):
                     width=5, command=self._redraw_spatial).pack(side="left", padx=8)
         tk.Label(pc_row, text="(redraws map)", bg=C["sidebar"], fg=C["text_dim"],
                  font=("Segoe UI", 9, "italic")).pack(side="left")
+
+        # Scores plot (PC1 vs PC2) appearance controls
+        SectionDiv(left, "SCORES PLOT (PC1 vs PC2)").pack(fill="x")
+        sp = tk.Frame(left, bg=C["sidebar"])
+        sp.pack(fill="x", padx=10, pady=4)
+
+        tk.Label(sp, text="Point size", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", pady=2)
+        self._pt_size = tk.DoubleVar(value=18)
+        ttk.Spinbox(sp, from_=2, to=120, increment=2, textvariable=self._pt_size,
+                    width=6, command=self._redraw_spatial).grid(
+                        row=0, column=1, padx=8, pady=2)
+
+        tk.Label(sp, text="Aspect (H/W, 0=auto)", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).grid(
+                     row=1, column=0, sticky="w", pady=2)
+        self._aspect = tk.DoubleVar(value=0.0)
+        ttk.Spinbox(sp, from_=0.0, to=5.0, increment=0.1, textvariable=self._aspect,
+                    width=6, command=self._redraw_spatial).grid(
+                        row=1, column=1, padx=8, pady=2)
+        tk.Label(sp, text="Adjust size/aspect, then it redraws live",
+                 bg=C["sidebar"], fg=C["text_dim"],
+                 font=("Segoe UI", 9, "italic")).grid(
+                     row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         # Right: plot area
         right = tk.Frame(self, bg=C["bg"])
@@ -2444,6 +2501,11 @@ class PCAWindow(tk.Toplevel):
 
         # ── A: Scores PC1 vs PC2 ─────────────────────────────────────────────
         ax = self.axes[0, 0]
+        # User-adjustable marker size (default smaller so dense clouds resolve)
+        try:
+            _pt_sz = max(2.0, float(self._pt_size.get()))
+        except Exception:
+            _pt_sz = 18.0
         diets = r.get("diets"); temps = r.get("temps")
         use_factor = (diets is not None and temps is not None
                       and any(d is not None for d in diets))
@@ -2480,7 +2542,7 @@ class PCAWindow(tk.Toplevel):
                     if not idx.any():
                         continue
                     x, y = scores[idx, 0], scores[idx, 1]
-                    ax.scatter(x, y, s=34, color=diet_col[d],
+                    ax.scatter(x, y, s=_pt_sz, color=diet_col[d],
                                marker=temp_marker.get(t, "s"), alpha=0.55,
                                edgecolor="white", linewidth=0.35, zorder=3)
                     _draw_ellipse(x, y, diet_col[d])
@@ -2495,7 +2557,7 @@ class PCAWindow(tk.Toplevel):
                 idx = labels == g
                 x, y = scores[idx, 0], scores[idx, 1]
                 col  = color_map[g]
-                ax.scatter(x, y, s=60, color=col, alpha=0.75, label=g, zorder=3)
+                ax.scatter(x, y, s=_pt_sz, color=col, alpha=0.75, label=g, zorder=3)
                 _draw_ellipse(x, y, col)
             self._legend_handles = (
                 [mpatches.Patch(color=color_map[g], label=str(g))
@@ -2507,6 +2569,15 @@ class PCAWindow(tk.Toplevel):
         ax.set_title("A: PCA Scores (PC1 vs PC2) · 95% T² ellipse",
                      fontsize=11, fontweight="semibold")
         ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+        # Manual aspect ratio: 0 = auto (fill panel); >0 sets box height/width
+        try:
+            _asp = float(self._aspect.get())
+        except Exception:
+            _asp = 0.0
+        if _asp and _asp > 0:
+            ax.set_box_aspect(_asp)
+        else:
+            ax.set_box_aspect(None)
 
         # ── B: Loadings — colour-coded positive/negative ──────────────────────
         ax = self.axes[0, 1]
@@ -3233,6 +3304,10 @@ class PCAWindow(tk.Toplevel):
 
         if kind == "scores":
             fig, ax = plt.subplots(figsize=(8.5, 6.5))
+            try:
+                _pt_sz = max(2.0, float(self._pt_size.get()))
+            except Exception:
+                _pt_sz = 18.0
             diets = r.get("diets"); temps = r.get("temps")
             use_factor = (diets is not None and temps is not None
                           and any(d is not None for d in diets))
@@ -3253,7 +3328,7 @@ class PCAWindow(tk.Toplevel):
                         if not idx.any():
                             continue
                         x, y = scores[idx, 0], scores[idx, 1]
-                        ax.scatter(x, y, s=34, color=diet_col[d],
+                        ax.scatter(x, y, s=_pt_sz, color=diet_col[d],
                                    marker=temp_marker.get(t, "s"), alpha=0.55,
                                    edgecolor="white", linewidth=0.35, zorder=3)
                         _ellipse(ax, x, y, diet_col[d])
@@ -3276,7 +3351,7 @@ class PCAWindow(tk.Toplevel):
                 for g in groups:
                     idx = labels == g
                     x, y = scores[idx, 0], scores[idx, 1]
-                    ax.scatter(x, y, s=34, color=color_map[g], alpha=0.6,
+                    ax.scatter(x, y, s=_pt_sz, color=color_map[g], alpha=0.6,
                                edgecolor="white", linewidth=0.35,
                                label=g, zorder=3)
                     _ellipse(ax, x, y, color_map[g])
@@ -3289,6 +3364,12 @@ class PCAWindow(tk.Toplevel):
             ax.set_title("PCA Scores (PC1 vs PC2)", fontsize=13,
                          fontweight="semibold")
             ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+            try:
+                _asp = float(self._aspect.get())
+            except Exception:
+                _asp = 0.0
+            if _asp and _asp > 0:
+                ax.set_box_aspect(_asp)
 
         elif kind == "loadings":
             fig, ax = plt.subplots(figsize=(9, 5.5))
