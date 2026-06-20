@@ -119,7 +119,7 @@ __email__   = "akalabya.bissoyi@manchester.ac.uk, bissoyi.akalabya@gmail.com"
 __affiliation__ = "Gibson Group, University of Manchester"
 __url__     = "https://gibsongroupresearch.com/"
 __license__ = "MIT"
-__version__ = "1.0.5"
+__version__ = "1.1.0"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import os, sys, time, threading, queue
@@ -2127,13 +2127,30 @@ class PCAWindow(tk.Toplevel):
                        font=("Segoe UI", 10)).grid(
                            row=4, column=0, columnspan=2, sticky="w", pady=4)
 
+        # FlyHash sparse-code outlier scan (fruit-fly novelty detection).
+        self._flyhash_out_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(opts, text="🪰 Exclude FlyHash outliers",
+                       variable=self._flyhash_out_var,
+                       bg=C["sidebar"], fg=C["text_mid"],
+                       activebackground=C["sidebar"],
+                       font=("Segoe UI", 10)).grid(
+                           row=5, column=0, sticky="w", pady=2)
+        self._flyhash_pct = tk.DoubleVar(value=2.0)
+        ttk.Spinbox(opts, from_=0.5, to=20.0, increment=0.5,
+                    textvariable=self._flyhash_pct, width=6).grid(
+                        row=5, column=1, padx=8, pady=2)
+        tk.Label(opts, text="(% most-novel spectra flagged & dropped)",
+                 bg=C["sidebar"], fg=C["text_dim"],
+                 font=("Segoe UI", 8)).grid(row=6, column=0, columnspan=2,
+                                            sticky="w")
+
         self._scale_var = tk.BooleanVar(value=False)
         tk.Checkbutton(opts, text="Standardise features",
                        variable=self._scale_var,
                        bg=C["sidebar"], fg=C["text_mid"],
                        activebackground=C["sidebar"],
                        font=("Segoe UI", 10)).grid(
-                           row=5, column=0, columnspan=2, sticky="w", pady=2)
+                           row=7, column=0, columnspan=2, sticky="w", pady=2)
 
         # Run button
         ttk.Button(left, text="▶  Run PCA", style="P.TButton",
@@ -2153,6 +2170,20 @@ class PCAWindow(tk.Toplevel):
                    command=self._save_fig).pack(fill="x", padx=10, pady=4)
         ttk.Button(left, text="↓  Save Panels (publication)", style="N.TButton",
                    command=self._save_panels).pack(fill="x", padx=10, pady=(0,4))
+        # ── class-imbalance handling for the classifier (SMOTE family) ──────
+        # Inspired by Servert Lerdo de Tejada et al. (2026), Spectrochim. Acta
+        # A — resampling is applied INSIDE each CV training fold only, never to
+        # the held-out test fold, so reported accuracy stays leakage-free.
+        imb = tk.Frame(left, bg=C["sidebar"])
+        imb.pack(fill="x", padx=10, pady=(2, 0))
+        tk.Label(imb, text="Class imbalance", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).pack(side="left")
+        self._clf_imbalance = tk.StringVar(value="None")
+        ttk.Combobox(imb, textvariable=self._clf_imbalance, width=16,
+                     state="readonly",
+                     values=("None", "Random over-sample", "SMOTE",
+                             "Borderline-SMOTE", "ADASYN", "SMOTE-ENN",
+                             "SMOTE-Tomek")).pack(side="right")
         ttk.Button(left, text="◎  Classify (PLS-DA / LDA)", style="N.TButton",
                    command=self._run_classifier).pack(fill="x", padx=10, pady=(0,4))
         ttk.Button(left, text="≈  Band-ratio export (CSV)", style="N.TButton",
@@ -2432,6 +2463,22 @@ class PCAWindow(tk.Toplevel):
         if scaled:
             X = StandardScaler().fit_transform(X)
 
+        # FlyHash outlier scan — fruit-fly sparse-code novelty detection.
+        # Flags the most-novel spectra (top N%) and drops them before PCA so a
+        # few artefact/contaminant spectra can't hijack the principal components.
+        self._flyhash_dropped = 0
+        if self._flyhash_out_var.get() and X.shape[0] > 10:
+            nov = flyhash_novelty(X_unscaled)
+            pct = float(self._flyhash_pct.get())
+            cut = np.percentile(nov, 100.0 - pct)
+            keep = nov < cut
+            if keep.sum() >= 5 and keep.sum() < len(keep):
+                self._flyhash_dropped = int((~keep).sum())
+                X = X[keep]; X_unscaled = X_unscaled[keep]; labels = labels[keep]
+                if diets is not None: diets = diets[keep]
+                if temps is not None: temps = temps[keep]
+                if pupae is not None: pupae = pupae[keep]
+
         # Outlier removal — Hotelling T² across the first k PCs (95% χ² limit).
         # NOTE: this is a global, unsupervised screen applied before CV. It can
         # still exert a mild optimistic bias on cross-validated metrics; it is
@@ -2477,8 +2524,10 @@ class PCAWindow(tk.Toplevel):
         self._draw_pca()
         self._prog["value"] = 100
         n_kept = len(labels)
+        _fly = getattr(self, "_flyhash_dropped", 0)
+        _flytxt = f"  ·  🪰 dropped {_fly} outlier(s)" if _fly else ""
         self._status_lbl.config(
-            text=f"Done.  {n_kept} spectra from {len(self._files)} files.\n"
+            text=f"Done.  {n_kept} spectra from {len(self._files)} files.{_flytxt}\n"
                  f"PC1={expl[0]*100:.1f}%  PC2={expl[1]*100:.1f}%  ·  "
                  f"suggested PCs: {suggest['cumvar']} (95% var) / "
                  f"{suggest['kaiser']} (Kaiser) / {suggest['broken_stick']} (broken-stick)")
@@ -2860,6 +2909,42 @@ class PCAWindow(tk.Toplevel):
                    command=_save).pack(side="right", padx=8)
         self._mean_fig = fig
 
+    # ── class-imbalance resampler factory (SMOTE family) ───────────────────────
+    @staticmethod
+    def _build_sampler(name, y_train, seed):
+        """Return an imbalanced-learn sampler for the given training labels, or
+        None if no resampling is requested / possible. k-neighbours is capped to
+        the smallest class so SMOTE never asks for more neighbours than exist."""
+        if name in (None, "None"):
+            return None
+        from collections import Counter
+        counts = Counter(y_train)
+        min_n = min(counts.values())
+        # need ≥2 samples in the smallest class to interpolate new ones
+        k = max(1, min(5, min_n - 1))
+        from imblearn.over_sampling import (RandomOverSampler, SMOTE,
+                                            BorderlineSMOTE, ADASYN)
+        from imblearn.combine import SMOTEENN, SMOTETomek
+        if name == "Random over-sample":
+            return RandomOverSampler(random_state=seed)
+        if min_n < 2:
+            # SMOTE-style interpolation impossible with a singleton class;
+            # degrade gracefully to plain random over-sampling.
+            return RandomOverSampler(random_state=seed)
+        if name == "SMOTE":
+            return SMOTE(k_neighbors=k, random_state=seed)
+        if name == "Borderline-SMOTE":
+            return BorderlineSMOTE(k_neighbors=k, random_state=seed)
+        if name == "ADASYN":
+            return ADASYN(n_neighbors=k, random_state=seed)
+        if name == "SMOTE-ENN":
+            return SMOTEENN(random_state=seed, smote=SMOTE(k_neighbors=k,
+                                                           random_state=seed))
+        if name == "SMOTE-Tomek":
+            return SMOTETomek(random_state=seed, smote=SMOTE(k_neighbors=k,
+                                                            random_state=seed))
+        return None
+
     # ── supervised classification: PLS-DA / LDA with cross-validation ──────────
     def _run_classifier(self):
         if self._results is None:
@@ -2878,6 +2963,21 @@ class PCAWindow(tk.Toplevel):
             messagebox.showerror("Missing library",
                                  f"scikit-learn required.\n{ex}", parent=self)
             return
+
+        # ── class-imbalance handling (SMOTE family) ───────────────────────────
+        samp_name = (self._clf_imbalance.get()
+                     if hasattr(self, "_clf_imbalance") else "None")
+        if samp_name != "None":
+            try:
+                import imblearn  # noqa: F401
+            except Exception:
+                messagebox.showerror(
+                    "Missing library",
+                    "Class-imbalance resampling needs imbalanced-learn.\n\n"
+                    "Install it with:\n    pip install imbalanced-learn\n\n"
+                    "Then re-run, or set 'Class imbalance' back to None.",
+                    parent=self)
+                return
 
         r = self._results
         # F4 — classify the UNSCALED features and fold scaling into a per-fold
@@ -2983,7 +3083,45 @@ class PCAWindow(tk.Toplevel):
                 for name in ("PLS-DA", "LDA"):
                     if cancel_evt.is_set():
                         return
+                    def _oof_resampled(yv, cvv):
+                        # Out-of-fold predictions with SMOTE-family resampling
+                        # applied to each TRAINING fold only (test fold is never
+                        # touched → no optimistic leakage). Scaling is likewise
+                        # fit on the (resampled) training fold only.
+                        yv = np.asarray(yv, dtype=object)
+                        pred = np.empty(len(yv), dtype=object)
+                        for tr, te in cvv.split(X, yv, groups=cv_groups):
+                            Xtr, ytr = X[tr], yv[tr]
+                            try:
+                                samp = self._build_sampler(samp_name, ytr,
+                                                           self._seed)
+                                if samp is not None:
+                                    Xtr, ytr = samp.fit_resample(Xtr, ytr)
+                            except Exception:
+                                Xtr, ytr = X[tr], yv[tr]   # fall back: no resample
+                            Xte = X[te]
+                            if clf_scaled:
+                                sc = StandardScaler().fit(Xtr)
+                                Xtr, Xte = sc.transform(Xtr), sc.transform(Xte)
+                            if name == "PLS-DA":
+                                lbf = LabelBinarizer()
+                                Ytr = lbf.fit_transform(ytr)
+                                if Ytr.shape[1] == 1:
+                                    Ytr = np.hstack([1 - Ytr, Ytr])
+                                est = PLSRegression(
+                                    n_components=min(n_comp, Xtr.shape[1],
+                                                     max(2, len(lbf.classes_)))
+                                ).fit(Xtr, Ytr)
+                                Yh = np.asarray(est.predict(Xte))
+                                pred[te] = lbf.classes_[np.argmax(Yh, axis=1)]
+                            else:
+                                est = LinearDiscriminantAnalysis().fit(Xtr, ytr)
+                                pred[te] = est.predict(Xte)
+                        return pred
+
                     def fit(yv, cvv):
+                        if samp_name != "None":
+                            return _oof_resampled(yv, cvv)
                         if name == "PLS-DA":
                             Yv = lb.fit_transform(yv)
                             if Yv.shape[1] == 1:
@@ -3006,6 +3144,7 @@ class PCAWindow(tk.Toplevel):
                         "acc": accuracy_score(y, pred),
                         "bacc": bacc_obs,
                         "cm": confusion_matrix(y, pred, labels=classes),
+                        "sampler": samp_name,
                     }
                     if n_perm > 0:
                         rng = np.random.default_rng(self._seed)
@@ -3076,7 +3215,10 @@ class PCAWindow(tk.Toplevel):
                     else f"p={pv:.3f}"
                 pstr = (f"\nperm. test ({res['n_perm']}×): {ptxt}  "
                         f"(null={res['null_mean']*100:.1f}%)")
-            ax.set_title(f"{name}\n{n_splits}-fold {cv_kind} CV  ·  "
+            sstr = ""
+            if res.get("sampler", "None") != "None":
+                sstr = f"  ·  resampling: {res['sampler']}"
+            ax.set_title(f"{name}\n{n_splits}-fold {cv_kind} CV{sstr}  ·  "
                          f"acc={res['acc']*100:.1f}%  ·  "
                          f"balanced={res['bacc']*100:.1f}%" + pstr,
                          fontsize=9, fontweight="semibold")
@@ -3106,6 +3248,7 @@ class PCAWindow(tk.Toplevel):
                     if "error" in res:
                         fh.write(f"{name},error,{res['error']}\n\n"); continue
                     fh.write(f"{name},{n_splits}-fold {cv_kind} CV,"
+                             f"resampling={res.get('sampler','None')},"
                              f"accuracy={res['acc']:.4f},"
                              f"balanced_accuracy={res['bacc']:.4f}")
                     if "p_perm" in res:
@@ -3475,6 +3618,226 @@ class PCAWindow(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FLYHASH — fruit-fly mushroom-body sparse hashing for fast region + anomaly maps
+# ─────────────────────────────────────────────────────────────────────────────
+def make_connectome_connectivity(n_glom=50, n_kc=256, claws_mean=6.0,
+                                 bias_strength=1.0, seed=0):
+    """PN->KC connectivity from published fly mushroom-body wiring statistics:
+    ~50 glomerular inputs, n_kc Kenyon cells, each KC sampling ~6 inputs
+    ('claws') with non-uniform glomerular bias. Returns (n_glom, n_kc).
+    To use the REAL measured wiring, load a FlyWire/neuPrint PN->KC matrix
+    of shape (n_glom, n_kc) and pass it to flyhash_maps(connectivity=...)."""
+    rng = np.random.default_rng(seed)
+    base = rng.gamma(shape=max(1e-3, 1.0 / max(bias_strength, 1e-3)),
+                     scale=1.0, size=n_glom)
+    pref = base / base.sum()
+    C = np.zeros((n_glom, n_kc))
+    for kc in range(n_kc):
+        n_claws = max(2, int(rng.poisson(claws_mean)))
+        inputs = rng.choice(n_glom, size=min(n_claws, n_glom),
+                            replace=False, p=pref)
+        C[inputs, kc] = rng.lognormal(mean=0.0, sigma=0.4, size=len(inputs))
+    return C
+
+
+def _spectrum_to_glomeruli(flat, n_glom):
+    """Reduce (n_pixels, B) spectra to (n_pixels, n_glom) channels by averaging
+    contiguous spectral bands (a receptor->PN dimensionality reduction)."""
+    B = flat.shape[1]
+    edges = np.linspace(0, B, n_glom + 1).astype(int)
+    return np.stack([flat[:, edges[g]:edges[g + 1]].mean(axis=1)
+                     for g in range(n_glom)], axis=1)
+
+
+def flyhash_maps(cube, n_bits=256, sparseness=0.05, n_regions=4,
+                 do_regions=True, do_anomaly=True, seed=42,
+                 projection="random", connectivity=None, n_glom=50):
+    """Fly-brain-inspired analysis of a Raman hyperspectral cube.
+
+    Mimics the fruit fly mushroom body: each pixel's spectrum is projected to a
+    high-dim space, then only the strongest few percent of projections are kept
+    (a sparse binary 'fingerprint'). These fingerprints are cheap to compare,
+    which makes two things fast and robust:
+
+      - REGION map  : cluster fingerprints into chemical domains (KMeans).
+      - ANOMALY map : score each pixel by how few others share its fingerprint;
+                      rare pixels (contaminants, defects, trace phases) light up.
+
+    projection : "random"     -> dense Gaussian random matrix (standard FlyHash).
+                 "connectome"  -> sparse PN->KC wiring prior (real fly structure):
+                                  spectrum is reduced to n_glom channels, then
+                                  passed through a biased ~6-claw connectivity
+                                  matrix. Pass a real matrix via `connectivity`.
+    cube : ndarray (H, W, B)   hyperspectral map (already preprocessed).
+    Returns (region_map | None, anomaly_map | None), each shape (H, W).
+    """
+    cube = np.asarray(cube, dtype=float)
+    H, W, B = cube.shape
+    flat = cube.reshape(-1, B)
+
+    # Normalise each spectrum to unit area so overall brightness doesn't dominate.
+    flat = flat - np.nanmin(flat, axis=1, keepdims=True)
+    areas = np.nansum(flat, axis=1, keepdims=True)
+    areas[areas == 0] = 1.0
+    flat = np.nan_to_num(flat / areas)
+
+    # The fly hash: project -> keep top-k -> sparse binary code.
+    rng = np.random.default_rng(seed)
+    if projection == "connectome":
+        C = connectivity if connectivity is not None else \
+            make_connectome_connectivity(n_glom=n_glom, n_kc=int(n_bits), seed=seed)
+        activity = _spectrum_to_glomeruli(flat, C.shape[0]) @ C
+    else:
+        proj = rng.standard_normal((B, int(n_bits)))
+        activity = flat @ proj
+    n_on = max(1, int(int(n_bits) * float(sparseness)))
+    thresh = np.sort(activity, axis=1)[:, -n_on][:, None]
+    hashes = (activity >= thresh).astype(np.float32)
+
+    region_map = None
+    if do_regions:
+        from sklearn.cluster import KMeans
+        labels = KMeans(n_clusters=int(n_regions), n_init=10,
+                        random_state=0).fit_predict(hashes)
+        region_map = labels.reshape(H, W).astype(float)
+
+    anomaly_map = None
+    if do_anomaly:
+        # Novelty = inverse of how many 'on' bits a pixel shares with a random
+        # reference sample of pixels. Fewer shared bits  =>  more unusual.
+        n_ref = min(500, len(hashes))
+        ref = hashes[rng.choice(len(hashes), size=n_ref, replace=False)]
+        shared = hashes @ ref.T
+        novelty = -shared.mean(axis=1)
+        novelty -= novelty.min()
+        if novelty.max() > 0:
+            novelty /= novelty.max()
+        anomaly_map = novelty.reshape(H, W)
+
+    return region_map, anomaly_map
+
+
+def flyhash_novelty(X, n_bits=256, sparseness=0.05, seed=42):
+    """Per-row novelty score using the fly mushroom-body sparse hash.
+
+    X : ndarray (n_samples, n_features)  — e.g. the PCA spectra matrix.
+    Returns a 1-D array of novelty scores (0..1); high = unlike the rest of
+    the dataset (candidate outlier / contaminant / artefact spectrum).
+    """
+    X = np.asarray(X, dtype=float)
+    n, B = X.shape
+    Xn = X - np.nanmin(X, axis=1, keepdims=True)
+    areas = np.nansum(Xn, axis=1, keepdims=True)
+    areas[areas == 0] = 1.0
+    Xn = np.nan_to_num(Xn / areas)
+
+    rng = np.random.default_rng(seed)
+    proj = rng.standard_normal((B, int(n_bits)))
+    act = Xn @ proj
+    n_on = max(1, int(int(n_bits) * float(sparseness)))
+    thr = np.sort(act, axis=1)[:, -n_on][:, None]
+    hashes = (act >= thr).astype(np.float32)
+
+    n_ref = min(500, n)
+    ref = hashes[rng.choice(n, size=n_ref, replace=False)]
+    shared = hashes @ ref.T
+    novelty = -shared.mean(axis=1)
+    novelty -= novelty.min()
+    if novelty.max() > 0:
+        novelty /= novelty.max()
+    return novelty
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL MASK / BACKGROUND REJECTION — separate cell pixels from buffer (e.g. PBS)
+# ─────────────────────────────────────────────────────────────────────────────
+def _band_height_area(cube, wn, lo, hi, local_baseline=True):
+    """Return (height_map, area_map) over [lo, hi] cm⁻¹ with an optional linear
+    local baseline subtracted (endpoints of the band). Both shape (Y, X)."""
+    m = (wn >= lo) & (wn <= hi)
+    if m.sum() < 2:
+        return None, None
+    x = wn[m]
+    sub = cube[:, :, m].astype(float)
+    if local_baseline:
+        t = (x - x[0]) / (x[-1] - x[0] + 1e-12)
+        base = (sub[:, :, :1] * (1 - t)[None, None, :]
+                + sub[:, :, -1:] * t[None, None, :])
+        sub = np.clip(sub - base, 0, None)
+    trap = getattr(np, "trapezoid", np.trapz)
+    return sub.max(axis=2), trap(sub, x, axis=2)
+
+
+def _noise_map(cube, wn, lo, hi):
+    """Per-pixel noise: std in a signal-free window if available, else a robust
+    high-frequency estimate from successive spectral differences."""
+    m = (wn >= lo) & (wn <= hi)
+    if m.sum() >= 5:
+        return cube[:, :, m].std(axis=2)
+    d = np.diff(cube.astype(float), axis=2)
+    med = np.median(d, axis=2, keepdims=True)
+    return 1.4826 * np.median(np.abs(d - med), axis=2) / np.sqrt(2.0)
+
+
+def _otsu_threshold(vals):
+    """Otsu's between-class-variance threshold for a 1-D array of values."""
+    v = np.asarray(vals, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0 or v.ptp() == 0:
+        return float(np.nanmedian(vals)) if v.size else 0.0
+    hist, edges = np.histogram(v, bins=256)
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    wb = np.cumsum(hist).astype(float)
+    wf = wb[-1] - wb
+    cs = np.cumsum(hist * centres)
+    mb = cs / np.maximum(wb, 1)
+    mf = (cs[-1] - cs) / np.maximum(wf, 1)
+    between = wb * wf * (mb - mf) ** 2
+    return float(centres[int(np.argmax(between))])
+
+
+def cell_mask_analysis(cube, wn, cell_lo=2850.0, cell_hi=2950.0,
+                       noise_lo=1750.0, noise_hi=1850.0, min_snr=3.0,
+                       method="Otsu", percentile=75.0):
+    """Auto cell-vs-background separation for a Raman map.
+
+    Strategy: cells are rich in CH-stretch (2850–2950 cm⁻¹) where buffer/PBS is
+    nearly silent, so an SNR map of that band cleanly marks cell pixels. Falls
+    back to amide I (1620–1700) if the CH-stretch band is outside the data.
+
+    Returns dict with: area, height, noise, snr (all (Y,X)); mask (bool Y,X);
+    background_spectrum (W,); threshold (float); band (lo,hi) actually used.
+    """
+    lo, hi = cell_lo, cell_hi
+    height, area = _band_height_area(cube, wn, lo, hi)
+    if height is None:                       # CH-stretch absent → amide I
+        lo, hi = 1620.0, 1700.0
+        height, area = _band_height_area(cube, wn, lo, hi)
+    if height is None:
+        raise ValueError("Neither CH-stretch nor amide I band is within the "
+                         "spectral range of this map.")
+    noise = _noise_map(cube, wn, noise_lo, noise_hi)
+    snr = height / (noise + 1e-12)
+
+    if method == "Percentile":
+        thr = float(np.nanpercentile(snr, percentile))
+    else:
+        thr = max(_otsu_threshold(snr), float(min_snr))
+    mask = snr >= thr
+
+    flat = cube.reshape(-1, cube.shape[2]).astype(float)
+    bg_pix = ~mask.reshape(-1)
+    if bg_pix.sum() >= 5:
+        bg_spectrum = np.median(flat[bg_pix], axis=0)
+    else:                                    # almost all cell → use global min env
+        bg_spectrum = np.percentile(flat, 5, axis=0)
+
+    return {"area": area, "height": height, "noise": noise, "snr": snr,
+            "mask": mask, "background_spectrum": bg_spectrum,
+            "threshold": thr, "band": (lo, hi)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN APPLICATION
 # ─────────────────────────────────────────────────────────────────────────────
 class RamanApp(tk.Tk):
@@ -3605,11 +3968,15 @@ class RamanApp(tk.Tk):
         pm.add_command(label="📥  Load Recipe…",     command=self.load_recipe)
         pm.add_separator()
         pm.add_command(label="✓  Quality Control Maps…", command=self.open_qc_map)
+        pm.add_command(label="🧫  Cell Mask / Background Rejection…",
+                       command=self.open_cell_mask)
 
         am = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
                      activebackground=C["accent"], activeforeground="white")
         mb.add_cascade(label="Analysis", menu=am)
         am.add_command(label="◈  PCA Analysis…",         command=self.open_pca)
+        am.add_command(label="◇  PCA Studio (scalable, large datasets)…",
+                       command=self.open_pca_studio)
         am.add_command(label="🧊  3D Volume Viewer…",     command=self.open_3d_viewer)
         am.add_command(label="✨  Publication Volume (Plotly)…",
                        command=self.open_volume_render)
@@ -3617,6 +3984,7 @@ class RamanApp(tk.Tk):
         am.add_command(label="⬡  Cluster Analysis…",     command=self.open_clustering)
         am.add_command(label="⟠  MCR-ALS…",              command=self.open_mcr)
         am.add_command(label="◉  N-FINDR Endmembers…",   command=self.open_nfindr)
+        am.add_command(label="🪰  FlyHash (Region + Anomaly)…", command=self.open_flyhash)
         am.add_separator()
         am.add_command(label="⚗  Component Analysis (DCLS/NNLS)…",
                        command=self.open_component_analysis)
@@ -3704,8 +4072,10 @@ class RamanApp(tk.Tk):
             ("⬡ Cluster",      self.open_clustering,        "Neutral.TButton"),
             ("⟠ MCR-ALS",      self.open_mcr,               "Neutral.TButton"),
             ("◉ N-FINDR",      self.open_nfindr,            "Neutral.TButton"),
+            ("🪰 FlyHash",      self.open_flyhash,           "Neutral.TButton"),
             ("⚒ Spectral Tools",self.open_spectral_tools,   "Neutral.TButton"),
             ("✓ QC Maps",       self.open_qc_map,            "Neutral.TButton"),
+            ("🧫 Cell Mask",    self.open_cell_mask,         "Neutral.TButton"),
             ("✨ HQ Volume",    self.open_volume_render,     "Neutral.TButton"),
             ("📂 Batch",        self.open_batch,             "Neutral.TButton"),
             ("↓ Save Map",      self.save_map,               "Neutral.TButton"),
@@ -5575,6 +5945,213 @@ class RamanApp(tk.Tk):
     def open_pca(self):
         PCAWindow(self, self.pp_params)
 
+    def open_pca_studio(self):
+        """Launch the scalable PCA Studio window (out-of-core IncrementalPCA for
+        very large datasets). If a map is currently loaded, offer to hand the
+        loaded spectra over; the user can also add files inside PCA Studio."""
+        try:
+            from pca_studio import PCAStudio
+        except Exception as ex:
+            messagebox.showerror(
+                "PCA Studio unavailable",
+                "Could not import PCA Studio. Make sure pca_studio.py, "
+                "pca_core.py and spectra_io.py are in the same folder as "
+                f"BioRaman.\n\n{ex}")
+            return
+
+        external = None
+        if getattr(self, "spectra", None) is not None and \
+                getattr(self, "xdata", None) is not None:
+            use = messagebox.askyesno(
+                "PCA Studio",
+                "Send the currently loaded map into PCA Studio?\n\n"
+                "Yes — analyse the loaded spectra (you can still add more files).\n"
+                "No  — open empty and load files inside PCA Studio.")
+            if use:
+                cube = np.asarray(self.spectra)
+                spectra2d = cube.reshape(-1, cube.shape[-1]) if cube.ndim == 3 else cube
+                external = {"spectra": spectra2d,
+                            "waves": np.asarray(self.xdata, dtype=float),
+                            "group": "BioRaman map"}
+        try:
+            PCAStudio(master=self, external_data=external)
+        except Exception as ex:
+            import traceback as _tb
+            messagebox.showerror("PCA Studio failed",
+                                 f"{ex}\n\n{_tb.format_exc()}")
+
+    # ── FLYHASH ANALYSIS ──────────────────────────────────────────────────────
+    def open_flyhash(self):
+        """Fruit-fly mushroom-body sparse-hash analysis.
+
+        Builds two maps from the current cube:
+          • FlyHash Regions  — fast unsupervised chemical segmentation.
+          • FlyHash Anomaly  — highlights rare/unusual pixels (contaminants,
+                               defects, trace phases) with no labels needed.
+        Results are stored as named maps (same system as Univariate), so the
+        usual LUT / colormap / save controls all work on them.
+        """
+        if self.spectra is None:
+            messagebox.showwarning("No data", "Load a WDF file first."); return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("FlyHash — Sparse-Code Region & Anomaly Maps")
+        dlg.geometry("560x520")
+        dlg.configure(bg=C["bg"])
+        dlg.grab_set()
+        # holder for an optional real PN->KC connectivity matrix
+        self._flyhash_connectivity = getattr(self, "_flyhash_connectivity", None)
+
+        hdr = tk.Frame(dlg, bg=C["header"], height=48)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="🪰  FLYHASH ANALYSIS",
+                 bg=C["header"], fg="white",
+                 font=("Consolas", 13, "bold")).pack(side="left", padx=16, pady=12)
+
+        body = tk.Frame(dlg, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=16, pady=12)
+
+        tk.Label(body,
+                 text="Fly-brain sparse hashing: fast region segmentation +\n"
+                      "automatic rare-pixel (anomaly) detection.",
+                 bg=C["bg"], fg=C["text_dim"], justify="left",
+                 font=("Segoe UI", 10)).grid(row=0, column=0, columnspan=2,
+                                             sticky="w", pady=(0, 8))
+
+        # Outputs
+        do_regions = tk.BooleanVar(value=True)
+        do_anomaly = tk.BooleanVar(value=True)
+        tk.Checkbutton(body, text="Build chemical region map", variable=do_regions,
+                       bg=C["bg"], fg=C["text_hi"], activebackground=C["bg"],
+                       selectcolor=C["panel"], font=("Segoe UI", 10)).grid(
+                           row=1, column=0, columnspan=2, sticky="w")
+        tk.Checkbutton(body, text="Build anomaly (rare-pixel) map", variable=do_anomaly,
+                       bg=C["bg"], fg=C["text_hi"], activebackground=C["bg"],
+                       selectcolor=C["panel"], font=("Segoe UI", 10)).grid(
+                           row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        # Number of regions
+        tk.Label(body, text="Number of regions:", bg=C["bg"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).grid(row=3, column=0, sticky="w", pady=4)
+        n_regions = tk.IntVar(value=4)
+        ttk.Spinbox(body, from_=2, to=20, increment=1, textvariable=n_regions,
+                    width=8).grid(row=3, column=1, sticky="w", padx=8)
+
+        # Hash size
+        tk.Label(body, text="Hash size (bits):", bg=C["bg"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).grid(row=4, column=0, sticky="w", pady=4)
+        n_bits = tk.IntVar(value=256)
+        ttk.Spinbox(body, from_=32, to=2048, increment=32, textvariable=n_bits,
+                    width=8).grid(row=4, column=1, sticky="w", padx=8)
+
+        # Sparseness
+        tk.Label(body, text="Sparseness (% bits on):", bg=C["bg"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).grid(row=5, column=0, sticky="w", pady=4)
+        sparse_pct = tk.DoubleVar(value=5.0)
+        ttk.Spinbox(body, from_=1.0, to=50.0, increment=1.0, textvariable=sparse_pct,
+                    width=8).grid(row=5, column=1, sticky="w", padx=8)
+        tk.Label(body, text="(fly uses ~5%; lower = sharper, more distinct codes)",
+                 bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 9)).grid(
+                     row=6, column=0, columnspan=2, sticky="w")
+
+        # Projection prior: random vs measured fly connectome (research option)
+        tk.Label(body, text="Projection:", bg=C["bg"], fg=C["text_mid"],
+                 font=("Segoe UI", 10)).grid(row=7, column=0, sticky="w", pady=(8, 2))
+        proj_var = tk.StringVar(value="random")
+        ttk.Combobox(body, textvariable=proj_var, state="readonly", width=14,
+                     values=["random", "connectome"]).grid(
+                         row=7, column=1, sticky="w", padx=8, pady=(8, 2))
+
+        conn_lbl = tk.Label(
+            body,
+            text="random = standard FlyHash · connectome = fly PN→KC wiring prior",
+            bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 9))
+        conn_lbl.grid(row=8, column=0, columnspan=2, sticky="w")
+
+        def load_real_conn():
+            path = filedialog.askopenfilename(
+                title="Load real PN→KC connectivity (CSV: dense or pn,kc,weight)",
+                filetypes=[("CSV", "*.csv"), ("All", "*.*")], parent=dlg)
+            if not path:
+                return
+            try:
+                raw = pd.read_csv(path)
+                if raw.shape[1] == 3:
+                    raw.columns = ["pn", "kc", "w"]
+                    pn = {v: i for i, v in enumerate(sorted(raw.pn.unique()))}
+                    kc = {v: i for i, v in enumerate(sorted(raw.kc.unique()))}
+                    M = np.zeros((len(pn), len(kc)))
+                    for _, r in raw.iterrows():
+                        M[pn[r.pn], kc[r.kc]] = r.w
+                else:
+                    M = raw.values.astype(float)
+                self._flyhash_connectivity = M
+                proj_var.set("connectome")
+                conn_lbl.config(text=f"✓ real connectome loaded: "
+                                     f"{M.shape[0]} glomeruli × {M.shape[1]} KCs",
+                                fg=C["success"])
+            except Exception as exc:
+                messagebox.showerror("Load failed", str(exc), parent=dlg)
+
+        ttk.Button(body, text="Load real PN→KC…", style="Neutral.TButton",
+                   command=load_real_conn).grid(row=9, column=0, columnspan=2,
+                                                sticky="w", pady=(4, 2))
+
+        status_lbl = tk.Label(body, text="", bg=C["bg"], fg=C["text_dim"],
+                              font=("Segoe UI", 11))
+        status_lbl.grid(row=10, column=0, columnspan=2, sticky="w", pady=8)
+
+        def run():
+            if not (do_regions.get() or do_anomaly.get()):
+                messagebox.showwarning("Nothing to do",
+                                       "Tick at least one output map.", parent=dlg)
+                return
+            try:
+                status_lbl.config(text="Computing fly-hash…", fg=C["text_dim"])
+                dlg.update_idletasks()
+                self._show_progress(True)
+                _conn = (self._flyhash_connectivity
+                         if proj_var.get() == "connectome" else None)
+                reg, ano = flyhash_maps(
+                    self.spectra,
+                    n_bits=n_bits.get(),
+                    sparseness=max(0.01, sparse_pct.get() / 100.0),
+                    n_regions=n_regions.get(),
+                    do_regions=do_regions.get(),
+                    do_anomaly=do_anomaly.get(),
+                    projection=proj_var.get(),
+                    connectivity=_conn,
+                )
+            except Exception as exc:
+                self._show_progress(False)
+                messagebox.showerror("FlyHash failed", str(exc), parent=dlg)
+                return
+            self._show_progress(False)
+
+            shown = None
+            if reg is not None:
+                self._saved_maps["FlyHash Regions"] = reg.copy()
+                shown = "FlyHash Regions"
+            if ano is not None:
+                self._saved_maps["FlyHash Anomaly"] = ano.copy()
+                shown = "FlyHash Anomaly"   # show anomaly last (usually most useful)
+
+            made = ", ".join(n for n, v in
+                             [("Regions", reg is not None), ("Anomaly", ano is not None)]
+                             if v)
+            status_lbl.config(text=f"✓  Saved FlyHash {made}. "
+                                   f"Bright = rare pixels.", fg=C["success"])
+            if shown:
+                self._show_saved_map(shown)
+            self._status.set(f"FlyHash maps created ({made}).")
+
+        btn_row = tk.Frame(dlg, bg=C["bg"])
+        btn_row.pack(fill="x", padx=16, pady=8)
+        ttk.Button(btn_row, text="Run FlyHash", style="Primary.TButton",
+                   command=run).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Close", style="Neutral.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+
     # ── UNIVARIATE ANALYSIS ───────────────────────────────────────────────────
     def open_univariate(self):
         """Raw-data univariate map dialog (intensity at point / signal to baseline/axis)."""
@@ -6403,6 +6980,153 @@ class RamanApp(tk.Tk):
                    command=create).pack(side="left", padx=4)
         ttk.Button(btn_row, text="Close", style="Neutral.TButton",
                    command=dlg.destroy).pack(side="left", padx=4)
+
+    # ── CELL MASK / BACKGROUND REJECTION ───────────────────────────────────────
+    def open_cell_mask(self):
+        """Auto-separate cell pixels from buffer (e.g. PBS) and reject background.
+
+        Builds a CH-stretch (2850–2950 cm⁻¹) SNR map — where cells are bright and
+        buffer is nearly silent — thresholds it into a cell mask, estimates the
+        background spectrum from the non-cell pixels, and can subtract it from the
+        whole cube so downstream analysis sees clean, background-free spectra.
+        """
+        if self.spectra is None or self.xdata is None:
+            messagebox.showwarning("No data", "Load and preprocess a map first.",
+                                   parent=self)
+            return
+        cube = self.spectra
+        wn = np.asarray(self.xdata, dtype=float)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Cell Mask / Background Rejection")
+        dlg.geometry("1080x720")
+        dlg.configure(bg=C["bg"])
+
+        hdr = tk.Frame(dlg, bg=C["header"], height=46)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="🧫  CELL MASK / BACKGROUND REJECTION",
+                 bg=C["header"], fg="white",
+                 font=("Consolas", 13, "bold")).pack(side="left", padx=16, pady=12)
+
+        ctl = tk.Frame(dlg, bg=C["sidebar"])
+        ctl.pack(fill="x", padx=0, pady=0)
+        def _sp(parent, label, val, frm, to, inc=1.0, w=7):
+            tk.Label(parent, text=label, bg=C["sidebar"], fg=C["text_mid"],
+                     font=("Segoe UI", 9)).pack(side="left", padx=(8, 2))
+            v = tk.DoubleVar(value=val)
+            ttk.Spinbox(parent, from_=frm, to=to, increment=inc,
+                        textvariable=v, width=w).pack(side="left")
+            return v
+
+        row1 = tk.Frame(ctl, bg=C["sidebar"]); row1.pack(fill="x", pady=(8, 2))
+        cell_lo = _sp(row1, "Cell band lo", 2850, 0, 4000, 10)
+        cell_hi = _sp(row1, "hi", 2950, 0, 4000, 10)
+        noise_lo = _sp(row1, "Noise band lo", 1750, 0, 4000, 10)
+        noise_hi = _sp(row1, "hi", 1850, 0, 4000, 10)
+
+        row2 = tk.Frame(ctl, bg=C["sidebar"]); row2.pack(fill="x", pady=(2, 8))
+        tk.Label(row2, text="Threshold", bg=C["sidebar"], fg=C["text_mid"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 2))
+        method = tk.StringVar(value="Otsu")
+        ttk.Combobox(row2, textvariable=method, values=("Otsu", "Percentile"),
+                     state="readonly", width=11).pack(side="left")
+        min_snr = _sp(row2, "min SNR", 3.0, 0, 50, 0.5, w=6)
+        pct = _sp(row2, "percentile", 75.0, 0, 100, 1.0, w=6)
+        nan_bg = tk.BooleanVar(value=True)
+        tk.Checkbutton(row2, text="blank background pixels (NaN)",
+                       variable=nan_bg, bg=C["sidebar"], fg=C["text_mid"],
+                       activebackground=C["sidebar"],
+                       font=("Segoe UI", 9)).pack(side="left", padx=10)
+
+        fig = plt.figure(figsize=(10.5, 4.6), facecolor="#ffffff")
+        axes = [fig.add_subplot(1, 3, i + 1) for i in range(3)]
+        canvas = FigureCanvasTkAgg(fig, master=dlg)
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=6)
+        NavigationToolbar2Tk(canvas, dlg).update()
+
+        state = {"res": None}
+
+        def compute():
+            try:
+                res = cell_mask_analysis(
+                    cube, wn,
+                    cell_lo=cell_lo.get(), cell_hi=cell_hi.get(),
+                    noise_lo=noise_lo.get(), noise_hi=noise_hi.get(),
+                    min_snr=min_snr.get(), method=method.get(),
+                    percentile=pct.get())
+            except Exception as ex:
+                messagebox.showerror("Cell mask", str(ex), parent=dlg)
+                return
+            state["res"] = res
+            for ax in axes:
+                ax.clear()
+            cell_band = res["area"]
+            im0 = axes[0].imshow(cell_band, cmap="magma")
+            axes[0].set_title(f"Cell-band area\n{res['band'][0]:.0f}–"
+                              f"{res['band'][1]:.0f} cm⁻¹", fontsize=9)
+            im1 = axes[1].imshow(res["mask"], cmap="Greens")
+            frac = 100.0 * res["mask"].mean()
+            axes[1].set_title(f"Cell mask  ({frac:.0f}% pixels)\n"
+                              f"SNR ≥ {res['threshold']:.1f}", fontsize=9)
+            im2 = axes[2].imshow(res["snr"], cmap="viridis")
+            axes[2].set_title("Per-pixel SNR", fontsize=9)
+            for ax in axes:
+                ax.axis("off")
+            fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            canvas.draw_idle()
+            self._status.set(
+                f"Cell mask: {frac:.0f}% cell pixels, SNR≥{res['threshold']:.1f}")
+
+        def save_maps():
+            res = state["res"]
+            if res is None:
+                messagebox.showinfo("Cell mask", "Run Compute first.", parent=dlg)
+                return
+            self._saved_maps["Cell mask"] = res["mask"].astype(float)
+            self._saved_maps["Cell SNR"] = res["snr"]
+            self._saved_maps["Cell-band area"] = res["area"]
+            messagebox.showinfo(
+                "Cell mask",
+                "Saved 'Cell mask', 'Cell SNR' and 'Cell-band area' to the map "
+                "list (use Ratio Map / Save Map).", parent=dlg)
+
+        def apply_bgsub():
+            res = state["res"]
+            if res is None:
+                messagebox.showinfo("Cell mask", "Run Compute first.", parent=dlg)
+                return
+            if not messagebox.askyesno(
+                "Background subtraction",
+                "Subtract the estimated background (buffer) spectrum from every "
+                "pixel of the current map?\n\nThe raw cube is backed up and can be "
+                "restored with Preprocessing → Reprocess.", parent=dlg):
+                return
+            if not hasattr(self, "_spectra_prebg") or self._spectra_prebg is None:
+                self._spectra_prebg = self.spectra.copy()
+            cleaned = self.spectra.astype(float) - res["background_spectrum"][None, None, :]
+            if nan_bg.get():
+                cleaned[~res["mask"]] = np.nan
+            self.spectra = cleaned
+            self._status.set("Background subtracted"
+                             + (" · background pixels blanked" if nan_bg.get() else ""))
+            messagebox.showinfo(
+                "Background subtraction",
+                "Done. Re-run PCA / clustering to use the cleaned, cell-only "
+                "spectra. (Preprocessing → Reprocess restores the raw cube.)",
+                parent=dlg)
+
+        bar = tk.Frame(dlg, bg=C["bg"]); bar.pack(fill="x", padx=8, pady=6)
+        ttk.Button(bar, text="▶  Compute", style="Primary.TButton",
+                   command=compute).pack(side="left", padx=4)
+        ttk.Button(bar, text="💾  Save mask + SNR to maps", style="Neutral.TButton",
+                   command=save_maps).pack(side="left", padx=4)
+        ttk.Button(bar, text="🧹  Apply background subtraction",
+                   style="Neutral.TButton", command=apply_bgsub).pack(side="left", padx=4)
+        ttk.Button(bar, text="Close", style="Neutral.TButton",
+                   command=dlg.destroy).pack(side="right", padx=4)
+
+        compute()
 
     # ── LUT CONTROL ───────────────────────────────────────────────────────────
     def open_lut_control(self):
@@ -8089,7 +8813,366 @@ BAND_LIBRARIES = {
         (812,  "PMMA: C–O–C (acrylic)"),
         (1635, "Nylon/PA: amide I"),
     ],
+
+    # ====================================================================
+    # RamanBioLib - 135 biomolecules, ODbL-1.0 (Teran et al. 2025).
+    # Auto-generated diagnostic peaks (rel.I >= 0.40), grouped by wavenumber.
+    "Biology / RamanBioLib (135 biomolecules)": [
+        (452, "RamanBioLib: l-proline"),
+        (477, "RamanBioLib: amylopectin, lactose"),
+        (481, "RamanBioLib: amylose"),
+        (485, "RamanBioLib: glycerol"),
+        (495, "RamanBioLib: d-(+)-mannose"),
+        (498, "RamanBioLib: chitin"),
+        (499, "RamanBioLib: papain"),
+        (504, "RamanBioLib: glycine"),
+        (513, "RamanBioLib: n-acetyl- d-glucosamine"),
+        (515, "RamanBioLib: l-serine"),
+        (523, "RamanBioLib: d-(+)-trehalose"),
+        (526, "RamanBioLib: d-(+)-xylose"),
+        (530, "RamanBioLib: d-(+)-galactosamine, d-(+)-mannose"),
+        (540, "RamanBioLib: d-(+)-trehalose"),
+        (541, "RamanBioLib: d-(+)-dextrose"),
+        (542, "RamanBioLib: β-d-glucose, l-valine"),
+        (548, "RamanBioLib: cytosine"),
+        (566, "RamanBioLib: ascorbic acid"),
+        (578, "RamanBioLib: n-acetyl- d-glucosamine"),
+        (611, "RamanBioLib: malic acid, l-serine"),
+        (617, "RamanBioLib: thymine"),
+        (625, "RamanBioLib: glutathione"),
+        (626, "RamanBioLib: d-(-)-fructose"),
+        (629, "RamanBioLib: ascorbic acid"),
+        (631, "RamanBioLib: acetyl coenzyme a"),
+        (640, "RamanBioLib: acetoacetate"),
+        (642, "RamanBioLib: l-proline"),
+        (643, "RamanBioLib: papain"),
+        (650, "RamanBioLib: guanine"),
+        (660, "RamanBioLib: glutathione"),
+        (669, "RamanBioLib: d-(+)-fucose"),
+        (679, "RamanBioLib: glutathione"),
+        (701, "RamanBioLib: cholesterol"),
+        (719, "RamanBioLib: l-α-phosphatidylcholine"),
+        (722, "RamanBioLib: coenzyme a"),
+        (723, "RamanBioLib: adenine"),
+        (724, "RamanBioLib: acetyl coenzyme a"),
+        (740, "RamanBioLib: thymine"),
+        (749, "RamanBioLib: malic acid"),
+        (751, "RamanBioLib: hemoglobin, myoglobin"),
+        (755, "RamanBioLib: l-tryptophan"),
+        (761, "RamanBioLib: lactalbumin"),
+        (762, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
+        (764, "RamanBioLib: elastase"),
+        (765, "RamanBioLib: lactalbumin"),
+        (776, "RamanBioLib: l-valine, glutathione"),
+        (784, "RamanBioLib: citric acid"),
+        (787, "RamanBioLib: phosphoenolpyruvate"),
+        (790, "RamanBioLib: uracil, n-acetyl- d-glucosamine"),
+        (792, "RamanBioLib: cytosine"),
+        (813, "RamanBioLib: l-serine"),
+        (815, "RamanBioLib: d-(+)-fucose"),
+        (818, "RamanBioLib: d-(-)-fructose"),
+        (820, "RamanBioLib: ascorbic acid, glycerol"),
+        (828, "RamanBioLib: l-tyrosine"),
+        (830, "RamanBioLib: acetoacetate, d-(+)-mannose, papain"),
+        (834, "RamanBioLib: l-proline, papain, pyruvate"),
+        (838, "RamanBioLib: d-(+)-trehalose, ferritin"),
+        (841, "RamanBioLib: β-d-glucose, d-(+)-dextrose"),
+        (842, "RamanBioLib: l-proline"),
+        (843, "RamanBioLib: d-(-)-arabinose"),
+        (849, "RamanBioLib: l-valine"),
+        (850, "RamanBioLib: glycerol, l-proline"),
+        (851, "RamanBioLib: l-alanine"),
+        (853, "RamanBioLib: l-serine"),
+        (854, "RamanBioLib: amylose"),
+        (856, "RamanBioLib: papain, glutathione transferase"),
+        (857, "RamanBioLib: l-glutamate, papain"),
+        (859, "RamanBioLib: collagen"),
+        (861, "RamanBioLib: d-(+)-mannose"),
+        (862, "RamanBioLib: collagen"),
+        (872, "RamanBioLib: d-(+)-galactosamine, d-(-)-fructose"),
+        (874, "RamanBioLib: l-tryptophan"),
+        (877, "RamanBioLib: pepsin, l-proline"),
+        (879, "RamanBioLib: d-(+)-fucose"),
+        (882, "RamanBioLib: d-(+)-mannose"),
+        (885, "RamanBioLib: glutathione, collagen"),
+        (890, "RamanBioLib: pepsin"),
+        (894, "RamanBioLib: glycine"),
+        (895, "RamanBioLib: chitin"),
+        (899, "RamanBioLib: l-proline"),
+        (903, "RamanBioLib: d-(+)-xylose"),
+        (912, "RamanBioLib: d-(+)-trehalose"),
+        (914, "RamanBioLib: β-d-glucose"),
+        (916, "RamanBioLib: l-proline, lactose"),
+        (917, "RamanBioLib: glutathione"),
+        (924, "RamanBioLib: collagen"),
+        (926, "RamanBioLib: papain"),
+        (928, "RamanBioLib: acetoacetate"),
+        (929, "RamanBioLib: n-acetyl- d-glucosamine"),
+        (930, "RamanBioLib: l-proline"),
+        (931, "RamanBioLib: papain, glutathione"),
+        (933, "RamanBioLib: papain"),
+        (936, "RamanBioLib: succinic acid, amylose"),
+        (940, "RamanBioLib: amylopectin, collagen"),
+        (942, "RamanBioLib: l-glutamate, citric acid"),
+        (944, "RamanBioLib: amylose"),
+        (945, "RamanBioLib: albumin"),
+        (948, "RamanBioLib: l-valine"),
+        (955, "RamanBioLib: chitin"),
+        (964, "RamanBioLib: malic acid"),
+        (973, "RamanBioLib: n-acetyl- d-glucosamine, d-fructose-6-phosphate"),
+        (982, "RamanBioLib: l-arginine"),
+        (994, "RamanBioLib: l-proline"),
+        (1003, "RamanBioLib: lectin, ferritin, lactalbumin"),
+        (1004, "RamanBioLib: l-phenylalanine, carbonic anhydrase, albumin, pepsin"),
+        (1005, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
+        (1006, "RamanBioLib: carbonic anhydrase, glutathione transferase"),
+        (1007, "RamanBioLib: carbonic anhydrase, albumin"),
+        (1008, "RamanBioLib: lactalbumin, ferritin, l-serine"),
+        (1009, "RamanBioLib: lectin, l-tryptophan, elastase, albumin, lactalbumin"),
+        (1010, "RamanBioLib: pepsinogen, glutathione transferase"),
+        (1011, "RamanBioLib: lectin, papain, α-chymotrypsinogen a (type ii)"),
+        (1014, "RamanBioLib: elastase"),
+        (1020, "RamanBioLib: n-acetyl- d-glucosamine"),
+        (1021, "RamanBioLib: lactose"),
+        (1031, "RamanBioLib: lactose"),
+        (1034, "RamanBioLib: phosphoenolpyruvate"),
+        (1035, "RamanBioLib: l-proline"),
+        (1036, "RamanBioLib: elastase, pepsinogen"),
+        (1038, "RamanBioLib: lectin"),
+        (1042, "RamanBioLib: pepsin"),
+        (1045, "RamanBioLib: l-proline, amylose"),
+        (1053, "RamanBioLib: lactose"),
+        (1054, "RamanBioLib: β-d-glucose"),
+        (1055, "RamanBioLib: glycerol"),
+        (1059, "RamanBioLib: chitin"),
+        (1061, "RamanBioLib: 14-methylpentadecanoic acid, lauric acid, tristearin, d-(+)-trehalose"),
+        (1062, "RamanBioLib: myristic acid, trimyristin, tripalmitin, d-(+)-galactosamine, stearic acid"),
+        (1063, "RamanBioLib: myristic acid, palmitic acid, tricaprin, trilaurin"),
+        (1066, "RamanBioLib: arachidic acid"),
+        (1067, "RamanBioLib: palmitic acid, l-arginine, stearic acid"),
+        (1075, "RamanBioLib: β-d-glucose, d-(+)-dextrose"),
+        (1080, "RamanBioLib: d-(+)-trehalose"),
+        (1081, "RamanBioLib: triolein"),
+        (1082, "RamanBioLib: amylopectin"),
+        (1083, "RamanBioLib: amylose"),
+        (1085, "RamanBioLib: l-α-phosphatidylethanolamine"),
+        (1086, "RamanBioLib: d-(+)-xylose"),
+        (1087, "RamanBioLib: d-(+)-mannose, lactose"),
+        (1089, "RamanBioLib: l-α-phosphatidylcholine"),
+        (1096, "RamanBioLib: cellulose, l-α-phosphatidylethanolamine, l-α-phosphatidylcholine"),
+        (1098, "RamanBioLib: 12-methyltetradecanoic acid"),
+        (1102, "RamanBioLib: d-(+)-trehalose"),
+        (1106, "RamanBioLib: d-(+)-mannose"),
+        (1107, "RamanBioLib: chitin"),
+        (1108, "RamanBioLib: d-(+)-dextrose"),
+        (1109, "RamanBioLib: amylopectin"),
+        (1110, "RamanBioLib: glycerol"),
+        (1111, "RamanBioLib: trierucin"),
+        (1113, "RamanBioLib: d-(+)-fucose"),
+        (1115, "RamanBioLib: d-(+)-xylose"),
+        (1120, "RamanBioLib: d-(+)-trehalose, lactose, β-d-glucose, cellulose"),
+        (1123, "RamanBioLib: amylose"),
+        (1125, "RamanBioLib: myristic acid, tricaprin"),
+        (1126, "RamanBioLib: n-acetyl- d-glucosamine"),
+        (1127, "RamanBioLib: lauric acid, trilaurin, amylopectin, pepsinogen"),
+        (1128, "RamanBioLib: myristic acid"),
+        (1129, "RamanBioLib: palmitic acid, trimyristin, sphingomyelin, d-(+)-fucose"),
+        (1130, "RamanBioLib: ascorbic acid, tripalmitin, tristearin"),
+        (1131, "RamanBioLib: hemoglobin, myoglobin, triarachidin, tribehenin, cholesteryl palmitate"),
+        (1132, "RamanBioLib: palmitic acid, arachidic acid"),
+        (1133, "RamanBioLib: cholesteryl stearate"),
+        (1135, "RamanBioLib: 14-methylpentadecanoic acid, 15-methylpalmiticacid"),
+        (1141, "RamanBioLib: 12-methyltetradecanoic acid"),
+        (1142, "RamanBioLib: lactose"),
+        (1143, "RamanBioLib: d-(+)-galactosamine"),
+        (1149, "RamanBioLib: d-(+)-trehalose, chitin"),
+        (1155, "RamanBioLib: d-(+)-fucose"),
+        (1156, "RamanBioLib: β-carotene"),
+        (1178, "RamanBioLib: cholesterol"),
+        (1226, "RamanBioLib: riboﬂavin"),
+        (1234, "RamanBioLib: guanine"),
+        (1235, "RamanBioLib: uracil"),
+        (1236, "RamanBioLib: carbonic anhydrase, lectin, elastase"),
+        (1237, "RamanBioLib: carbonic anhydrase"),
+        (1239, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
+        (1240, "RamanBioLib: elastase, α-chymotrypsinogen a (type ii), l-proline"),
+        (1241, "RamanBioLib: carbonic anhydrase"),
+        (1245, "RamanBioLib: pepsin"),
+        (1246, "RamanBioLib: lectin"),
+        (1247, "RamanBioLib: pepsinogen"),
+        (1248, "RamanBioLib: pepsin"),
+        (1249, "RamanBioLib: elastase"),
+        (1254, "RamanBioLib: pepsin"),
+        (1256, "RamanBioLib: ascorbic acid, d-(+)-fucose"),
+        (1257, "RamanBioLib: n-acetyl- d-glucosamine"),
+        (1258, "RamanBioLib: papain, lactalbumin"),
+        (1261, "RamanBioLib: lactose"),
+        (1262, "RamanBioLib: papain, linoleic acid"),
+        (1263, "RamanBioLib: cholesteryl linoleate, α-linolenic acid"),
+        (1265, "RamanBioLib: lactalbumin, d-(-)-fructose"),
+        (1267, "RamanBioLib: d-(+)-galactosamine, l-proline"),
+        (1270, "RamanBioLib: papain"),
+        (1271, "RamanBioLib: collagen, l-histidine"),
+        (1272, "RamanBioLib: lactalbumin"),
+        (1273, "RamanBioLib: d-(+)-fucose, collagen"),
+        (1275, "RamanBioLib: cytosine"),
+        (1278, "RamanBioLib: papain"),
+        (1280, "RamanBioLib: glutathione"),
+        (1286, "RamanBioLib: glutathione transferase"),
+        (1293, "RamanBioLib: fumarate"),
+        (1294, "RamanBioLib: myristic acid"),
+        (1295, "RamanBioLib: sphingomyelin"),
+        (1296, "RamanBioLib: palmitic acid, tribehenin, lauric acid, 15-methylpalmiticacid, 14-methylpentadecanoic acid"),
+        (1297, "RamanBioLib: trilaurin, triarachidin, trimyristin, tristearin, tripalmitin"),
+        (1298, "RamanBioLib: arachidic acid"),
+        (1299, "RamanBioLib: tricaprin"),
+        (1300, "RamanBioLib: palmitic acid, l-α-phosphatidylethanolamine, stearic acid, l-α-phosphatidylcholine"),
+        (1301, "RamanBioLib: triolein, oleic acid"),
+        (1302, "RamanBioLib: vaccenic acid, triolein, 12-methyltetradecanoic acid"),
+        (1303, "RamanBioLib: tri-11-eicosenoin"),
+        (1304, "RamanBioLib: tripalmitolein"),
+        (1305, "RamanBioLib: l-alanine, palmitoleic acid, tricaprylin"),
+        (1306, "RamanBioLib: oleic acid, tricaproin, cholesteryl linoleate, cholesteryl oleate, acetyl coenzyme a"),
+        (1308, "RamanBioLib: myoglobin"),
+        (1310, "RamanBioLib: hemoglobin"),
+        (1317, "RamanBioLib: l-histidine"),
+        (1319, "RamanBioLib: albumin, ascorbic acid"),
+        (1321, "RamanBioLib: albumin, n-acetyl- d-glucosamine"),
+        (1323, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
+        (1325, "RamanBioLib: coenzyme a"),
+        (1326, "RamanBioLib: l-serine, lactose"),
+        (1328, "RamanBioLib: albumin, chitin"),
+        (1330, "RamanBioLib: d-(+)-trehalose, n-acetyl- d-glucosamine"),
+        (1331, "RamanBioLib: d-(+)-fucose"),
+        (1332, "RamanBioLib: α-chymotrypsinogen a (type ii), adenine"),
+        (1333, "RamanBioLib: acetyl coenzyme a"),
+        (1334, "RamanBioLib: papain, pepsin, glutathione"),
+        (1335, "RamanBioLib: lectin, carbonic anhydrase"),
+        (1336, "RamanBioLib: pepsin"),
+        (1339, "RamanBioLib: papain, elastase, amylose"),
+        (1340, "RamanBioLib: ferritin, albumin, α-chymotrypsinogen a (type ii)"),
+        (1341, "RamanBioLib: albumin, l-glutamate"),
+        (1342, "RamanBioLib: carbonic anhydrase, glutathione transferase, pepsin, lectin, elastase"),
+        (1343, "RamanBioLib: lactalbumin, glutathione transferase, ferritin, α-chymotrypsinogen a (type ii)"),
+        (1344, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
+        (1345, "RamanBioLib: riboﬂavin, lectin"),
+        (1346, "RamanBioLib: carbonic anhydrase"),
+        (1347, "RamanBioLib: elastase, papain"),
+        (1351, "RamanBioLib: l-valine"),
+        (1358, "RamanBioLib: d-(+)-trehalose, l-tryptophan"),
+        (1359, "RamanBioLib: l-alanine, lactose"),
+        (1360, "RamanBioLib: hemoglobin"),
+        (1369, "RamanBioLib: thymine"),
+        (1370, "RamanBioLib: horseradish peroxidase"),
+        (1371, "RamanBioLib: chitin, d-(+)-trehalose"),
+        (1377, "RamanBioLib: horseradish peroxidase"),
+        (1378, "RamanBioLib: l-proline"),
+        (1379, "RamanBioLib: amylose"),
+        (1380, "RamanBioLib: myoglobin, lactose, n-acetyl- d-glucosamine"),
+        (1389, "RamanBioLib: l-proline"),
+        (1399, "RamanBioLib: acetoacetate"),
+        (1401, "RamanBioLib: l-glutamate"),
+        (1407, "RamanBioLib: coenzyme a"),
+        (1408, "RamanBioLib: pyruvate"),
+        (1414, "RamanBioLib: chitin"),
+        (1420, "RamanBioLib: succinic acid, coenzyme a"),
+        (1421, "RamanBioLib: palmitic acid, l-glutamate"),
+        (1422, "RamanBioLib: acetoacetate, myristic acid"),
+        (1423, "RamanBioLib: l-tryptophan"),
+        (1426, "RamanBioLib: palmitic acid"),
+        (1428, "RamanBioLib: cholesteryl stearate"),
+        (1430, "RamanBioLib: fumarate"),
+        (1433, "RamanBioLib: myristic acid"),
+        (1434, "RamanBioLib: l-glutamate"),
+        (1436, "RamanBioLib: l-arginine"),
+        (1437, "RamanBioLib: sphingomyelin"),
+        (1438, "RamanBioLib: trielaidin, palmitic acid, myristic acid, linoleic acid"),
+        (1439, "RamanBioLib: vaccenic acid"),
+        (1440, "RamanBioLib: triolein, oleic acid, tri-11-eicosenoin, 12-methyltetradecanoic acid"),
+        (1441, "RamanBioLib: trierucin, elaidic acid, stearic acid, cholesteryl oleate, 14-methylhexadecanoic acid"),
+        (1442, "RamanBioLib: cholesteryl palmitate, cholesteryl linoleate, cholesterol, l-α-phosphatidylcholine, tricaprylin"),
+        (1443, "RamanBioLib: tricaprin, trimyristin, tristearin, palmitic acid"),
+        (1444, "RamanBioLib: cholesteryl stearate, oleic acid, tricaproin, tripalmitolein, tripetroselinin"),
+        (1445, "RamanBioLib: stearic acid, lactalbumin, papain, 14-methylpentadecanoic acid"),
+        (1446, "RamanBioLib: lauric acid, phosphoenolpyruvate"),
+        (1447, "RamanBioLib: 12-methyltetradecanoic acid, 13-methylmyristicacid"),
+        (1448, "RamanBioLib: 15-methylpalmiticacid"),
+        (1449, "RamanBioLib: ferritin, elastase, pepsin"),
+        (1450, "RamanBioLib: collagen, albumin, carbonic anhydrase, lectin"),
+        (1451, "RamanBioLib: α-chymotrypsinogen a (type ii), lectin"),
+        (1452, "RamanBioLib: papain, lactalbumin, lectin, α-chymotrypsinogen a (type ii), d-(+)-fucose"),
+        (1453, "RamanBioLib: collagen, elastase, carbonic anhydrase"),
+        (1454, "RamanBioLib: glutathione transferase, pepsin, albumin, tricaprin"),
+        (1455, "RamanBioLib: glutathione transferase"),
+        (1456, "RamanBioLib: collagen, ferritin, tripetroselinin"),
+        (1457, "RamanBioLib: elastase, pepsinogen"),
+        (1459, "RamanBioLib: trilaurin, 12-methyltetradecanoic acid, lauric acid"),
+        (1460, "RamanBioLib: α-chymotrypsinogen a (type ii), lectin"),
+        (1461, "RamanBioLib: ferritin"),
+        (1462, "RamanBioLib: trierucin, l-serine, l-alanine"),
+        (1463, "RamanBioLib: trielaidin, stearic acid"),
+        (1464, "RamanBioLib: 15-methylpalmiticacid, cholesteryl palmitate, elaidic acid"),
+        (1465, "RamanBioLib: glycerol, trimyristin, tristearin, 14-methylpentadecanoic acid, 14-methylhexadecanoic acid"),
+        (1466, "RamanBioLib: tribehenin, tripalmitin, stearic acid, arachidic acid"),
+        (1467, "RamanBioLib: triarachidin, palmitic acid"),
+        (1468, "RamanBioLib: cholesteryl stearate"),
+        (1469, "RamanBioLib: 13-methylmyristicacid"),
+        (1472, "RamanBioLib: 12-methyltetradecanoic acid"),
+        (1482, "RamanBioLib: l-alanine"),
+        (1515, "RamanBioLib: β-carotene"),
+        (1553, "RamanBioLib: carbonic anhydrase"),
+        (1554, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
+        (1555, "RamanBioLib: lactalbumin, elastase"),
+        (1556, "RamanBioLib: elastase, lactalbumin"),
+        (1560, "RamanBioLib: horseradish peroxidase"),
+        (1575, "RamanBioLib: horseradish peroxidase"),
+        (1585, "RamanBioLib: myoglobin, hemoglobin"),
+        (1610, "RamanBioLib: albumin"),
+        (1615, "RamanBioLib: ferritin, papain"),
+        (1617, "RamanBioLib: papain, pepsin"),
+        (1618, "RamanBioLib: papain"),
+        (1619, "RamanBioLib: lactalbumin, carbonic anhydrase"),
+        (1620, "RamanBioLib: elastase, glutathione transferase, carbonic anhydrase"),
+        (1622, "RamanBioLib: glutathione transferase"),
+        (1623, "RamanBioLib: pepsinogen"),
+        (1625, "RamanBioLib: elastase"),
+        (1630, "RamanBioLib: horseradish peroxidase"),
+        (1632, "RamanBioLib: horseradish peroxidase"),
+        (1640, "RamanBioLib: myoglobin, trilinolenin, hemoglobin"),
+        (1653, "RamanBioLib: arachidonic acid, ascorbic acid"),
+        (1654, "RamanBioLib: α-linolenic acid, linoleic acid, trilinolein"),
+        (1655, "RamanBioLib: trilinolenin, palmitoleic acid, vaccenic acid, oleic acid, triolein"),
+        (1656, "RamanBioLib: trilinolenin, albumin, tripalmitolein, tri-11-eicosenoin"),
+        (1657, "RamanBioLib: albumin, trilinolein, oleic acid, l-α-phosphatidylethanolamine"),
+        (1658, "RamanBioLib: ferritin"),
+        (1660, "RamanBioLib: trierucin"),
+        (1661, "RamanBioLib: ferritin"),
+        (1662, "RamanBioLib: glutathione transferase, cholesteryl linoleate, ferritin"),
+        (1664, "RamanBioLib: glutathione transferase"),
+        (1665, "RamanBioLib: lactalbumin, carbonic anhydrase, papain"),
+        (1666, "RamanBioLib: collagen"),
+        (1667, "RamanBioLib: lectin, ascorbic acid, carbonic anhydrase"),
+        (1668, "RamanBioLib: collagen, papain, α-chymotrypsinogen a (type ii)"),
+        (1669, "RamanBioLib: α-chymotrypsinogen a (type ii), carbonic anhydrase, elastase, pepsin"),
+        (1670, "RamanBioLib: lactalbumin"),
+        (1671, "RamanBioLib: thymine, elastase, pepsin"),
+        (1672, "RamanBioLib: α-chymotrypsinogen a (type ii), papain, cholesterol, trielaidin"),
+        (1675, "RamanBioLib: pepsin"),
+        (1676, "RamanBioLib: elastase, lectin, pepsinogen"),
+        (1679, "RamanBioLib: lectin"),
+        (1700, "RamanBioLib: pyruvate"),
+        (1703, "RamanBioLib: acetoacetate"),
+        (1715, "RamanBioLib: acetoacetate"),
+    ],
 }
+
+# Merge the RamanBioLib reference bands into the Cryopreservation library so the
+# 135-biomolecule set is available within the default biology library (no
+# separate dropdown entry / external CSV needed).
+BAND_LIBRARIES["Biology / Cryopreservation"] = (
+    BAND_LIBRARIES["Biology / Cryopreservation"]
+    + BAND_LIBRARIES.pop("Biology / RamanBioLib (135 biomolecules)")
+)
 
 # Active library (mutable; the Peak-ID window can switch it).  Default = biology.
 RAMAN_BANDS = BAND_LIBRARIES["Biology / Cryopreservation"]

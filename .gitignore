@@ -36,6 +36,10 @@ Thumbs.db
 .pytest_cache/
 .coverage
 
+# PCA Studio is its own standalone project/repo, kept inside this folder for
+# convenience only — never part of the BioRaman repo
+pca-studio/
+
 # Local working backups / generated presentation artefacts (not part of the release)
 bioraman_backup_*.py
 BioRaman_Live_Demo.pptx
@@ -45,8 +49,22 @@ BioRaman_tool_comparison.html
 
 # Keep the bundled example dataset (small enough to ship; see example/README.md)
 !example/
-!example/*.wdf
 !example/*.pdf
 !example/*.png
 example/.DS_Store
+
+# Large / licence-restricted raw data — not redistributed in the repo
+example/*.wdf
+example/*.wip
+pcrs_library/
+raman-augment/
+FlyHash_Connectome_Study/
+
+# Local working copies of the main app (canonical file is bioraman.py)
+bioraman16*.py
+bioraman_pupae.py
+
+# Generated documents / artefacts (not part of the release)
+*.docx
+*.pptx
 example/paracetamol.wdf

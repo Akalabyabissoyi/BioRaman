@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > algorithms, numerical defaults, preprocessing) are flagged with **[OUTPUT]**
 > and always trigger at least a MINOR version bump.
 
+## [1.1.0] - 2026-06-20
+
+New feature release: a scalable PCA workflow and an expanded peak-assignment
+library. No changes to existing analytical defaults.
+
+### Added
+- **PCA Studio — scalable, publication-grade PCA, built into BioRaman.** A new
+  *Analysis → PCA Studio* window backed by an out-of-core engine
+  (`pca_core.py`, batched `IncrementalPCA`) that streams through 10⁵–10⁶
+  spectra instead of loading a single dense matrix, removing the practical
+  dataset-size ceiling of the original PCA window. It adds standard / robust /
+  sparse PCA variants, Hotelling's T² and Q-residual (SPE) diagnostics with 95%
+  control limits, PLS-DA / LDA classification and k-means / agglomerative /
+  HDBSCAN clustering on the scores, and colour-blind-safe (Okabe–Ito) 600 dpi
+  PNG / vector PDF/SVG export with density rendering for large point clouds.
+  PCA Studio runs both standalone (`python pca_studio.py`) and embedded, and
+  can ingest the map currently loaded in BioRaman or load its own files
+  (`.wdf`, `.csv`, `.txt`, `.dpt`, `.xlsx`).
+- **Expanded RamanBioLib peak/band reference** (`ramanbiolib_bands.py` plus
+  `build_ramanbiolib_library.py` / `build_pcrs_library.py`) for more reliable
+  band-to-biomolecule assignment across proteins, lipids and nucleic acids.
+
+### Changed
+- `bioraman.py` is now the single canonical application file and includes the
+  PCA Studio integration.
+- `.gitignore` updated to exclude large / licence-restricted raw data and local
+  working copies from the repository.
+
+## [1.0.6] - 2026-06-11
+
+Usability improvements to the PCA window. No analytical results are affected.
+
+### Added
+- **Adjustable marker size on the PC1 vs PC2 scores plot.** A new *Point size*
+  control lets dense score clouds resolve instead of overlapping into a single
+  blob; the default marker size is reduced accordingly. The setting also applies
+  to the publication-quality panel export.
+- **Manual aspect ratio for the scores plot.** A new *Aspect (H/W)* control sets
+  the panel's height-to-width ratio (`0` = auto). Stretching the plot helps
+  separate clusters that are compressed along one principal component.
+
+### Changed
+- **The PCA window's left control panel is now scrollable.** Previously the
+  lower controls could be clipped off the bottom edge on shorter windows; all
+  options are now reachable via scrollbar or mouse wheel.
+
 ## [1.0.5] - 2026-06-10
 
 Robustness & scientific-correctness hardening from a static assessment of the
