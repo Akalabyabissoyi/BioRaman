@@ -60,11 +60,47 @@ pcrs_library/
 raman-augment/
 FlyHash_Connectome_Study/
 
+# Personal-only library overlay (private; extends the public set locally)
+ramanbiolib_personal.py
+pcrs_library_personal/
+
 # Local working copies of the main app (canonical file is bioraman.py)
 bioraman16*.py
 bioraman_pupae.py
+bioramanv*.py
+bioraman[0-9]*.py
+bioraman [0-9]*.py
+
+# Archived old app copies (kept locally for reference, not part of the release)
+archive/
+
+# Working drafts / notes (not part of the release)
+CRYO-VIBE_Future_Directions.md
+CRYO-VIBE_Revised_Sections.md
+Figure1_layout_and_methods.md
+LinkedIn_Post.md
 
 # Generated documents / artefacts (not part of the release)
 *.docx
 *.pptx
 example/paracetamol.wdf
+
+# ── Unpublished manuscript, raw study data & derived results (DO NOT PUBLISH) ──
+Manuscript_Cryo-Raman_Polyampholyte/
+JK DATA/
+data for paper/
+# Analysis Planner local preference file
+.bioraman_planner.json
+# Catch-all for result containers that may hold unpublished data
+*.npz
+summary*.json
+rigor*.json
+
+.bioraman_presets.json
+
+# double-click launchers (local convenience only)
+*.command
+
+# marketing / comparison artefacts (not part of the codebase)
+BioRaman_tool_comparison.html
+LinkedIn_Post*.md

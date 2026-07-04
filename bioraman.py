@@ -21,6 +21,18 @@ copies or substantial portions of the Software.
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. See the MIT
 License (LICENSE file) for the full text.
 ================================================
+NEW in v1.2.0 (Figure export & multi-region ROI):
+• Individual panel export — every analysis window can now save each plot as
+    its own publication-ready file (PNG 600 dpi + optional vector PDF), not
+    just the whole page:
+    - MCR-ALS & N-FINDR: combined spectra, each component/endmember spectrum,
+      and each abundance map (with its own colorbar + µm scale bar)
+    - Clustering: cluster map, mean spectra, pixel-count panels
+    - PCA: scores, loadings, distribution, scree, spatial map (pre-existing)
+• Multi-region ROI — "Multi-region" checkbox + "＋ Add Region" button let you
+    union several ROIs (any mix of rect/ellipse/polygon/freehand) into a single
+    selection used by ROI Analysis, MCR-ALS, Clustering and N-FINDR
+
 NEW in v13 (Reproducibility, Batch & QC):
 • Preprocessing recipes — save_recipe() / load_recipe()
     - Save/load all preprocessing parameters as a JSON recipe for reproducible,
@@ -119,7 +131,7 @@ __email__   = "akalabya.bissoyi@manchester.ac.uk, bissoyi.akalabya@gmail.com"
 __affiliation__ = "Gibson Group, University of Manchester"
 __url__     = "https://gibsongroupresearch.com/"
 __license__ = "MIT"
-__version__ = "1.1.0"
+__version__ = "1.4.0"  # v6: WL overlay metadata alignment + per-panel image/spectrum export
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import os, sys, time, threading, queue
@@ -167,7 +179,7 @@ def _ensure_package(import_name, pip_name=None):
 # ── numeric / scientific ──────────────────────────────────────────────────────
 import numpy as np
 from scipy.signal import savgol_filter, find_peaks
-from scipy.ndimage import gaussian_filter, zoom, median_filter
+from scipy.ndimage import gaussian_filter, gaussian_filter1d, zoom, median_filter
 
 # NumPy 2.0 renamed ``np.trapz`` → ``np.trapezoid`` (the old name was removed).
 # Bind to whichever exists so the app works on both NumPy 1.x and 2.x.
@@ -254,6 +266,14 @@ if not any("wip" in pat.lower() for _, pat in SUPPORTED_PATTERNS):
          ("WITec WIP", "*.wip"), ("Renishaw WDF", "*.wdf")]
         + [p for p in SUPPORTED_PATTERNS if "wdf" not in p[1].lower()]
     )
+
+# v4 — add the open columnar formats to the master open dialog.
+if not any("parquet" in pat.lower() for _, pat in SUPPORTED_PATTERNS):
+    if SUPPORTED_PATTERNS and SUPPORTED_PATTERNS[0][0] == "Raman data":
+        _lbl, _pat = SUPPORTED_PATTERNS[0]
+        SUPPORTED_PATTERNS[0] = (_lbl, _pat + " *.parquet *.feather *.arrow")
+    SUPPORTED_PATTERNS = (SUPPORTED_PATTERNS
+        + [("Parquet/Feather cube", "*.parquet *.feather *.arrow")])
 
 # Files at or above this size (MB) trigger a "this may be slow" caution on load.
 LARGE_FILE_WARN_MB = 500.0
@@ -704,13 +724,19 @@ def _open_raman_any(path):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".wip":
         return _WITecReader(path)
+    if ext in (".parquet", ".feather", ".arrow"):
+        return read_cube_table(path)
     if ext in (".txt", ".csv", ".dpt", ".dat", ".jdx", ".asc"):
         if HAS_RAMANIO:
             try:
                 return _normalise_reader(open_raman(path))
             except Exception:
                 pass
-        return _TextReader(path)
+        # Try the generic text reader, then fall back to the Horiba map parser
+        try:
+            return _TextReader(path)
+        except Exception:
+            return _read_horiba_map_text(path)
     if ext == ".wdf":
         # Prefer the native Renishaw reader: it reconstructs proper 2-D map
         # cubes (Y×X×W). Fall back to the universal raman_io reader.
@@ -1106,10 +1132,85 @@ def save_recipe_file(path, params):
 
 
 def load_recipe_file(path):
-    import json
+    return load_pipeline_file(path)
+
+
+# ── v4: full pipeline export / replay (JSON or YAML) ──────────────────────────
+def _has_yaml():
+    try:
+        import yaml  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def pipeline_to_dict(params, source="", output_format=".npz"):
+    """Build a self-describing, reproducible pipeline document: app version,
+    creation time, data source, chosen output format and the full
+    preprocessing recipe. Re-runnable with :func:`run_pipeline`."""
+    import datetime
+    return {
+        "bioraman_pipeline_version": 1,
+        "app_version": __version__,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": str(source or ""),
+        "output_format": output_format,
+        "preprocessing": recipe_to_dict(params),
+    }
+
+
+def save_pipeline_file(path, params, source="", output_format=".npz"):
+    """Serialise the pipeline to .json or .yaml/.yml (chosen by extension)."""
+    doc = pipeline_to_dict(params, source=source, output_format=output_format)
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".yaml", ".yml"):
+        if not _has_yaml():
+            raise RuntimeError("YAML export needs PyYAML (pip install pyyaml).")
+        import yaml
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+    else:
+        import json
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+
+
+def load_pipeline_file(path):
+    """Load a pipeline/recipe (.json/.yaml/.yml) and return PreprocessParams.
+    Accepts new pipeline docs, legacy recipe files, and bare param dicts."""
+    ext = os.path.splitext(path)[1].lower()
     with open(path, "r", encoding="utf-8") as fh:
-        d = json.load(fh)
-    return recipe_from_dict(d.get("params", d))
+        text = fh.read()
+    if ext in (".yaml", ".yml"):
+        if not _has_yaml():
+            raise RuntimeError("Reading YAML needs PyYAML (pip install pyyaml).")
+        import yaml
+        d = yaml.safe_load(text) or {}
+    else:
+        import json
+        d = json.loads(text)
+    if isinstance(d, dict):
+        section = d.get("preprocessing") or d.get("params") or d
+    else:
+        section = {}
+    return recipe_from_dict(section)
+
+
+def run_pipeline(pipeline_path, in_dir, out_dir, log=print):
+    """Replay an exported pipeline file over every supported map in a folder."""
+    import os as _os
+    params = load_pipeline_file(pipeline_path)
+    out_fmt = ".npz"
+    try:
+        import json
+        ext = _os.path.splitext(pipeline_path)[1].lower()
+        with open(pipeline_path, "r", encoding="utf-8") as fh:
+            doc = (__import__("yaml").safe_load(fh) if ext in (".yaml", ".yml")
+                   else json.load(fh))
+        out_fmt = (doc or {}).get("output_format", ".npz")
+    except Exception:
+        pass
+    return run_batch(in_dir, out_dir, params, out_format=out_fmt, log=log)
 
 
 def write_cube(path, cube, x, report=None, source=""):
@@ -1125,7 +1226,10 @@ def write_cube(path, cube, x, report=None, source=""):
     ext  = os.path.splitext(path)[1].lower()
     report = report or {}
 
-    if ext == ".npz":
+    if ext in (".parquet", ".feather", ".arrow"):
+        write_cube_table(path, cube, x, source=source)
+
+    elif ext == ".npz":
         np.savez_compressed(
             path, xdata=x, spectra=cube,
             report=np.array(list(report.items()), dtype=object),
@@ -1186,7 +1290,8 @@ def run_batch(in_dir, out_dir, params, out_format=".npz",
     Writes one processed file per input plus a ``batch_summary.csv``.
     Returns (n_ok, n_fail).
     """
-    exts = (".wdf", ".wip", ".spc", ".jdx", ".txt", ".csv", ".dpt", ".dat", ".asc")
+    exts = (".wdf", ".wip", ".spc", ".jdx", ".txt", ".csv", ".dpt", ".dat",
+            ".asc", ".parquet", ".feather", ".arrow")
     in_dir, out_dir = Path(in_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     files = (sorted(in_dir.rglob("*")) if recursive else sorted(in_dir.iterdir()))
@@ -1224,6 +1329,187 @@ def run_batch(in_dir, out_dir, params, out_format=".npz",
         pass
     log(f"Done: {n_ok} ok, {n_fail} failed  →  {out_dir}")
     return n_ok, n_fail
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v4 — PARQUET / FEATHER CUBE I/O  (open, columnar, language-agnostic)
+# ─────────────────────────────────────────────────────────────────────────────
+class _SimpleCube:
+    """Lightweight reader-like object so loaded cubes flow through the same
+    pipeline as instrument readers (needs only ``.spectra`` and ``.xdata``)."""
+    def __init__(self, spectra, xdata, px_um=None, source=""):
+        self.spectra = np.asarray(spectra, dtype=float)
+        self.xdata   = np.asarray(xdata, dtype=float)
+        if px_um is not None:
+            self._px_um = px_um
+        self.source = source
+
+
+def write_cube_table(path, cube, x, px_um=None, source=""):
+    """Write a Y×X×W cube to Apache Parquet (.parquet) or Feather
+    (.feather/.arrow). One row per pixel: columns ``y``, ``x`` and an
+    ``intensity`` list column; the wavenumber axis, map shape, pixel size and
+    source are stored in the file's schema metadata so the cube round-trips
+    losslessly and is also readable from pandas/R/Julia."""
+    try:
+        import pyarrow as pa
+    except Exception as exc:
+        raise RuntimeError(
+            "Parquet/Feather I/O needs pyarrow (pip install pyarrow).") from exc
+    import json
+    cube = np.asarray(cube, dtype=np.float32)
+    x    = np.asarray(x, dtype=float)
+    Y, X, W = cube.shape
+    flat = cube.reshape(Y * X, W)
+    ys, xs = np.divmod(np.arange(Y * X), X)
+    table = pa.table({
+        "y": pa.array(ys.astype(np.int32)),
+        "x": pa.array(xs.astype(np.int32)),
+        "intensity": pa.array(list(flat)),
+    })
+    meta = {
+        b"format":     b"bioraman-cube-v1",
+        b"wavenumber": json.dumps([float(v) for v in x]).encode("utf-8"),
+        b"map_shape":  json.dumps([int(Y), int(X)]).encode("utf-8"),
+        b"px_um":      json.dumps(px_um).encode("utf-8"),
+        b"source":     str(source or "").encode("utf-8"),
+    }
+    table = table.replace_schema_metadata(meta)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".parquet":
+        import pyarrow.parquet as pq
+        pq.write_table(table, path, compression="zstd")
+    else:  # .feather / .arrow
+        import pyarrow.feather as feather
+        feather.write_feather(table, path, compression="zstd")
+
+
+def read_cube_table(path):
+    """Read a Parquet/Feather cube written by :func:`write_cube_table`
+    (or any table exposing y/x/intensity + wavenumber metadata)."""
+    try:
+        import pyarrow as pa  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "Parquet/Feather I/O needs pyarrow (pip install pyarrow).") from exc
+    import json
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".parquet":
+        import pyarrow.parquet as pq
+        table = pq.read_table(path)
+    else:
+        import pyarrow.feather as feather
+        table = feather.read_table(path)
+    meta = table.schema.metadata or {}
+    if b"wavenumber" not in meta:
+        raise RuntimeError(
+            "This table has no bioraman cube metadata (wavenumber axis). "
+            "It may not be a hyperspectral cube exported by BioRaman.")
+    x = np.asarray(json.loads(meta[b"wavenumber"].decode("utf-8")), dtype=float)
+    Y, X = json.loads(meta[b"map_shape"].decode("utf-8"))
+    px_um = None
+    if meta.get(b"px_um"):
+        try: px_um = json.loads(meta[b"px_um"].decode("utf-8"))
+        except Exception: px_um = None
+    src = meta.get(b"source", b"").decode("utf-8")
+    cols = {n: i for i, n in enumerate(table.column_names)}
+    flat = np.vstack([np.asarray(r, dtype=float)
+                      for r in table.column("intensity").to_pylist()])
+    # Honour explicit y/x ordering if present (robust to row reordering)
+    if "y" in cols and "x" in cols:
+        yy = np.asarray(table.column("y").to_pylist(), dtype=int)
+        xx = np.asarray(table.column("x").to_pylist(), dtype=int)
+        cube = np.zeros((Y, X, x.size), dtype=float)
+        cube[yy, xx] = flat
+    else:
+        cube = flat.reshape(Y, X, x.size)
+    return _SimpleCube(cube, x, px_um=px_um, source=src)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v4 — HORIBA LabSpec ASCII / text map reader  (open export path)
+# Horiba's binary .ngc is proprietary and undocumented; LabSpec can export an
+# open ASCII map (and HDF5 from LabSpec 6.3+). This parses the standard ASCII
+# map: first row = Raman shifts (preceded by blank coordinate cells), each
+# following row = X-pos, Y-pos, then the intensities for that pixel.
+# ─────────────────────────────────────────────────────────────────────────────
+def _read_horiba_map_text(path):
+    import io
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+    # Detect delimiter (tab is the Horiba default; fall back to comma/space)
+    sample = "\n".join(raw.splitlines()[:5])
+    if "\t" in sample:
+        delim = "\t"
+    elif ";" in sample:
+        delim = ";"
+    elif "," in sample:
+        delim = ","
+    else:
+        delim = None  # whitespace
+    def _split(line):
+        return line.split(delim) if delim else line.split()
+    lines = [ln for ln in raw.splitlines() if ln.strip()
+             and not ln.lstrip().startswith(("#", "//"))]
+    if len(lines) < 2:
+        raise RuntimeError("Not a Horiba ASCII map (need a header + data rows).")
+
+    def _to_float(tok):
+        try: return float(tok.replace(",", ".")) if delim != "," else float(tok)
+        except Exception: return np.nan
+
+    header = [_to_float(t) for t in _split(lines[0])]
+    # Leading non-finite / empty cells are the X/Y coordinate placeholders.
+    n_lead = 0
+    for v in header:
+        if not np.isfinite(v):
+            n_lead += 1
+        else:
+            break
+    wn = np.asarray(header[n_lead:], dtype=float)
+    W = wn.size
+    if W < 3:
+        raise RuntimeError("Horiba header has too few wavenumber columns.")
+
+    xs, ys, specs = [], [], []
+    for ln in lines[1:]:
+        toks = _split(ln)
+        vals = [_to_float(t) for t in toks]
+        if len(vals) < n_lead + W:
+            continue
+        if n_lead >= 2:
+            xs.append(vals[0]); ys.append(vals[1])
+        elif n_lead == 1:
+            xs.append(vals[0]); ys.append(0.0)
+        else:
+            xs.append(len(xs)); ys.append(0.0)
+        specs.append(vals[len(vals) - W:])
+    if not specs:
+        raise RuntimeError("No data rows parsed from the Horiba map.")
+    spectra_flat = np.asarray(specs, dtype=float)
+
+    # Reconstruct the 2-D grid from the unique X/Y stage positions.
+    xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
+    ux = np.unique(xs); uy = np.unique(ys)
+    if ux.size * uy.size == spectra_flat.shape[0] and ux.size > 1 and uy.size > 1:
+        xi = {v: i for i, v in enumerate(ux)}
+        yi = {v: i for i, v in enumerate(uy)}
+        cube = np.zeros((uy.size, ux.size, W), dtype=float)
+        for k in range(spectra_flat.shape[0]):
+            cube[yi[ys[k]], xi[xs[k]]] = spectra_flat[k]
+        px_um = None
+        if ux.size > 1:
+            step = np.median(np.diff(ux))
+            if np.isfinite(step) and step > 0:
+                px_um = float(abs(step))
+    else:
+        # Could not infer a 2-D grid — treat as a line scan (1 × N × W).
+        cube = spectra_flat[None, :, :]
+        px_um = None
+    # Ensure ascending wavenumber axis
+    if wn.size > 1 and wn[0] > wn[-1]:
+        wn = wn[::-1]; cube = cube[:, :, ::-1]
+    return _SimpleCube(cube, wn, px_um=px_um, source=str(path))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1737,6 +2023,30 @@ class SectionDiv(tk.Frame):
             side="left", fill="x", expand=True, pady=6, padx=(0,10))
 
 
+def make_scroll_sidebar(parent, width=270):
+    """Create a fixed-width, vertically scrollable sidebar so long control
+    stacks never clip off on short windows. Returns the inner frame to pack
+    controls into (use exactly like the old ``left`` frame)."""
+    outer = tk.Frame(parent, bg=C["sidebar"], width=width)
+    outer.pack(side="left", fill="y"); outer.pack_propagate(False)
+    cv = tk.Canvas(outer, bg=C["sidebar"], highlightthickness=0)
+    sb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+    cv.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    cv.pack(side="left", fill="both", expand=True)
+    inner = tk.Frame(cv, bg=C["sidebar"])
+    wid = cv.create_window((0, 0), window=inner, anchor="nw")
+    cv.bind("<Configure>", lambda e: cv.itemconfig(wid, width=e.width))
+    inner.bind("<Configure>",
+               lambda e: cv.configure(scrollregion=cv.bbox("all")))
+    # wheel scrolls only while the pointer is over this sidebar
+    cv.bind("<Enter>", lambda e: cv.bind_all(
+        "<MouseWheel>",
+        lambda ev: cv.yview_scroll(int(-1 * (ev.delta / 120)), "units")))
+    cv.bind("<Leave>", lambda e: cv.unbind_all("<MouseWheel>"))
+    return inner
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ROI MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1969,9 +2279,160 @@ class ROIManager:
         yy, xx = np.mgrid[0:Y, 0:X]
         coords = np.column_stack([xx.ravel(), yy.ravel()])
         return path.contains_points(coords).reshape(Y, X)
+# ─────────────────────────────────────────────────────────────────────────────
+# PANEL SAVE MIXIN — tick a checkbox on each plot panel, save only the ticked
+# ones. Reused by every analysis window (PCA, Clustering, N-FINDR, …).
+# ─────────────────────────────────────────────────────────────────────────────
+class PanelSaveMixin:
+    """Overlay a small checkbox at the top-left of every content panel of an
+    embedded matplotlib canvas, and save only the ticked panels as standalone
+    images. A window enables it with one call after creating its canvas:
+
+        self._enable_panel_ticks(canvas, basename="PCA")
+
+    Detection is automatic via the canvas 'draw_event', so individual windows
+    do not need to register their panels manually."""
+
+    def _enable_panel_ticks(self, canvas, basename="panel"):
+        self._tick_canvas = canvas
+        self._tick_fig = canvas.figure
+        self._panel_basename = basename
+        self._panel_vars = getattr(self, "_panel_vars", {})
+        self._panel_checks = []
+        w = canvas.get_tk_widget()
+        w.bind("<Configure>", lambda _e: self._place_panel_ticks())
+        try:
+            canvas.mpl_connect("draw_event",
+                               lambda _e: self._place_panel_ticks())
+        except Exception:
+            pass
+        try:
+            ttk.Button(w.master, text="☑ Save Ticked Panels…",
+                       command=self._save_ticked_panels).pack(
+                           side="bottom", fill="x", padx=6, pady=4)
+        except Exception:
+            pass
+
+    def _content_axes(self):
+        fig = getattr(self, "_tick_fig", None)
+        if fig is None:
+            return []
+        # Skip colorbar axes (matplotlib labels them '<colorbar>').
+        return [ax for ax in fig.axes if ax.get_label() != "<colorbar>"]
+
+    def _place_panel_ticks(self):
+        for cb in getattr(self, "_panel_checks", []):
+            try:
+                cb.destroy()
+            except Exception:
+                pass
+        self._panel_checks = []
+        axes = self._content_axes()
+        if not axes:
+            return
+        w = self._tick_canvas.get_tk_widget()
+        fw, fh = w.winfo_width(), w.winfo_height()
+        if fw <= 1 or fh <= 1:
+            return
+        seen = {}
+        for idx, ax in enumerate(axes):
+            tag = (ax.get_title() or "").strip() or f"panel{idx+1}"
+            n = seen.get(tag, 0) + 1
+            seen[tag] = n
+            if n > 1:
+                tag = f"{tag} ({n})"
+            ax._save_tag = tag
+            var = self._panel_vars.setdefault(tag, tk.BooleanVar(value=True))
+            pos = ax.get_position()
+            x = int(pos.x0 * fw) + 2
+            y = int((1.0 - pos.y1) * fh) + 2
+            cb = tk.Checkbutton(w, variable=var, bg="white",
+                                activebackground="white", bd=0,
+                                highlightthickness=0, padx=0, pady=0)
+            cb.place(x=x, y=y)
+            self._panel_checks.append(cb)
+
+    def _save_ticked_panels(self):
+        fig = getattr(self, "_tick_fig", None)
+        if fig is None or not self._content_axes():
+            messagebox.showwarning("Nothing to save",
+                                   "Generate a plot first.", parent=self)
+            return
+        self._place_panel_ticks()          # ensure tags are current
+        chosen = [ax for ax in self._content_axes()
+                  if getattr(ax, "_save_tag", None)
+                  and self._panel_vars.get(ax._save_tag)
+                  and self._panel_vars[ax._save_tag].get()]
+        if not chosen:
+            messagebox.showinfo(
+                "Nothing selected",
+                "Tick the box at the top-left of at least one panel.",
+                parent=self)
+            return
+        out_dir = filedialog.askdirectory(
+            title="Choose a folder for the ticked panels", parent=self)
+        if not out_dir:
+            return
+        save_pdf = messagebox.askyesno(
+            "Vector copy?",
+            "Also save a vector PDF of each panel?\n\n"
+            "Yes → PNG (600 dpi) + PDF      No → PNG only", parent=self)
+
+        import re
+        from matplotlib.transforms import Bbox
+        try:
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+        except Exception:
+            renderer = None
+        base = getattr(self, "_panel_basename", None) or "panel"
+        exported = []
+        for ax in chosen:
+            tag = getattr(ax, "_save_tag", "panel")
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", tag).strip("_") or "panel"
+            try:
+                boxes = [ax.get_tightbbox(renderer)]
+                for im in ax.images:
+                    cb = getattr(im, "colorbar", None)
+                    if cb is not None:
+                        boxes.append(cb.ax.get_tightbbox(renderer))
+                for coll in ax.collections:
+                    cb = getattr(coll, "colorbar", None)
+                    if cb is not None:
+                        boxes.append(cb.ax.get_tightbbox(renderer))
+                bb = Bbox.union([b for b in boxes if b is not None])
+                ext = bb.expanded(1.06, 1.10).transformed(
+                    fig.dpi_scale_trans.inverted())
+                png = Path(out_dir) / f"{base}_{safe}.png"
+                fig.savefig(png, dpi=600, bbox_inches=ext, facecolor="white")
+                exported.append(png.name)
+                if save_pdf:
+                    pdf = Path(out_dir) / f"{base}_{safe}.pdf"
+                    fig.savefig(pdf, bbox_inches=ext, facecolor="white")
+                    exported.append(pdf.name)
+            except Exception as ex:
+                messagebox.showerror("Export error", f"{tag}: {ex}",
+                                     parent=self)
+        if exported:
+            messagebox.showinfo(
+                "Panels saved",
+                f"Saved {len(exported)} files to:\n{out_dir}", parent=self)
+
+
+def attach_panel_saver(win, canvas, basename="panel"):
+    """Give an arbitrary Toplevel the PanelSaveMixin behaviour (tick boxes on
+    each panel + 'Save Ticked Panels' button) without it subclassing the mixin.
+    Used for figures built inside plain functions rather than mixin windows."""
+    import types
+    for name in ("_enable_panel_ticks", "_content_axes",
+                 "_place_panel_ticks", "_save_ticked_panels"):
+        setattr(win, name, types.MethodType(getattr(PanelSaveMixin, name), win))
+    win._enable_panel_ticks(canvas, basename=basename)
+
+
 # PCA WINDOW
 # ─────────────────────────────────────────────────────────────────────────────
-class PCAWindow(tk.Toplevel):
+class PCAWindow(PanelSaveMixin, tk.Toplevel):
     """
     Standalone PCA analysis window.
     Load multiple WDF or XLSX map files → preprocess → PCA → plots.
@@ -2252,6 +2713,7 @@ class PCAWindow(tk.Toplevel):
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         nav = NavigationToolbar2Tk(self.canvas, right)
         nav.update()
+        self._enable_panel_ticks(self.canvas, basename="PCA")
 
     def _init_plots(self):
         titles = ["A: PCA Scores (PC1 vs PC2)",
@@ -3863,7 +4325,10 @@ class RamanApp(tk.Tk):
         self._roi_mode    = tk.StringVar(value="rectangle")
         self._roi_mask:   np.ndarray | None = None   # stored boolean mask
         self._roi_reverse_mask = tk.BooleanVar(value=True)  # shade outside ROI on map preview
+        self._roi_smooth_edge  = tk.BooleanVar(value=True)  # anti-aliased ROI boundary on map
         self._roi_mask_inv: np.ndarray | None = None        # inverse (outside) mask
+        self._roi_multi   = tk.BooleanVar(value=False)      # accumulate multiple ROIs
+        self._roi_count   = 0                               # number of regions in current mask
 
         # v5: saved univariate maps  {name: 2-D ndarray}
         self._saved_maps: dict[str, np.ndarray] = {}
@@ -3927,7 +4392,9 @@ class RamanApp(tk.Tk):
         fm = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
                      activebackground=C["accent"], activeforeground="white")
         mb.add_cascade(label="File", menu=fm)
-        fm.add_command(label="Open Raman file (WDF/WIP/…)   Ctrl+O", command=self.load_file)
+        fm.add_command(label="Open Raman file (WDF/WIP/Parquet/…)   Ctrl+O", command=self.load_file)
+        fm.add_command(label="Import Horiba LabSpec map (ASCII/text)…",
+                       command=self.import_horiba)
         fm.add_command(label="Load White-Light…",       command=self.load_wl)
         fm.add_separator()
         fm.add_command(label="📦 RAMANMETRIX Dataset (ZIP + metadata)…",
@@ -3964,8 +4431,9 @@ class RamanApp(tk.Tk):
         pm.add_separator()
         pm.add_command(label="🔁  Reprocess (apply recipe to raw)",
                        command=self.reprocess)
-        pm.add_command(label="💾  Save Recipe…",     command=self.save_recipe)
-        pm.add_command(label="📥  Load Recipe…",     command=self.load_recipe)
+        pm.add_command(label="💾  Export Pipeline (JSON/YAML)…", command=self.save_recipe)
+        pm.add_command(label="📥  Load Pipeline / Recipe…",      command=self.load_recipe)
+        pm.add_command(label="▶  Run Pipeline on folder…",       command=self.run_pipeline_folder)
         pm.add_separator()
         pm.add_command(label="✓  Quality Control Maps…", command=self.open_qc_map)
         pm.add_command(label="🧫  Cell Mask / Background Rejection…",
@@ -3994,6 +4462,10 @@ class RamanApp(tk.Tk):
         am.add_command(label="🔎  Library Search (full-spectrum)…",
                        command=self.open_library_search)
         am.add_command(label="⚒  Spectral Tools…",       command=self.open_spectral_tools)
+        am.add_command(label="⚖  Group Comparison (stats + mean spectra)…",
+                       command=self.open_group_compare)
+        am.add_command(label="🧭  Analysis Planner (suggests a workflow)…",
+                       command=self.open_planner)
 
         # ── PCRS (Particle Characterisation & Raman Spectroscopy) ──────────────
         pm = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
@@ -4208,10 +4680,26 @@ class RamanApp(tk.Tk):
                        activebackground=C["sidebar"],
                        selectcolor=C["sidebar"],
                        font=("Segoe UI", 11)).pack(anchor="w", padx=4, pady=(6, 2))
+        tk.Checkbutton(roi_card, text="Smooth ROI edge (anti-aliased)",
+                       variable=self._roi_smooth_edge,
+                       command=self._redraw_roi_overlay,
+                       bg=C["sidebar"], fg=C["text_mid"],
+                       activebackground=C["sidebar"],
+                       selectcolor=C["sidebar"],
+                       font=("Segoe UI", 11)).pack(anchor="w", padx=4, pady=(0, 2))
+        tk.Checkbutton(roi_card,
+                       text="Multi-region (add each ROI to selection)",
+                       variable=self._roi_multi,
+                       bg=C["sidebar"], fg=C["text_mid"],
+                       activebackground=C["sidebar"],
+                       selectcolor=C["sidebar"],
+                       font=("Segoe UI", 11)).pack(anchor="w", padx=4, pady=(0, 2))
         btn_row = tk.Frame(roi_card, bg=C["sidebar"])
         btn_row.pack(fill="x", padx=4, pady=4)
         ttk.Button(btn_row, text="✎ Draw ROI", style="ROI.TButton",
                    command=self._start_roi).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="＋ Add Region", style="ROI.TButton",
+                   command=self._add_roi).pack(side="left", padx=2)
         ttk.Button(btn_row, text="✕ Clear", style="Neutral.TButton",
                    command=self._clear_roi).pack(side="left", padx=2)
 
@@ -4238,6 +4726,10 @@ class RamanApp(tk.Tk):
         self._wl_name.pack(anchor="w", padx=6, pady=(0,4))
         self._wl_thumb = tk.Label(wl_card, bg=C["sidebar"])
         self._wl_thumb.pack(pady=(0,4))
+        self._wl_align_note = tk.Label(
+            wl_card, text="", bg=C["sidebar"], fg=C["text_dim"],
+            font=("Segoe UI", 9), wraplength=210, justify="left")
+        self._wl_align_note.pack(anchor="w", padx=6, pady=(0,4))
         self.sl_wl_alpha = SingleSlider(wl_card, "Overlay opacity",
                                          0, 1, 0.45, color=C["accent2"],
                                          resolution=0.05, command=self.update_map)
@@ -4246,6 +4738,28 @@ class RamanApp(tk.Tk):
                                           0.1, 3.0, 1.0, color=C["band_a"],
                                           resolution=0.05, command=self.update_map)
         self.sl_wl_bright.pack(**pad)
+
+        # ── Alignment / registration ──────────────────────────────────────
+        # The embedded white-light image is stretched onto the Raman pixel
+        # grid. If the file's crop metadata is slightly off (or the image was
+        # loaded manually) the overlay drifts. These controls let the user
+        # shift/scale the image to register it against the map.
+        def _wl_realign(*_):
+            self._resize_wl(); self.update_map()
+        self.sl_wl_dx = SingleSlider(wl_card, "Align shift X (px)",
+                                     -60, 60, 0, color=C["accent2"],
+                                     resolution=1, command=_wl_realign)
+        self.sl_wl_dx.pack(**pad)
+        self.sl_wl_dy = SingleSlider(wl_card, "Align shift Y (px)",
+                                     -60, 60, 0, color=C["accent2"],
+                                     resolution=1, command=_wl_realign)
+        self.sl_wl_dy.pack(**pad)
+        self.sl_wl_scale = SingleSlider(wl_card, "Align scale",
+                                        0.5, 1.5, 1.0, color=C["band_a"],
+                                        resolution=0.01, command=_wl_realign)
+        self.sl_wl_scale.pack(**pad)
+        ttk.Button(wl_card, text="Reset alignment", style="Neutral.TButton",
+                   command=self._reset_wl_align).pack(fill="x", padx=4, pady=(2,6))
 
         # ── Spectrum options ──────────────────────────────────────────────
         SectionDiv(p, "SPECTRUM OPTIONS").pack(**pad)
@@ -4293,8 +4807,38 @@ class RamanApp(tk.Tk):
             except Exception: pass
         nav.update()
 
+        # Per-panel export (the toolbar disk icon only saves the whole figure)
+        ttk.Button(tb_frame, text="↓ Save Spectrum",
+                   style="Neutral.TButton",
+                   command=lambda: self._save_panel(self.ax_spec, "spectrum")
+                   ).pack(side="right", padx=4, pady=2)
+        ttk.Button(tb_frame, text="↓ Save Map",
+                   style="Neutral.TButton",
+                   command=lambda: self._save_panel(self.ax_map, "map")
+                   ).pack(side="right", padx=4, pady=2)
+
         self.canvas.mpl_connect("button_press_event",  self._click)
         self.canvas.mpl_connect("motion_notify_event", self._hover)
+
+    def _save_panel(self, ax, tag):
+        """Save a single panel (map or spectrum) to PNG/PDF at 600 dpi."""
+        path = filedialog.asksaveasfilename(
+            title=f"Save {tag} image",
+            defaultextension=".png",
+            initialfile=f"BioRaman_{tag}",
+            filetypes=[("PNG image", "*.png"), ("PDF document", "*.pdf"),
+                       ("SVG vector", "*.svg"), ("TIFF image", "*.tif")])
+        if not path:
+            return
+        try:
+            # tight bounding box around just this panel (+ its colourbar/labels)
+            ext = ax.get_tightbbox(self.fig.canvas.get_renderer()).transformed(
+                self.fig.dpi_scale_trans.inverted()).expanded(1.18, 1.12)
+            self.fig.savefig(path, dpi=600, bbox_inches=ext, facecolor="white")
+            self._status.set(f"Saved {tag} → {Path(path).name}")
+        except Exception as ex:
+            messagebox.showerror("Save error", f"Could not save {tag}:\n{ex}",
+                                 parent=self)
 
     def _init_map_ax(self):
         ax = self.ax_map
@@ -4303,7 +4847,7 @@ class RamanApp(tk.Tk):
         ax.set_ylabel("Y  (pixels)", fontsize=10)
         ax.tick_params(which="both", direction="in", length=3)
         self.im = ax.imshow(np.zeros((10,10)), origin="upper",
-                            aspect="equal", interpolation="bilinear", cmap="turbo")
+                            aspect="equal", interpolation="bicubic", cmap="turbo")
         self.cbar = self.fig.colorbar(self.im, ax=ax,
                                       fraction=0.046, pad=0.03, shrink=0.85)
         self.cbar.ax.tick_params(labelsize=8)
@@ -4427,16 +4971,25 @@ class RamanApp(tk.Tk):
         self._status.set(f"ROI mode: {mode}  —  {hint}  (Esc to cancel)")
         self._roi_info.config(text=f"Drawing {mode}…", fg=C["roi"])
 
+    def _add_roi(self):
+        """Draw another region and add it to the current selection."""
+        self._roi_multi.set(True)
+        if self._roi_mask is None:
+            self._status.set("No ROI yet — draw the first region.")
+        self._start_roi()
+
     def _cancel_roi(self):
         if self._roi_manager:
             self._roi_manager.deactivate()
             self._roi_manager = None
         self._status.set("ROI cancelled")
-        self._roi_info.config(text="No ROI defined", fg=C["text_dim"])
+        if self._roi_mask is None:
+            self._roi_info.config(text="No ROI defined", fg=C["text_dim"])
 
     def _clear_roi(self):
         self._cancel_roi()
         self._roi_mask = None
+        self._roi_count = 0
         self.spec_roi.set_visible(False)
         if self._roi_patch:
             try: self._roi_patch.remove()
@@ -4445,40 +4998,79 @@ class RamanApp(tk.Tk):
         self.canvas.draw_idle()
         self._roi_info.config(text="No ROI defined", fg=C["text_dim"])
 
+    def _draw_roi_overlay(self, mask):
+        """Paint the ROI overlay on the map. Honors the 'Smooth ROI edge'
+        toggle (smooth = anti-aliased boundary, off = hard pixel edge). This is
+        display-only; the stored ROI mask and all analysis are unaffected."""
+        if mask is None:
+            return
+        from scipy.ndimage import zoom as _zoom
+        if self._roi_patch:
+            try: self._roi_patch.remove()
+            except Exception: pass
+            self._roi_patch = None
+        self._roi_mask_inv = ~mask
+        Y, X = mask.shape
+        rgba = np.zeros((Y * ZOOM, X * ZOOM, 4), dtype=np.float32)
+        if self._roi_smooth_edge.get():
+            # Anti-aliased boundary: bilinear upsample + light blur → soft 0→1
+            # alpha ramp so the edge reads as a smooth curve, not stair-steps.
+            soft = _zoom(mask.astype(np.float32), ZOOM, order=1)
+            soft = gaussian_filter(soft, sigma=ZOOM * 0.7)
+            soft = np.clip(soft, 0.0, 1.0)[..., None]
+            if self._roi_reverse_mask.get():
+                dark = np.array([0.10, 0.10, 0.10], np.float32)
+                warm = np.array([1.00, 0.42, 0.21], np.float32)
+                rgba[..., :3] = (1.0 - soft) * dark + soft * warm
+                rgba[...,  3] = ((1.0 - soft) * 0.55 + soft * 0.10)[..., 0]
+            else:
+                rgba[..., 0] = 1.00; rgba[..., 1] = 0.42; rgba[..., 2] = 0.21
+                rgba[...,  3] = (soft * 0.28)[..., 0]
+            interp = "bilinear"
+        else:
+            # Hard, pixel-accurate boundary (literal whole-pixel mask).
+            mask_z = _zoom(mask.astype(float), ZOOM, order=0) > 0.5
+            if self._roi_reverse_mask.get():
+                out_z = ~mask_z
+                rgba[out_z, :3] = (0.10, 0.10, 0.10); rgba[out_z, 3] = 0.55
+                rgba[mask_z, :3] = (1.00, 0.42, 0.21); rgba[mask_z, 3] = 0.10
+            else:
+                rgba[mask_z, 0] = 1.0; rgba[mask_z, 1] = 0.42
+                rgba[mask_z, 2] = 0.21; rgba[mask_z, 3] = 0.28
+            interp = "nearest"
+        self._roi_patch = self.ax_map.imshow(
+            rgba, origin="upper", aspect="equal", interpolation=interp,
+            extent=(0, X*ZOOM, Y*ZOOM, 0), zorder=5)
+        self.canvas.draw_idle()
+
+    def _redraw_roi_overlay(self):
+        """Re-paint the current ROI overlay (e.g. when the smooth-edge toggle is
+        switched) using the stored mask, if any."""
+        m = getattr(self, "_roi_mask", None)
+        if m is not None and np.any(m):
+            self._draw_roi_overlay(m)
+
     def _on_roi_done(self, mask):
         if self._roi_manager:
             self._roi_manager.deactivate()
             self._roi_manager = None
+        # Multi-region: union the new region into the running selection.
+        if self._roi_multi.get() and self._roi_mask is not None \
+                and self._roi_mask.shape == mask.shape:
+            mask = self._roi_mask | mask
+            self._roi_count += 1
+        else:
+            self._roi_count = 1
         self._roi_mask = mask          # ← store for ROI Analysis
         n_px = int(mask.sum())
+        reg = self._roi_count
+        reg_txt = f"{reg} regions" if reg > 1 else "1 region"
         self._roi_info.config(
-            text=f"{n_px} pixels selected", fg=C["success"])
-        self._status.set(f"ROI: {n_px} pixels — computing mean spectrum…")
+            text=f"{n_px} pixels selected ({reg_txt})", fg=C["success"])
+        self._status.set(f"ROI: {n_px} pixels in {reg_txt} — computing mean spectrum…")
 
         # Draw filled ROI overlay on map
-        if self._roi_patch:
-            try: self._roi_patch.remove()
-            except Exception: pass
-        Y, X = mask.shape
-        rgba = np.zeros((Y * ZOOM, X * ZOOM, 4), dtype=np.float32)
-        from scipy.ndimage import zoom as _zoom
-        mask_z = _zoom(mask.astype(float), ZOOM, order=0) > 0.5
-        self._roi_mask_inv = ~mask
-        if self._roi_reverse_mask.get():
-            out_z = ~mask_z
-            rgba[out_z, :3] = (0.10, 0.10, 0.10)
-            rgba[out_z,  3] = 0.55
-            rgba[mask_z, :3] = (1.00, 0.42, 0.21)
-            rgba[mask_z,  3] = 0.10
-        else:
-            rgba[mask_z, 0] = 1.0
-            rgba[mask_z, 1] = 0.42
-            rgba[mask_z, 2] = 0.21
-            rgba[mask_z, 3] = 0.28
-        self._roi_patch = self.ax_map.imshow(
-            rgba, origin="upper", aspect="equal",
-            extent=(0, X*ZOOM, Y*ZOOM, 0), zorder=5)
-        self.canvas.draw_idle()
+        self._draw_roi_overlay(mask)
 
         # Compute mean spectrum of ROI
         Y2, X2, W = self.spectra.shape
@@ -4495,10 +5087,12 @@ class RamanApp(tk.Tk):
         self.ax_spec.legend(loc="upper right", frameon=True, fontsize=9)
         self.canvas.draw_idle()
         self._status.set(
-            f"ROI: {n_px} pixels selected — click '🔬 ROI Analysis' for full workflow")
+            f"ROI: {n_px} pixels in {reg_txt} — '＋ Add Region' to add more, "
+            f"or '🔬 ROI Analysis' for full workflow")
         # offer analysis
         self._roi_info.config(
-            text=f"✓ {n_px} px  —  click 🔬 Analyse", fg=C["success"])
+            text=f"✓ {n_px} px in {reg_txt}  —  click 🔬 Analyse",
+            fg=C["success"])
 
     # ── ROI ANALYSIS WINDOW ───────────────────────────────────────────────────
     def open_roi_analysis(self):
@@ -4594,8 +5188,8 @@ class RamanApp(tk.Tk):
                           highlightthickness=1, highlightbackground=C["border"])
         card_b.pack(fill="x", padx=8, pady=3)
 
-        b_lo_var = tk.DoubleVar(value=3087)
-        b_hi_var = tk.DoubleVar(value=3162)
+        b_lo_var = tk.DoubleVar(value=3100)
+        b_hi_var = tk.DoubleVar(value=3450)
         _row(card_b, "Low (cm⁻¹)",
              lambda f: ttk.Spinbox(f, from_=lo, to=hi, increment=5,
                                    textvariable=b_lo_var, width=9))
@@ -4749,8 +5343,8 @@ class RamanApp(tk.Tk):
         # Layout: 2 rows × 3 cols
         # Row 0: [Bright-field / ROI mask] [Raw heatmap A] [Raw heatmap B]
         # Row 1: [Mean spectrum + bands]   [Binarized]     [Masked heatmap B in A]
-        gs = fig.add_gridspec(2, 3, wspace=0.35, hspace=0.42,
-                              left=0.06, right=0.97, top=0.94, bottom=0.09)
+        gs = fig.add_gridspec(2, 3, wspace=0.55, hspace=0.48,
+                              left=0.05, right=0.90, top=0.92, bottom=0.08)
         ax_roi   = fig.add_subplot(gs[0, 0])   # ROI mask
         ax_raw_a = fig.add_subplot(gs[0, 1])   # Smoothed heatmap Band A
         ax_raw_b = fig.add_subplot(gs[0, 2])   # Smoothed heatmap Band B
@@ -4773,6 +5367,7 @@ class RamanApp(tk.Tk):
         canvas_r = FigureCanvasTkAgg(fig, master=right)
         canvas_r.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(canvas_r, right).update()
+        attach_panel_saver(win, canvas_r, basename="ROI_analysis")
 
         # Pre-draw ROI mask preview
         Y, X, W = self.spectra.shape
@@ -4986,8 +5581,10 @@ class RamanApp(tk.Tk):
 
             # Panel 1: Smoothed Band A heatmap (full ROI)
             ax_raw_a.clear()
-            disp_a = np.where(mask, sm_a, np.nan)
-            im_a = ax_raw_a.imshow(disp_a, origin="upper", cmap=cm_a,
+            disp_a = np.ma.masked_where(~mask, sm_a)
+            cmap_a = plt.get_cmap(cm_a).copy(); cmap_a.set_bad("#bfbfbf")
+            ax_raw_a.set_facecolor("#bfbfbf")
+            im_a = ax_raw_a.imshow(disp_a, origin="upper", cmap=cmap_a,
                                    aspect="equal", interpolation="bilinear")
             fig.colorbar(im_a, ax=ax_raw_a, fraction=0.046, pad=0.04, shrink=0.8)
             ax_raw_a.set_title(f"Smoothed  —  {lbl_a}\n({al:.0f}–{ah:.0f} cm⁻¹)",
@@ -4996,8 +5593,10 @@ class RamanApp(tk.Tk):
 
             # Panel 2: Smoothed Band B heatmap (full ROI)
             ax_raw_b.clear()
-            disp_b = np.where(mask, sm_b, np.nan)
-            im_b = ax_raw_b.imshow(disp_b, origin="upper", cmap=cm_b,
+            disp_b = np.ma.masked_where(~mask, sm_b)
+            cmap_b = plt.get_cmap(cm_b).copy(); cmap_b.set_bad("#bfbfbf")
+            ax_raw_b.set_facecolor("#bfbfbf")
+            im_b = ax_raw_b.imshow(disp_b, origin="upper", cmap=cmap_b,
                                    aspect="equal", interpolation="bilinear")
             fig.colorbar(im_b, ax=ax_raw_b, fraction=0.046, pad=0.04, shrink=0.8)
             ax_raw_b.set_title(f"Smoothed  —  {lbl_b}\n({bl:.0f}–{bh:.0f} cm⁻¹)",
@@ -5010,10 +5609,11 @@ class RamanApp(tk.Tk):
                          color=C["text_hi"], lw=1.1, label="Mean (cellular)")
             ax_spec.axvspan(al, ah, alpha=0.18, color=C["band_a"], label=f"S_A  {lbl_a}")
             ax_spec.axvspan(bl, bh, alpha=0.18, color=C["band_b"], label=f"S_B  {lbl_b}")
-            # annotate band area arrows
+            # annotate band area arrows (use the user's actual band labels,
+            # not fixed assignments, so any A/B choice is described correctly)
             for lo_wn, hi_wn, col, lbl_s in [
-                (al, ah, C["band_a"], "S_amide"),
-                (bl, bh, C["band_b"], "S_ice"),
+                (al, ah, C["band_a"], f"S_A ({lbl_a})"),
+                (bl, bh, C["band_b"], f"S_B ({lbl_b})"),
             ]:
                 m2 = (self.xdata >= lo_wn) & (self.xdata <= hi_wn)
                 if m2.any():
@@ -5043,14 +5643,32 @@ class RamanApp(tk.Tk):
                 fontsize=8, fontweight="semibold")
             ax_bin.set_xticks([]); ax_bin.set_yticks([])
 
-            # Panel 5: Band B signal within cellular region (masked heatmap)
+            # Panel 5: per-pixel ratio Band B / Band A within cellular region.
+            # Shows where ice is high RELATIVE to cell material, rather than
+            # echoing the binary mask shape.
             ax_mask.clear()
-            disp_masked = np.where(binary, sm_b, np.nan)
-            im_mk = ax_mask.imshow(disp_masked, origin="upper", cmap=cm_b,
-                                   aspect="equal", interpolation="bilinear")
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio_map = sm_b / sm_a
+            ratio_map[~np.isfinite(ratio_map)] = np.nan
+            disp_masked = np.ma.masked_where(~binary | ~np.isfinite(ratio_map),
+                                             ratio_map)
+            cmap_mk = plt.get_cmap(cm_b).copy()
+            cmap_mk.set_bad("#bfbfbf")
+            # Scale contrast to the WITHIN-CELL ratio values.
+            rv = ratio_map[binary & np.isfinite(ratio_map)]
+            if rv.size:
+                vlo, vhi = np.nanpercentile(rv, [2, 98])
+                if not np.isfinite(vlo) or vhi <= vlo:
+                    vlo, vhi = None, None
+            else:
+                vlo, vhi = None, None
+            im_mk = ax_mask.imshow(disp_masked, origin="upper", cmap=cmap_mk,
+                                   aspect="equal", interpolation="bilinear",
+                                   vmin=vlo, vmax=vhi)
+            ax_mask.set_facecolor("#bfbfbf")
             fig.colorbar(im_mk, ax=ax_mask, fraction=0.046, pad=0.04, shrink=0.8)
             ax_mask.set_title(
-                f"Heatmap of {lbl_b}\nwithin cellular region",
+                f"{lbl_b} / {lbl_a}  ratio\nper pixel (cellular region)",
                 fontsize=8, fontweight="semibold")
             ax_mask.set_xticks([]); ax_mask.set_yticks([])
 
@@ -5345,7 +5963,19 @@ class RamanApp(tk.Tk):
         if not path: return
         self._load_path(path)
 
-    def _load_path(self, path, display_name=None):
+    def import_horiba(self):
+        """Open a Horiba LabSpec ASCII/text map export using the dedicated
+        Horiba parser (Horiba's binary .ngc is proprietary/undocumented; the
+        ASCII map and LabSpec 6.3+ HDF5 are the open export paths)."""
+        path = filedialog.askopenfilename(
+            title="Import Horiba LabSpec map (ASCII/text export)",
+            filetypes=[("Horiba text map", "*.txt *.csv *.dat *.asc"),
+                       ("All", "*.*")])
+        if not path:
+            return
+        self._load_path(path, reader=_read_horiba_map_text)
+
+    def _load_path(self, path, display_name=None, reader=None):
         """Load a single spectrum/map file by path (reused by the dataset dialog)."""
         label = display_name or Path(path).name
 
@@ -5376,7 +6006,7 @@ class RamanApp(tk.Tk):
 
         def worker():
           try:
-            r = _open_raman_any(path)
+            r = reader(path) if reader is not None else _open_raman_any(path)
 
             # Try to extract embedded white-light microscope image (if present)
             wl_raw = None
@@ -5438,8 +6068,14 @@ class RamanApp(tk.Tk):
         if wl_raw is not None:
             try:
                 self.wl_raw = wl_raw
+                self._wl_from_wdf = True
                 if hasattr(self, "_wl_name") and self._wl_name is not None:
-                    self._wl_name.config(text="(from WDF) " + Path(path).name, fg=C["success"])
+                    self._wl_name.config(text="✓ from WDF: " + Path(path).name, fg=C["success"])
+                if hasattr(self, "_wl_align_note"):
+                    self._wl_align_note.config(
+                        text="Auto-registered from stage metadata (img_cropbox). "
+                             "Alignment sliders only fine-tune residual drift.",
+                        fg=C["text_dim"])
                 try:
                     pil = Image.fromarray((np.clip(wl_raw, 0, 1) * 255).astype(np.uint8))
                     thumb = pil.copy(); thumb.thumbnail((220, 130))
@@ -5475,20 +6111,63 @@ class RamanApp(tk.Tk):
         if not path: return
         img = Image.open(path).convert("RGBA")
         self.wl_raw = np.asarray(img, dtype=np.float32) / 255.0
-        self._wl_name.config(text=Path(path).name, fg=C["success"])
+        self._wl_from_wdf = False
+        self._wl_name.config(text="⚠ manual: " + Path(path).name, fg=C["band_a"])
+        if hasattr(self, "_wl_align_note"):
+            self._wl_align_note.config(
+                text="Manually loaded — no stage metadata, so the image is "
+                     "stretched to the scan area and may be offset. Use the "
+                     "alignment sliders, or load the .wdf for auto-registration.",
+                fg=C["band_a"])
         thumb = img.copy(); thumb.thumbnail((220,130))
         self._wl_ph = ImageTk.PhotoImage(thumb)
         self._wl_thumb.config(image=self._wl_ph)
         self._resize_wl()
         self.update_map()
 
+    def _reset_wl_align(self):
+        """Return the white-light overlay to the file's native registration."""
+        for sl in ("sl_wl_dx", "sl_wl_dy"):
+            if hasattr(self, sl): getattr(self, sl).set(0)
+        if hasattr(self, "sl_wl_scale"): self.sl_wl_scale.set(1.0)
+        self._resize_wl(); self.update_map()
+
     def _resize_wl(self):
         if self.wl_raw is None or self.spectra is None: return
         Y,X,_ = self.spectra.shape
         th,tw = Y*ZOOM, X*ZOOM
+        # Base: stretch the full WL image onto the Raman pixel grid.
         pil = Image.fromarray((self.wl_raw*255).astype(np.uint8)).resize(
             (tw,th), Image.LANCZOS)
-        self.wl_resized = np.asarray(pil, dtype=np.float32) / 255.0
+        arr = np.asarray(pil, dtype=np.float32) / 255.0
+
+        # Manual registration (shift X/Y in pixels, scale about the centre)
+        # so the user can correct residual deviation from the map.
+        s  = float(getattr(self, "sl_wl_scale", None).value) if hasattr(self, "sl_wl_scale") else 1.0
+        dx = int(round(getattr(self, "sl_wl_dx", None).value)) if hasattr(self, "sl_wl_dx") else 0
+        dy = int(round(getattr(self, "sl_wl_dy", None).value)) if hasattr(self, "sl_wl_dy") else 0
+
+        if abs(s - 1.0) > 1e-3:
+            zoomed = zoom(arr, (s, s, 1), order=1)
+            zh, zw = zoomed.shape[:2]
+            out = np.zeros_like(arr)
+            # centre the scaled image back into the original frame (crop or pad)
+            oy, ox = (th - zh)//2, (tw - zw)//2
+            sy0, sx0 = max(0, -oy), max(0, -ox)
+            dy0, dx0 = max(0, oy),  max(0, ox)
+            hh = min(zh - sy0, th - dy0); ww = min(zw - sx0, tw - dx0)
+            out[dy0:dy0+hh, dx0:dx0+ww] = zoomed[sy0:sy0+hh, sx0:sx0+ww]
+            arr = out
+
+        if dx or dy:
+            arr = np.roll(arr, (dy, dx), axis=(0, 1))
+            # blank the wrapped-around edges so shifted regions read as empty
+            if dy > 0:   arr[:dy, :] = 0
+            elif dy < 0: arr[dy:, :] = 0
+            if dx > 0:   arr[:, :dx] = 0
+            elif dx < 0: arr[:, dx:] = 0
+
+        self.wl_resized = arr
 
     # ── map computation ───────────────────────────────────────────────────────
     def _band_mean(self, lo, hi):
@@ -5518,21 +6197,57 @@ class RamanApp(tk.Tk):
         rgb[...,0]=A; rgb[...,2]=B
         return np.clip(rgb, 0, 1)
 
+    def _wl_cover_bbox(self, shape):
+        """Bounding box (x0, x1, y0, y1) of the white-light–covered region in
+        map-pixel coords, or None if fully covered / no data. Used to auto-crop
+        the map view to the covered area after an alignment shift."""
+        wl = self.wl_resized
+        if wl is None:
+            return None
+        cov = (wl[..., 3] > 0.0) if wl.shape[-1] >= 4 \
+            else np.any(wl[..., :3] > 0.0, axis=-1)
+        if cov.all() or not cov.any():
+            return None
+        h, w = shape
+        if cov.shape != (h, w):
+            cov = np.asarray(Image.fromarray((cov * 255).astype(np.uint8)).resize(
+                (w, h), Image.NEAREST)) > 127
+            if cov.all() or not cov.any():
+                return None
+        rows = np.where(cov.any(axis=1))[0]
+        cols = np.where(cov.any(axis=0))[0]
+        return int(cols.min()), int(cols.max()) + 1, int(rows.min()), int(rows.max()) + 1
+
     def _blend_wl(self, base):
         if self.wl_resized is None: return base
         alpha  = self.sl_wl_alpha.value
         bright = self.sl_wl_bright.value
-        wl = np.clip(self.wl_resized[...,:3]*bright, 0, 1)
+        wl_full = self.wl_resized
+        wl = np.clip(wl_full[...,:3]*bright, 0, 1)
         h,w = base.shape[:2]
         wl_r = np.asarray(
             Image.fromarray((wl*255).astype(np.uint8)).resize((w,h), Image.LANCZOS),
             dtype=np.float32) / 255.0
+        # Coverage mask: where the (possibly shifted/scaled) white-light image
+        # actually has data.  Regions exposed by alignment shifts are blanked to
+        # zero (incl. alpha); show the base map there instead of blending in
+        # black — that avoids the odd solid-black band in saved figures.
+        if wl_full.shape[-1] >= 4:
+            cover_src = (wl_full[..., 3] > 0.0)
+        else:
+            cover_src = np.any(wl_full[..., :3] > 0.0, axis=-1)
+        cover = np.asarray(
+            Image.fromarray((cover_src * 255).astype(np.uint8)).resize(
+                (w, h), Image.NEAREST), dtype=np.float32) / 255.0
+        cover = cover[..., None]                        # (h, w, 1)
         if base.ndim == 2:
             norm = Normalize(vmin=base.min(), vmax=base.max())
             base_rgb = plt.get_cmap(self.cmap_var.get())(norm(base))[...,:3]
         else:
             base_rgb = base[...,:3]
-        return np.clip((1-alpha)*base_rgb + alpha*wl_r, 0, 1)
+        blended = (1 - alpha) * base_rgb + alpha * wl_r
+        out = np.where(cover > 0.5, blended, base_rgb)  # exposed → base map
+        return np.clip(out, 0, 1)
 
     def update_map(self):
         if self.spectra is None: return
@@ -5572,8 +6287,17 @@ class RamanApp(tk.Tk):
                 self.cbar.update_normal(self.im)
 
         self.im.set_extent((0,data.shape[1],data.shape[0],0))
-        self.ax_map.set_xlim(0,data.shape[1])
-        self.ax_map.set_ylim(data.shape[0],0)
+        # Auto-crop the view to the white-light–covered area when an alignment
+        # shift has exposed an uncovered strip, so saved figures don't show a
+        # blank/black border.  Falls back to the full frame when fully covered.
+        bb = self._wl_cover_bbox(data.shape[:2]) if self.wl_resized is not None else None
+        if bb is not None:
+            x0, x1, y0, y1 = bb
+            self.ax_map.set_xlim(x0, x1)
+            self.ax_map.set_ylim(y1, y0)          # inverted y (origin="upper")
+        else:
+            self.ax_map.set_xlim(0, data.shape[1])
+            self.ax_map.set_ylim(data.shape[0], 0)
         self._update_xhair()
         self.canvas.draw_idle()
 
@@ -6478,7 +7202,7 @@ class RamanApp(tk.Tk):
                 im_wl = None
 
         im_dm = ax_map.imshow(np.zeros((Y * ZOOM, X * ZOOM)), cmap=cmap,
-                              origin="upper", interpolation="nearest")
+                              origin="upper", interpolation="bicubic")
         im_dm.set_zorder(1)
         cbar = fig.colorbar(im_dm, ax=ax_map, fraction=0.046, pad=0.02)
         cbar.ax.tick_params(labelsize=8)
@@ -6663,7 +7387,7 @@ class RamanApp(tk.Tk):
             arr = np.array(im_dm.get_array())
             cmap2 = im_dm.get_cmap(); vmin, vmax = im_dm.get_clim()
             alpha2 = float(im_dm.get_alpha() if im_dm.get_alpha() is not None else 1.0)
-            ax2.imshow(arr, origin="upper", interpolation="nearest", cmap=cmap2, vmin=vmin, vmax=vmax, alpha=alpha2)
+            ax2.imshow(arr, origin="upper", interpolation="bicubic", cmap=cmap2, vmin=vmin, vmax=vmax, alpha=alpha2)
             try:
                 if getattr(roi_mgr, "_patch", None) is not None:
                     p = roi_mgr._patch
@@ -7940,7 +8664,14 @@ class RamanApp(tk.Tk):
             defaultextension=".png",
             filetypes=[("PNG","*.png"),("Text","*.txt"),("NumPy","*.npy")])
         if not path: return
-        arr = self.im.get_array()
+        arr = np.asarray(self.im.get_array())
+        # Match the on-screen auto-crop: if an alignment shift exposed an
+        # uncovered strip, crop the saved array to the white-light area too.
+        if self.wl_resized is not None:
+            bb = self._wl_cover_bbox(arr.shape[:2])
+            if bb is not None:
+                x0, x1, y0, y1 = bb
+                arr = arr[y0:y1, x0:x1]
         if path.endswith(".npy"):
             np.save(path, arr)
         elif path.endswith(".txt"):
@@ -7999,6 +8730,8 @@ class RamanApp(tk.Tk):
             initialfile=stem,
             defaultextension=".npz",
             filetypes=[("NumPy archive", "*.npz"),
+                       ("Parquet cube", "*.parquet"),
+                       ("Feather cube", "*.feather"),
                        ("HDF5", "*.h5"),
                        ("CSV", "*.csv"),
                        ("Text", "*.txt"),
@@ -8023,34 +8756,64 @@ class RamanApp(tk.Tk):
 
     # ── v13: recipes, reprocess, QC, batch, report, session ────────────────────
     def save_recipe(self):
-        """Save the current preprocessing parameters to a JSON recipe file."""
+        """Export the current processing pipeline to a JSON or YAML file
+        (self-describing + re-runnable on a folder via Run Pipeline)."""
         path = filedialog.asksaveasfilename(
-            title="Save Preprocessing Recipe",
-            initialfile="recipe", defaultextension=".json",
-            filetypes=[("JSON recipe", "*.json")])
+            title="Export Pipeline (JSON / YAML)",
+            initialfile="pipeline", defaultextension=".json",
+            filetypes=[("JSON pipeline", "*.json"),
+                       ("YAML pipeline", "*.yaml"),
+                       ("YAML pipeline", "*.yml")])
         if not path:
             return
         try:
-            save_recipe_file(path, self.pp_params)
+            save_pipeline_file(path, self.pp_params,
+                               source=getattr(self, "_loaded_path", ""))
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc)); return
-        self._status.set(f"Recipe saved  →  {Path(path).name}")
+        self._status.set(f"Pipeline exported  →  {Path(path).name}")
 
     def load_recipe(self):
-        """Load preprocessing parameters from a JSON recipe and offer to reapply."""
+        """Load a pipeline/recipe (JSON or YAML) and offer to reapply."""
         path = filedialog.askopenfilename(
-            title="Load Preprocessing Recipe",
-            filetypes=[("JSON recipe", "*.json"), ("All", "*.*")])
+            title="Load Pipeline / Recipe",
+            filetypes=[("Pipeline / recipe", "*.json *.yaml *.yml"),
+                       ("All", "*.*")])
         if not path:
             return
         try:
-            self.pp_params = load_recipe_file(path)
+            self.pp_params = load_pipeline_file(path)
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc)); return
-        self._status.set(f"Recipe loaded  →  {Path(path).name}")
+        self._status.set(f"Pipeline loaded  →  {Path(path).name}")
         if getattr(self, "_raw_spectra", None) is not None and messagebox.askyesno(
-                "Reprocess", "Re-apply the loaded recipe to the current data now?"):
+                "Reprocess", "Re-apply the loaded pipeline to the current data now?"):
             self.reprocess()
+
+    def run_pipeline_folder(self):
+        """Replay an exported pipeline file over every map in a chosen folder."""
+        pipe = filedialog.askopenfilename(
+            title="Choose a pipeline file (JSON / YAML)",
+            filetypes=[("Pipeline / recipe", "*.json *.yaml *.yml"),
+                       ("All", "*.*")])
+        if not pipe:
+            return
+        in_dir = filedialog.askdirectory(title="Folder of maps to process")
+        if not in_dir:
+            return
+        out_dir = filedialog.askdirectory(title="Output folder for results")
+        if not out_dir:
+            return
+        self._status.set("Running pipeline…")
+        def worker():
+            try:
+                n_ok, n_fail = run_pipeline(pipe, in_dir, out_dir,
+                                            log=lambda m: None)
+                msg = f"Pipeline done: {n_ok} ok, {n_fail} failed → {Path(out_dir).name}"
+            except Exception as exc:
+                msg = f"Pipeline failed: {exc}"
+            self.after(0, lambda: self._status.set(msg))
+        threading.Thread(target=worker, daemon=True).start()
 
     def reprocess(self, show_summary=True):
         """Re-run preprocessing on the retained raw cube (no disk reload).
@@ -8365,11 +9128,90 @@ td:first-child{{color:#556;font-weight:600}} img{{max-width:100%;border:1px soli
             messagebox.showwarning("No data", "Load a WDF file first."); return
         SpectralToolsWindow(self)
 
+    def open_group_compare(self):
+        """Multi-file group comparison: per-cell custom band ratio with
+        Mann-Whitney / Hodges-Lehmann / Cliff's delta + group mean-spectra
+        overlay. Implemented in the companion module bioraman_group_compare.py."""
+        try:
+            import bioraman_group_compare as bgc
+        except Exception as e:
+            messagebox.showerror(
+                "Group Comparison unavailable",
+                "Could not load bioraman_group_compare.py.\n\n"
+                "Ensure the module sits next to bioraman.py and that scikit-image "
+                "is installed.\n\nDetails: %s" % e)
+            return
+        bgc.open_group_compare(self)
+
+    def open_planner(self):
+        """Offline analysis planner: asks about the sample/goal and suggests a
+        BioRaman workflow from a built-in knowledge base (no external search)."""
+        try:
+            import bioraman_planner as bp
+        except Exception as e:
+            messagebox.showerror(
+                "Analysis Planner unavailable",
+                "Could not load bioraman_planner.py (keep it next to bioraman.py).\n\n"
+                "Details: %s" % e)
+            return
+        bp.open_planner(self)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED: export each panel of a multi-panel figure as its own file
+# ─────────────────────────────────────────────────────────────────────────────
+def save_panels_dialog(win, fig, panels, base="figure"):
+    """Save each (axes, name) in *panels* as its own standalone image by
+    cropping the live figure to that axes' tight bounding box. Prompts for a
+    folder and (optionally) a vector PDF copy. Returns the list of files."""
+    out_dir = filedialog.askdirectory(
+        title="Choose a folder for the individual panels", parent=win)
+    if not out_dir:
+        return []
+    save_pdf = messagebox.askyesno(
+        "Vector copy?",
+        "Also save a vector PDF of each panel (recommended for journals)?\n\n"
+        "Yes → PNG (600 dpi) + PDF      No → PNG only",
+        parent=win)
+
+    def _sanitize(s):
+        s = str(s).strip().replace(" ", "_")
+        return "".join(ch for ch in s if ch.isalnum() or ch in "-_[]()")[:40] or "panel"
+
+    try:
+        fig.canvas.draw()
+    except Exception:
+        pass
+    renderer = fig.canvas.get_renderer()
+    exported = []
+    for ax, name in panels:
+        if ax is None or not ax.get_visible():
+            continue
+        try:
+            bbox = ax.get_tightbbox(renderer).transformed(
+                fig.dpi_scale_trans.inverted())
+        except Exception:
+            bbox = ax.get_window_extent().transformed(
+                fig.dpi_scale_trans.inverted())
+        bbox = bbox.expanded(1.06, 1.10)
+        tag = _sanitize(name)
+        png = Path(out_dir) / f"{base}_{tag}.png"
+        fig.savefig(png, dpi=600, bbox_inches=bbox, facecolor="white")
+        exported.append(png.name)
+        if save_pdf:
+            pdf = Path(out_dir) / f"{base}_{tag}.pdf"
+            fig.savefig(pdf, bbox_inches=bbox, facecolor="white")
+            exported.append(pdf.name)
+    messagebox.showinfo(
+        "Panels saved",
+        f"Saved {len(exported)} files to:\n{out_dir}", parent=win)
+    return exported
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLUSTER ANALYSIS WINDOW
 # ─────────────────────────────────────────────────────────────────────────────
-class ClusteringWindow(tk.Toplevel):
+class ClusteringWindow(PanelSaveMixin, tk.Toplevel):
     """
     K-means and Agglomerative (Ward linkage) clustering on the Raman map.
 
@@ -8419,8 +9261,7 @@ class ClusteringWindow(tk.Toplevel):
                  font=("Consolas", 12, "bold")).pack(side="left", padx=16, pady=10)
 
         # Left controls
-        left = tk.Frame(self, bg=C["sidebar"], width=270)
-        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        left = make_scroll_sidebar(self, 270)
 
         SectionDiv(left, "METHOD").pack(fill="x")
         self._method = tk.StringVar(value="kmeans")
@@ -8491,8 +9332,10 @@ class ClusteringWindow(tk.Toplevel):
         self._status.pack(padx=12, pady=4, anchor="w")
 
         SectionDiv(left, "EXPORT").pack(fill="x")
-        ttk.Button(left, text="↓ Save Figure", style="N.TButton",
+        ttk.Button(left, text="↓ Save Figure (whole page)", style="N.TButton",
                    command=self._save_fig).pack(fill="x", padx=12, pady=4)
+        ttk.Button(left, text="↓ Save Individual Panels…", style="N.TButton",
+                   command=self._save_panels).pack(fill="x", padx=12, pady=4)
         ttk.Button(left, text="↓ Save Label Matrix (.csv)", style="N.TButton",
                    command=self._save_labels).pack(fill="x", padx=12, pady=4)
 
@@ -8521,6 +9364,7 @@ class ClusteringWindow(tk.Toplevel):
         self._canvas = FigureCanvasTkAgg(self._fig, master=right)
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self._canvas, right).update()
+        self._enable_panel_ticks(self._canvas, basename="Clustering")
 
     # ── run ───────────────────────────────────────────────────────────────────
     def _run(self):
@@ -8676,6 +9520,22 @@ class ClusteringWindow(tk.Toplevel):
         if path:
             self._fig.savefig(path, dpi=250, bbox_inches="tight")
 
+    def _save_panels(self):
+        if self._labels is None:
+            messagebox.showwarning("No results", "Run clustering first.",
+                                   parent=self)
+            return
+        base = Path(getattr(self.master, "_last_wdf_path", "Cluster")).stem or "Cluster"
+        panels = [
+            (self._ax_map,  "cluster_map"),
+            (self._ax_spec, "mean_spectra"),
+            (self._ax_bar,  "pixel_counts"),
+        ]
+        n = save_panels_dialog(self, self._fig, panels, base=base)
+        if n:
+            self._status.config(
+                text=f"Saved {len(n)} individual panels.", fg=C["success"])
+
     def _save_labels(self):
         if self._labels is None:
             messagebox.showwarning("No results", "Run clustering first.",
@@ -8815,9 +9675,9 @@ BAND_LIBRARIES = {
     ],
 
     # ====================================================================
-    # RamanBioLib - 135 biomolecules, ODbL-1.0 (Teran et al. 2025).
+    # RamanBioLib - 144 biomolecules, ODbL-1.0 (Teran et al. 2025).
     # Auto-generated diagnostic peaks (rel.I >= 0.40), grouped by wavenumber.
-    "Biology / RamanBioLib (135 biomolecules)": [
+    "Biology / RamanBioLib (144 biomolecules)": [
         (452, "RamanBioLib: l-proline"),
         (477, "RamanBioLib: amylopectin, lactose"),
         (481, "RamanBioLib: amylose"),
@@ -8835,6 +9695,7 @@ BAND_LIBRARIES = {
         (541, "RamanBioLib: d-(+)-dextrose"),
         (542, "RamanBioLib: β-d-glucose, l-valine"),
         (548, "RamanBioLib: cytosine"),
+        (560, "RamanBioLib: l-threonine"),
         (566, "RamanBioLib: ascorbic acid"),
         (578, "RamanBioLib: n-acetyl- d-glucosamine"),
         (611, "RamanBioLib: malic acid, l-serine"),
@@ -8845,7 +9706,7 @@ BAND_LIBRARIES = {
         (631, "RamanBioLib: acetyl coenzyme a"),
         (640, "RamanBioLib: acetoacetate"),
         (642, "RamanBioLib: l-proline"),
-        (643, "RamanBioLib: papain"),
+        (643, "RamanBioLib: papain, o-phospho-l-tyrosine"),
         (650, "RamanBioLib: guanine"),
         (660, "RamanBioLib: glutathione"),
         (669, "RamanBioLib: d-(+)-fucose"),
@@ -8855,8 +9716,9 @@ BAND_LIBRARIES = {
         (722, "RamanBioLib: coenzyme a"),
         (723, "RamanBioLib: adenine"),
         (724, "RamanBioLib: acetyl coenzyme a"),
+        (728, "RamanBioLib: dna"),
         (740, "RamanBioLib: thymine"),
-        (749, "RamanBioLib: malic acid"),
+        (749, "RamanBioLib: malic acid, cytochrome c, cytochrome b5, cytochrome p450"),
         (751, "RamanBioLib: hemoglobin, myoglobin"),
         (755, "RamanBioLib: l-tryptophan"),
         (761, "RamanBioLib: lactalbumin"),
@@ -8864,12 +9726,13 @@ BAND_LIBRARIES = {
         (764, "RamanBioLib: elastase"),
         (765, "RamanBioLib: lactalbumin"),
         (776, "RamanBioLib: l-valine, glutathione"),
-        (784, "RamanBioLib: citric acid"),
+        (780, "RamanBioLib: l-threonine"),
+        (784, "RamanBioLib: citric acid, dna, rna, o-phospho-l-threonine"),
         (787, "RamanBioLib: phosphoenolpyruvate"),
         (790, "RamanBioLib: uracil, n-acetyl- d-glucosamine"),
         (792, "RamanBioLib: cytosine"),
-        (813, "RamanBioLib: l-serine"),
-        (815, "RamanBioLib: d-(+)-fucose"),
+        (813, "RamanBioLib: l-serine, rna"),
+        (815, "RamanBioLib: d-(+)-fucose, o-phospho-l-serine"),
         (818, "RamanBioLib: d-(-)-fructose"),
         (820, "RamanBioLib: ascorbic acid, glycerol"),
         (828, "RamanBioLib: l-tyrosine"),
@@ -8890,7 +9753,7 @@ BAND_LIBRARIES = {
         (861, "RamanBioLib: d-(+)-mannose"),
         (862, "RamanBioLib: collagen"),
         (872, "RamanBioLib: d-(+)-galactosamine, d-(-)-fructose"),
-        (874, "RamanBioLib: l-tryptophan"),
+        (874, "RamanBioLib: l-tryptophan, o-phospho-l-threonine, l-threonine"),
         (877, "RamanBioLib: pepsin, l-proline"),
         (879, "RamanBioLib: d-(+)-fucose"),
         (882, "RamanBioLib: d-(+)-mannose"),
@@ -8901,18 +9764,18 @@ BAND_LIBRARIES = {
         (899, "RamanBioLib: l-proline"),
         (903, "RamanBioLib: d-(+)-xylose"),
         (912, "RamanBioLib: d-(+)-trehalose"),
-        (914, "RamanBioLib: β-d-glucose"),
+        (914, "RamanBioLib: β-d-glucose, o-phospho-l-threonine"),
         (916, "RamanBioLib: l-proline, lactose"),
         (917, "RamanBioLib: glutathione"),
         (924, "RamanBioLib: collagen"),
         (926, "RamanBioLib: papain"),
         (928, "RamanBioLib: acetoacetate"),
         (929, "RamanBioLib: n-acetyl- d-glucosamine"),
-        (930, "RamanBioLib: l-proline"),
+        (930, "RamanBioLib: l-proline, o-phospho-l-serine"),
         (931, "RamanBioLib: papain, glutathione"),
         (933, "RamanBioLib: papain"),
         (936, "RamanBioLib: succinic acid, amylose"),
-        (940, "RamanBioLib: amylopectin, collagen"),
+        (940, "RamanBioLib: amylopectin, collagen, o-phospho-l-threonine, l-threonine"),
         (942, "RamanBioLib: l-glutamate, citric acid"),
         (944, "RamanBioLib: amylose"),
         (945, "RamanBioLib: albumin"),
@@ -8922,7 +9785,7 @@ BAND_LIBRARIES = {
         (973, "RamanBioLib: n-acetyl- d-glucosamine, d-fructose-6-phosphate"),
         (982, "RamanBioLib: l-arginine"),
         (994, "RamanBioLib: l-proline"),
-        (1003, "RamanBioLib: lectin, ferritin, lactalbumin"),
+        (1003, "RamanBioLib: lectin, ferritin, lactalbumin, cytochrome c"),
         (1004, "RamanBioLib: l-phenylalanine, carbonic anhydrase, albumin, pepsin"),
         (1005, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
         (1006, "RamanBioLib: carbonic anhydrase, glutathione transferase"),
@@ -8932,6 +9795,7 @@ BAND_LIBRARIES = {
         (1010, "RamanBioLib: pepsinogen, glutathione transferase"),
         (1011, "RamanBioLib: lectin, papain, α-chymotrypsinogen a (type ii)"),
         (1014, "RamanBioLib: elastase"),
+        (1017, "RamanBioLib: dna"),
         (1020, "RamanBioLib: n-acetyl- d-glucosamine"),
         (1021, "RamanBioLib: lactose"),
         (1031, "RamanBioLib: lactose"),
@@ -8957,10 +9821,10 @@ BAND_LIBRARIES = {
         (1083, "RamanBioLib: amylose"),
         (1085, "RamanBioLib: l-α-phosphatidylethanolamine"),
         (1086, "RamanBioLib: d-(+)-xylose"),
-        (1087, "RamanBioLib: d-(+)-mannose, lactose"),
+        (1087, "RamanBioLib: d-(+)-mannose, lactose, o-phospho-l-serine"),
         (1089, "RamanBioLib: l-α-phosphatidylcholine"),
-        (1096, "RamanBioLib: cellulose, l-α-phosphatidylethanolamine, l-α-phosphatidylcholine"),
-        (1098, "RamanBioLib: 12-methyltetradecanoic acid"),
+        (1096, "RamanBioLib: cellulose, l-α-phosphatidylethanolamine, l-α-phosphatidylcholine, dna"),
+        (1098, "RamanBioLib: 12-methyltetradecanoic acid, rna"),
         (1102, "RamanBioLib: d-(+)-trehalose"),
         (1106, "RamanBioLib: d-(+)-mannose"),
         (1107, "RamanBioLib: chitin"),
@@ -8975,9 +9839,9 @@ BAND_LIBRARIES = {
         (1125, "RamanBioLib: myristic acid, tricaprin"),
         (1126, "RamanBioLib: n-acetyl- d-glucosamine"),
         (1127, "RamanBioLib: lauric acid, trilaurin, amylopectin, pepsinogen"),
-        (1128, "RamanBioLib: myristic acid"),
+        (1128, "RamanBioLib: myristic acid, cytochrome c"),
         (1129, "RamanBioLib: palmitic acid, trimyristin, sphingomyelin, d-(+)-fucose"),
-        (1130, "RamanBioLib: ascorbic acid, tripalmitin, tristearin"),
+        (1130, "RamanBioLib: ascorbic acid, tripalmitin, tristearin, cytochrome b5, cytochrome p450"),
         (1131, "RamanBioLib: hemoglobin, myoglobin, triarachidin, tribehenin, cholesteryl palmitate"),
         (1132, "RamanBioLib: palmitic acid, arachidic acid"),
         (1133, "RamanBioLib: cholesteryl stearate"),
@@ -8988,14 +9852,17 @@ BAND_LIBRARIES = {
         (1149, "RamanBioLib: d-(+)-trehalose, chitin"),
         (1155, "RamanBioLib: d-(+)-fucose"),
         (1156, "RamanBioLib: β-carotene"),
+        (1172, "RamanBioLib: cytochrome c, o-phospho-l-tyrosine"),
         (1178, "RamanBioLib: cholesterol"),
+        (1210, "RamanBioLib: o-phospho-l-tyrosine"),
         (1226, "RamanBioLib: riboﬂavin"),
+        (1230, "RamanBioLib: o-phospho-l-tyrosine"),
         (1234, "RamanBioLib: guanine"),
         (1235, "RamanBioLib: uracil"),
         (1236, "RamanBioLib: carbonic anhydrase, lectin, elastase"),
         (1237, "RamanBioLib: carbonic anhydrase"),
         (1239, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
-        (1240, "RamanBioLib: elastase, α-chymotrypsinogen a (type ii), l-proline"),
+        (1240, "RamanBioLib: elastase, α-chymotrypsinogen a (type ii), l-proline, rna"),
         (1241, "RamanBioLib: carbonic anhydrase"),
         (1245, "RamanBioLib: pepsin"),
         (1246, "RamanBioLib: lectin"),
@@ -9005,7 +9872,7 @@ BAND_LIBRARIES = {
         (1254, "RamanBioLib: pepsin"),
         (1256, "RamanBioLib: ascorbic acid, d-(+)-fucose"),
         (1257, "RamanBioLib: n-acetyl- d-glucosamine"),
-        (1258, "RamanBioLib: papain, lactalbumin"),
+        (1258, "RamanBioLib: papain, lactalbumin, dna"),
         (1261, "RamanBioLib: lactose"),
         (1262, "RamanBioLib: papain, linoleic acid"),
         (1263, "RamanBioLib: cholesteryl linoleate, α-linolenic acid"),
@@ -9026,17 +9893,18 @@ BAND_LIBRARIES = {
         (1297, "RamanBioLib: trilaurin, triarachidin, trimyristin, tristearin, tripalmitin"),
         (1298, "RamanBioLib: arachidic acid"),
         (1299, "RamanBioLib: tricaprin"),
-        (1300, "RamanBioLib: palmitic acid, l-α-phosphatidylethanolamine, stearic acid, l-α-phosphatidylcholine"),
+        (1300, "RamanBioLib: palmitic acid, l-α-phosphatidylethanolamine, stearic acid, l-α-phosphatidylcholine, rna"),
         (1301, "RamanBioLib: triolein, oleic acid"),
         (1302, "RamanBioLib: vaccenic acid, triolein, 12-methyltetradecanoic acid"),
         (1303, "RamanBioLib: tri-11-eicosenoin"),
-        (1304, "RamanBioLib: tripalmitolein"),
+        (1304, "RamanBioLib: tripalmitolein, dna"),
         (1305, "RamanBioLib: l-alanine, palmitoleic acid, tricaprylin"),
         (1306, "RamanBioLib: oleic acid, tricaproin, cholesteryl linoleate, cholesteryl oleate, acetyl coenzyme a"),
         (1308, "RamanBioLib: myoglobin"),
-        (1310, "RamanBioLib: hemoglobin"),
+        (1310, "RamanBioLib: hemoglobin, cytochrome b5, cytochrome p450"),
+        (1313, "RamanBioLib: cytochrome c"),
         (1317, "RamanBioLib: l-histidine"),
-        (1319, "RamanBioLib: albumin, ascorbic acid"),
+        (1319, "RamanBioLib: albumin, ascorbic acid, rna"),
         (1321, "RamanBioLib: albumin, n-acetyl- d-glucosamine"),
         (1323, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
         (1325, "RamanBioLib: coenzyme a"),
@@ -9048,35 +9916,36 @@ BAND_LIBRARIES = {
         (1333, "RamanBioLib: acetyl coenzyme a"),
         (1334, "RamanBioLib: papain, pepsin, glutathione"),
         (1335, "RamanBioLib: lectin, carbonic anhydrase"),
-        (1336, "RamanBioLib: pepsin"),
-        (1339, "RamanBioLib: papain, elastase, amylose"),
-        (1340, "RamanBioLib: ferritin, albumin, α-chymotrypsinogen a (type ii)"),
+        (1336, "RamanBioLib: pepsin, cytochrome c"),
+        (1339, "RamanBioLib: papain, elastase, amylose, rna"),
+        (1340, "RamanBioLib: ferritin, albumin, α-chymotrypsinogen a (type ii), dna"),
         (1341, "RamanBioLib: albumin, l-glutamate"),
-        (1342, "RamanBioLib: carbonic anhydrase, glutathione transferase, pepsin, lectin, elastase"),
+        (1342, "RamanBioLib: carbonic anhydrase, glutathione transferase, pepsin, lectin, elastase, l-threonine"),
         (1343, "RamanBioLib: lactalbumin, glutathione transferase, ferritin, α-chymotrypsinogen a (type ii)"),
         (1344, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
         (1345, "RamanBioLib: riboﬂavin, lectin"),
         (1346, "RamanBioLib: carbonic anhydrase"),
         (1347, "RamanBioLib: elastase, papain"),
         (1351, "RamanBioLib: l-valine"),
+        (1355, "RamanBioLib: l-threonine"),
         (1358, "RamanBioLib: d-(+)-trehalose, l-tryptophan"),
         (1359, "RamanBioLib: l-alanine, lactose"),
-        (1360, "RamanBioLib: hemoglobin"),
+        (1360, "RamanBioLib: hemoglobin, cytochrome c, cytochrome b5"),
         (1369, "RamanBioLib: thymine"),
-        (1370, "RamanBioLib: horseradish peroxidase"),
+        (1370, "RamanBioLib: horseradish peroxidase, cytochrome p450"),
         (1371, "RamanBioLib: chitin, d-(+)-trehalose"),
-        (1377, "RamanBioLib: horseradish peroxidase"),
+        (1377, "RamanBioLib: horseradish peroxidase, dna"),
         (1378, "RamanBioLib: l-proline"),
         (1379, "RamanBioLib: amylose"),
         (1380, "RamanBioLib: myoglobin, lactose, n-acetyl- d-glucosamine"),
         (1389, "RamanBioLib: l-proline"),
-        (1399, "RamanBioLib: acetoacetate"),
+        (1399, "RamanBioLib: acetoacetate, cytochrome c"),
         (1401, "RamanBioLib: l-glutamate"),
         (1407, "RamanBioLib: coenzyme a"),
-        (1408, "RamanBioLib: pyruvate"),
+        (1408, "RamanBioLib: pyruvate, o-phospho-l-serine, o-phospho-l-threonine, l-threonine"),
         (1414, "RamanBioLib: chitin"),
         (1420, "RamanBioLib: succinic acid, coenzyme a"),
-        (1421, "RamanBioLib: palmitic acid, l-glutamate"),
+        (1421, "RamanBioLib: palmitic acid, l-glutamate, dna"),
         (1422, "RamanBioLib: acetoacetate, myristic acid"),
         (1423, "RamanBioLib: l-tryptophan"),
         (1426, "RamanBioLib: palmitic acid"),
@@ -9116,43 +9985,45 @@ BAND_LIBRARIES = {
         (1466, "RamanBioLib: tribehenin, tripalmitin, stearic acid, arachidic acid"),
         (1467, "RamanBioLib: triarachidin, palmitic acid"),
         (1468, "RamanBioLib: cholesteryl stearate"),
-        (1469, "RamanBioLib: 13-methylmyristicacid"),
+        (1469, "RamanBioLib: 13-methylmyristicacid, o-phospho-l-serine"),
         (1472, "RamanBioLib: 12-methyltetradecanoic acid"),
-        (1482, "RamanBioLib: l-alanine"),
+        (1482, "RamanBioLib: l-alanine, rna"),
+        (1489, "RamanBioLib: dna"),
         (1515, "RamanBioLib: β-carotene"),
         (1553, "RamanBioLib: carbonic anhydrase"),
         (1554, "RamanBioLib: α-chymotrypsinogen a (type ii)"),
         (1555, "RamanBioLib: lactalbumin, elastase"),
         (1556, "RamanBioLib: elastase, lactalbumin"),
         (1560, "RamanBioLib: horseradish peroxidase"),
-        (1575, "RamanBioLib: horseradish peroxidase"),
-        (1585, "RamanBioLib: myoglobin, hemoglobin"),
-        (1610, "RamanBioLib: albumin"),
+        (1575, "RamanBioLib: horseradish peroxidase, rna"),
+        (1578, "RamanBioLib: dna"),
+        (1585, "RamanBioLib: myoglobin, hemoglobin, cytochrome c, cytochrome b5, cytochrome p450"),
+        (1610, "RamanBioLib: albumin, o-phospho-l-tyrosine"),
         (1615, "RamanBioLib: ferritin, papain"),
         (1617, "RamanBioLib: papain, pepsin"),
         (1618, "RamanBioLib: papain"),
         (1619, "RamanBioLib: lactalbumin, carbonic anhydrase"),
-        (1620, "RamanBioLib: elastase, glutathione transferase, carbonic anhydrase"),
+        (1620, "RamanBioLib: elastase, glutathione transferase, carbonic anhydrase, cytochrome b5, cytochrome p450"),
         (1622, "RamanBioLib: glutathione transferase"),
         (1623, "RamanBioLib: pepsinogen"),
         (1625, "RamanBioLib: elastase"),
         (1630, "RamanBioLib: horseradish peroxidase"),
         (1632, "RamanBioLib: horseradish peroxidase"),
-        (1640, "RamanBioLib: myoglobin, trilinolenin, hemoglobin"),
+        (1640, "RamanBioLib: myoglobin, trilinolenin, hemoglobin, cytochrome c"),
         (1653, "RamanBioLib: arachidonic acid, ascorbic acid"),
         (1654, "RamanBioLib: α-linolenic acid, linoleic acid, trilinolein"),
         (1655, "RamanBioLib: trilinolenin, palmitoleic acid, vaccenic acid, oleic acid, triolein"),
         (1656, "RamanBioLib: trilinolenin, albumin, tripalmitolein, tri-11-eicosenoin"),
         (1657, "RamanBioLib: albumin, trilinolein, oleic acid, l-α-phosphatidylethanolamine"),
         (1658, "RamanBioLib: ferritin"),
-        (1660, "RamanBioLib: trierucin"),
+        (1660, "RamanBioLib: trierucin, rna"),
         (1661, "RamanBioLib: ferritin"),
         (1662, "RamanBioLib: glutathione transferase, cholesteryl linoleate, ferritin"),
         (1664, "RamanBioLib: glutathione transferase"),
         (1665, "RamanBioLib: lactalbumin, carbonic anhydrase, papain"),
         (1666, "RamanBioLib: collagen"),
         (1667, "RamanBioLib: lectin, ascorbic acid, carbonic anhydrase"),
-        (1668, "RamanBioLib: collagen, papain, α-chymotrypsinogen a (type ii)"),
+        (1668, "RamanBioLib: collagen, papain, α-chymotrypsinogen a (type ii), dna"),
         (1669, "RamanBioLib: α-chymotrypsinogen a (type ii), carbonic anhydrase, elastase, pepsin"),
         (1670, "RamanBioLib: lactalbumin"),
         (1671, "RamanBioLib: thymine, elastase, pepsin"),
@@ -9167,15 +10038,47 @@ BAND_LIBRARIES = {
 }
 
 # Merge the RamanBioLib reference bands into the Cryopreservation library so the
-# 135-biomolecule set is available within the default biology library (no
+# 144-biomolecule set is available within the default biology library (no
 # separate dropdown entry / external CSV needed).
 BAND_LIBRARIES["Biology / Cryopreservation"] = (
     BAND_LIBRARIES["Biology / Cryopreservation"]
-    + BAND_LIBRARIES.pop("Biology / RamanBioLib (135 biomolecules)")
+    + BAND_LIBRARIES.pop("Biology / RamanBioLib (144 biomolecules)")
 )
 
 # Active library (mutable; the Peak-ID window can switch it).  Default = biology.
 RAMAN_BANDS = BAND_LIBRARIES["Biology / Cryopreservation"]
+
+# ---------------------------------------------------------------------------
+# Optional PERSONAL overlay (private; never committed to GitHub, see .gitignore).
+# If a local `ramanbiolib_personal.py` sits next to this script, its
+# PERSONAL_BANDS list [(wavenumber, "label"), ...] is merged into the active
+# biology library, and any PERSONAL_LIBRARIES dict is added as extra selectable
+# libraries.  This lets a private build carry additional reference bands (e.g.
+# MicrobioRaman-derived or literature-estimated) on top of the public set,
+# without changing anything in the public repository.  No-ops if absent.
+# ---------------------------------------------------------------------------
+try:
+    import os as _os, importlib.util as _ilu
+    try:
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+    except NameError:
+        _here = _os.getcwd()
+    _pp = _os.path.join(_here, "ramanbiolib_personal.py")
+    if _os.path.exists(_pp):
+        _spec = _ilu.spec_from_file_location("ramanbiolib_personal", _pp)
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _extra = list(getattr(_mod, "PERSONAL_BANDS", []) or [])
+        if _extra:
+            RAMAN_BANDS = RAMAN_BANDS + _extra
+            BAND_LIBRARIES["Biology / Cryopreservation"] = RAMAN_BANDS
+        _extra_libs = dict(getattr(_mod, "PERSONAL_LIBRARIES", {}) or {})
+        for _name, _bands in _extra_libs.items():
+            BAND_LIBRARIES[_name] = list(_bands)
+        print("[BioRaman] Personal overlay loaded: %d extra bands, %d extra libraries"
+              % (len(_extra), len(_extra_libs)))
+except Exception as _e:
+    print("[BioRaman] Personal overlay not loaded (%s)" % _e)
 
 
 def _detect_peaks(wn, spectrum, prominence=0.05, tol=12.0, bands=None):
@@ -9459,6 +10362,9 @@ class MCRWindow(tk.Toplevel):
                                      and np.asarray(roi_mask).any()) else None
         self._C: np.ndarray | None = None
         self._S: np.ndarray | None = None
+        self._panel_vars = {}     # tag -> BooleanVar (ticked = save)
+        self._panel_items = []    # [(ax, tag)] registered each _draw
+        self._panel_checks = []   # overlay Checkbutton widgets
         self._build_ui()
 
     def _build_ui(self):
@@ -9468,8 +10374,7 @@ class MCRWindow(tk.Toplevel):
                  bg=C["header"], fg="white",
                  font=("Consolas", 12, "bold")).pack(side="left", padx=16, pady=10)
 
-        left = tk.Frame(self, bg=C["sidebar"], width=270)
-        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        left = make_scroll_sidebar(self, 270)
 
         SectionDiv(left, "PARAMETERS").pack(fill="x")
         pf = tk.Frame(left, bg=C["sidebar"])
@@ -9504,6 +10409,11 @@ class MCRWindow(tk.Toplevel):
                        font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=2)
         tk.Checkbutton(left, text="Non-negative spectra",
                        variable=self._nn_S, bg=C["sidebar"], fg=C["text_mid"],
+                       activebackground=C["sidebar"],
+                       font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=2)
+        self._despike = tk.BooleanVar(value=True)
+        tk.Checkbutton(left, text="Cosmic-ray despike (pre-MCR)",
+                       variable=self._despike, bg=C["sidebar"], fg=C["text_mid"],
                        activebackground=C["sidebar"],
                        font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=2)
 
@@ -9542,6 +10452,10 @@ class MCRWindow(tk.Toplevel):
                    command=self._compare_comps).pack(fill="x", padx=12, pady=4)
         ttk.Button(left, text="⛯ Identify Peaks", style="N.TButton",
                    command=self._identify_peaks).pack(fill="x", padx=12, pady=4)
+        ttk.Button(left, text="📉 Lack-of-fit vs components", style="N.TButton",
+                   command=self._lof_scan).pack(fill="x", padx=12, pady=4)
+        ttk.Button(left, text="🧭 Flatness / tilt check", style="N.TButton",
+                   command=self._flatness_check).pack(fill="x", padx=12, pady=4)
         ds = tk.Frame(left, bg=C["sidebar"]); ds.pack(fill="x", padx=12, pady=4)
         tk.Label(ds, text="Display σ", bg=C["sidebar"], fg=C["text_mid"],
                  font=("Segoe UI", 10)).pack(side="left")
@@ -9554,17 +10468,47 @@ class MCRWindow(tk.Toplevel):
         _build_lut_panel(self, left, lambda: getattr(self, "_C", None) is not None)
 
         SectionDiv(left, "EXPORT").pack(fill="x")
-        ttk.Button(left, text="↓ Save Figure", style="N.TButton",
+        ttk.Button(left, text="↓ Save Figure (whole page)", style="N.TButton",
                    command=self._save_fig).pack(fill="x", padx=12, pady=4)
+        ttk.Button(left, text="↓ Save Individual Panels…  (all)",
+                   style="N.TButton",
+                   command=self._save_panels).pack(fill="x", padx=12, pady=4)
+        ttk.Button(left, text="☑ Save Ticked Panels…", style="N.TButton",
+                   command=self._save_ticked).pack(fill="x", padx=12, pady=4)
         ttk.Button(left, text="↓ Save Pure Spectra (.csv)", style="N.TButton",
                    command=self._save_spectra).pack(fill="x", padx=12, pady=4)
 
         right = tk.Frame(self, bg=C["bg"])
         right.pack(side="left", fill="both", expand=True)
-        self._fig = plt.figure(figsize=(12, 7), facecolor="#ffffff")
+        self._fig = plt.figure(figsize=(12, 7.6), facecolor="#ffffff")
         self._canvas = FigureCanvasTkAgg(self._fig, master=right)
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._canvas.get_tk_widget().bind(
+            "<Configure>", lambda _e: self._place_panel_ticks())
         NavigationToolbar2Tk(self._canvas, right).update()
+
+    def _place_panel_ticks(self):
+        """Overlay a small checkbox at the top-left of each live panel so the
+        user can tick which figures to save."""
+        for cb in self._panel_checks:
+            cb.destroy()
+        self._panel_checks = []
+        if not self._panel_items:
+            return
+        w = self._canvas.get_tk_widget()
+        fw, fh = w.winfo_width(), w.winfo_height()
+        if fw <= 1 or fh <= 1:
+            return
+        for ax, tag in self._panel_items:
+            var = self._panel_vars.setdefault(tag, tk.BooleanVar(value=True))
+            pos = ax.get_position()
+            x = int(pos.x0 * fw) + 2
+            y = int((1.0 - pos.y1) * fh) + 2
+            cb = tk.Checkbutton(w, variable=var, bg="white",
+                                activebackground="white", bd=0,
+                                highlightthickness=0, padx=0, pady=0)
+            cb.place(x=x, y=y)
+            self._panel_checks.append(cb)
 
     def _compare_comps(self):
         if self._S is None:
@@ -9607,6 +10551,9 @@ class MCRWindow(tk.Toplevel):
             # float32 → ~2× faster + half memory via Apple Accelerate BLAS
             dt   = np.float32 if self._fast32.get() else np.float64
             cube = np.clip(self.spectra[:, :, mask_w].astype(dt), 0, None)
+            n_spikes = 0
+            if self._despike.get():
+                cube, n_spikes = self._despike_cube(cube)
             Wsel = cube.shape[2]
 
             # Analyse only ROI pixels (ignore background) when an ROI is set
@@ -9685,6 +10632,7 @@ class MCRWindow(tk.Toplevel):
             self._S  = np.asarray(S_cur, dtype=float)     # Wsel × k
             self._xsel = xsel
             self._k  = k
+            self._n_spikes = n_spikes
             self.after(0, self._draw)
         except Exception as ex:
             self.after(0, lambda ex=ex: messagebox.showerror("Error", str(ex),
@@ -9692,20 +10640,204 @@ class MCRWindow(tk.Toplevel):
         finally:
             self.after(0, self._prog.stop)
 
+    @staticmethod
+    def _despike_cube(cube, win=5, thresh=7.0):
+        """Remove cosmic-ray spikes along the spectral axis.
+
+        A spike is a narrow, strongly positive outlier relative to a local
+        median. Detection uses a robust (MAD-based) modified z-score on the
+        residual to the median-filtered spectrum; flagged points are replaced
+        by the median value. Returns (clean_cube, n_points_replaced)."""
+        from scipy.ndimage import median_filter
+        med = median_filter(cube, size=(1, 1, win))
+        diff = cube - med
+        # Noise scale from NONZERO residuals: in flat/smooth regions the median
+        # filter reproduces values exactly, so a plain median(|diff|) collapses
+        # to 0 and would disable detection.
+        absd = np.abs(diff)
+        nz = absd[absd > 0]
+        if nz.size == 0:
+            return cube, 0
+        mad = float(np.median(nz))
+        if not np.isfinite(mad) or mad <= 0:
+            return cube, 0
+        # Only positive excursions → cosmic rays, not real absorption dips.
+        spikes = diff > thresh * 1.4826 * mad
+        if not spikes.any():
+            return cube, 0
+        out = cube.copy()
+        out[spikes] = med[spikes]
+        return out, int(spikes.sum())
+
+    def _lof_scan(self):
+        """Scan k = 1..K and plot lack-of-fit %, to guide component choice."""
+        if not HAS_SKL:
+            messagebox.showerror("Missing library",
+                "scikit-learn not installed.\npip install scikit-learn",
+                parent=self)
+            return
+        self._prog.start(12)
+        self._status.config(text="Scanning component counts…", fg=C["text_mid"])
+        threading.Thread(target=self._lof_worker, daemon=True).start()
+
+    def _lof_worker(self):
+        try:
+            from sklearn.decomposition import NMF
+            lo = self._vars["wn_lo"].get(); hi = self._vars["wn_hi"].get()
+            mask_w = (self.xdata >= lo) & (self.xdata <= hi)
+            dt = np.float32 if self._fast32.get() else np.float64
+            cube = np.clip(self.spectra[:, :, mask_w].astype(dt), 0, None)
+            if self._despike.get():
+                cube, _ = self._despike_cube(cube)
+            Y, X, Wsel = cube.shape
+            bin_f = max(1, int(self._bin.get()))
+            if bin_f > 1:
+                yb, xb = Y // bin_f, X // bin_f
+                if yb >= 1 and xb >= 1:
+                    cube = cube[:yb*bin_f, :xb*bin_f, :].reshape(
+                        yb, bin_f, xb, bin_f, Wsel).mean(axis=(1, 3))
+            Dw = cube.reshape(-1, Wsel).astype(dt)
+            if self.roi_mask is not None and bin_f == 1:
+                Dw = Dw[np.asarray(self.roi_mask, dtype=bool).ravel()]
+            kmax = min(8, max(self._vars["n_comp"].get() + 3, 5),
+                       Dw.shape[0] - 1, Wsel - 1)
+            normD = float(np.linalg.norm(Dw)) or 1.0
+            ks, lofs = [], []
+            for k in range(1, kmax + 1):
+                nmf = NMF(n_components=k, init="nndsvda", max_iter=300,
+                          random_state=42)
+                Cw = nmf.fit_transform(Dw)
+                Sw = nmf.components_
+                lof = 100.0 * float(np.linalg.norm(Dw - Cw @ Sw)) / normD
+                ks.append(k); lofs.append(lof)
+            self.after(0, lambda: self._show_lof(ks, lofs))
+        except Exception as ex:
+            self.after(0, lambda ex=ex: messagebox.showerror(
+                "LOF scan error", str(ex), parent=self))
+        finally:
+            self.after(0, self._prog.stop)
+
+    def _show_lof(self, ks, lofs):
+        win = tk.Toplevel(self); win.title("Lack-of-fit vs number of components")
+        win.configure(bg=C["bg"]); win.geometry("640x480")
+        fig = plt.Figure(figsize=(6, 4.4), facecolor="white")
+        ax = fig.add_subplot(111)
+        ax.plot(ks, lofs, "o-", color="#2563eb", lw=1.6)
+        for k, l in zip(ks, lofs):
+            ax.annotate(f"{l:.1f}%", (k, l), textcoords="offset points",
+                        xytext=(0, 8), ha="center", fontsize=8)
+        ax.set_xlabel("Number of components (k)")
+        ax.set_ylabel("Lack of fit  (% of ‖D‖)")
+        ax.set_title("MCR-ALS / NMF lack-of-fit vs k", fontweight="semibold")
+        ax.set_xticks(ks)
+        ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+        fig.tight_layout()
+        cv = FigureCanvasTkAgg(fig, master=win)
+        cv.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(cv, win).update()
+        drops = [lofs[i-1] - lofs[i] for i in range(1, len(lofs))]
+        hint = ""
+        if drops:
+            for i, d in enumerate(drops):
+                if d < 1.0:
+                    hint = (f"Improvement past k={ks[i]} is < 1%; "
+                            f"k={ks[i]} is likely sufficient.")
+                    break
+        tk.Label(win, text=hint or "No clear plateau in range — inspect curve.",
+                 bg=C["bg"], fg=C["text_mid"], font=("Segoe UI", 10),
+                 wraplength=600, justify="left").pack(padx=10, pady=6)
+        self._status.config(text="Lack-of-fit scan complete.", fg=C["success"])
+
+    def _flatness_check(self):
+        """Check whether the map intensity is a flat field or a tilted plane.
+
+        A tilted / defocused sample makes the total per-pixel intensity drift
+        smoothly across the field. We fit a plane I = a·x + b·y + c to the
+        total-intensity map; a high fraction of variance explained by that
+        plane (plus a non-trivial slope) indicates tilt rather than chemistry.
+        """
+        cube = np.asarray(self.spectra, dtype=float)
+        if cube.ndim != 3:
+            messagebox.showwarning("Flatness", "Need a 2-D map cube.",
+                                   parent=self)
+            return
+        Y, X, _ = cube.shape
+        if Y < 3 or X < 3:
+            messagebox.showwarning("Flatness", "Map too small to assess.",
+                                   parent=self)
+            return
+        inten = np.nansum(np.clip(cube, 0, None), axis=2)   # Y × X
+        yy, xx = np.mgrid[0:Y, 0:X]
+        m = np.isfinite(inten)
+        A = np.column_stack([xx[m].ravel(), yy[m].ravel(),
+                             np.ones(m.sum())])
+        b = inten[m].ravel()
+        coef, *_ = np.linalg.lstsq(A, b, rcond=None)
+        plane = (coef[0] * xx + coef[1] * yy + coef[2])
+        resid = inten - plane
+        ss_tot = float(np.nansum((inten - np.nanmean(inten)) ** 2)) or 1.0
+        ss_res = float(np.nansum(resid[m] ** 2))
+        r2 = 1.0 - ss_res / ss_tot
+        # Slope expressed as % intensity change across the full field.
+        span = abs(coef[0]) * (X - 1) + abs(coef[1]) * (Y - 1)
+        mean_i = float(np.nanmean(inten)) or 1.0
+        tilt_pct = 100.0 * span / mean_i
+
+        if r2 >= 0.6 and tilt_pct >= 15:
+            verdict = ("LIKELY TILTED / defocused: the intensity field is "
+                       "mostly a smooth plane.")
+            col = "#b91c1c"
+        elif r2 >= 0.4 or tilt_pct >= 10:
+            verdict = ("BORDERLINE: some planar gradient present — inspect "
+                       "and consider focus tracking.")
+            col = "#b45309"
+        else:
+            verdict = "LOOKS FLAT: little planar gradient in intensity."
+            col = "#15803d"
+
+        win = tk.Toplevel(self); win.title("Flatness / tilt check")
+        win.configure(bg=C["bg"]); win.geometry("900x420")
+        fig = plt.Figure(figsize=(8.6, 3.6), facecolor="white")
+        a1 = fig.add_subplot(1, 3, 1); a2 = fig.add_subplot(1, 3, 2)
+        a3 = fig.add_subplot(1, 3, 3)
+        im1 = a1.imshow(inten, cmap="turbo"); a1.set_title("Total intensity")
+        fig.colorbar(im1, ax=a1, fraction=0.046)
+        im2 = a2.imshow(plane, cmap="turbo"); a2.set_title("Fitted plane")
+        fig.colorbar(im2, ax=a2, fraction=0.046)
+        im3 = a3.imshow(resid, cmap="coolwarm")
+        a3.set_title("Residual (real structure)")
+        fig.colorbar(im3, ax=a3, fraction=0.046)
+        for ax in (a1, a2, a3):
+            ax.set_xticks([]); ax.set_yticks([])
+        fig.tight_layout()
+        cv = FigureCanvasTkAgg(fig, master=win)
+        cv.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(cv, win).update()
+        tk.Label(win,
+                 text=(f"{verdict}\n"
+                       f"Plane fit R² = {r2:.2f}   |   "
+                       f"tilt ≈ {tilt_pct:.0f}% of mean intensity across field"),
+                 bg=C["bg"], fg=col, font=("Segoe UI", 10, "bold"),
+                 wraplength=860, justify="left").pack(padx=10, pady=6)
+        self._status.config(text="Flatness check complete.", fg=C["success"])
+
     def _draw(self):
         k    = self._k
         cols = self.COMP_COLORS[:k]
         self._fig.clear()
 
         import matplotlib.gridspec as gridspec
-        # Row 0: abundance maps (up to 4 per row, wrap)
-        rows_needed = 1 + (-(k // -4))   # ceil(k/4) map rows + 1 spectra row
-        gs = gridspec.GridSpec(2, max(k, 2), figure=self._fig,
-                               hspace=0.52, wspace=0.30,
-                               left=0.05, right=0.82, top=0.93, bottom=0.08)
+        self._panel_items = []
+        # 3 rows: combined spectra (top), per-component spectra (middle),
+        # abundance maps (bottom). Each panel gets its own save-tick.
+        gs = gridspec.GridSpec(3, max(k, 2), figure=self._fig,
+                               height_ratios=[1.15, 0.85, 1.05],
+                               hspace=0.55, wspace=0.30,
+                               left=0.05, right=0.82, top=0.95, bottom=0.05)
 
         # Pure spectra on top row spanning all columns
         ax_sp = self._fig.add_subplot(gs[0, :])
+        self._panel_items.append((ax_sp, "pure_spectra_all"))
         offset = 0.0
         for c in range(k):
             spec = self._S[:, c]
@@ -9723,9 +10855,23 @@ class MCRWindow(tk.Toplevel):
                      borderaxespad=0., frameon=True, framealpha=0.9)
         ax_sp.grid(True, ls="--", lw=0.4, alpha=0.5)
 
+        # Middle row: each component spectrum on its own — individually tickable
+        for c in range(k):
+            ax_c = self._fig.add_subplot(gs[1, c])
+            self._panel_items.append((ax_c, f"spectrum_C{c+1}"))
+            spec = self._S[:, c]
+            pk   = spec.max() or 1.0
+            ax_c.plot(self._xsel, spec / pk, color=cols[c], lw=1.2)
+            ax_c.set_title(f"Spectrum — C{c+1}", fontsize=9,
+                           fontweight="semibold", color=cols[c])
+            ax_c.set_xlabel("Raman Shift (cm⁻¹)", fontsize=8)
+            ax_c.tick_params(labelsize=7)
+            ax_c.grid(True, ls="--", lw=0.4, alpha=0.5)
+
         # Abundance maps on bottom row — smoothed, robust-contrast display
         for c in range(k):
-            ax_m = self._fig.add_subplot(gs[1, c])
+            ax_m = self._fig.add_subplot(gs[2, c])
+            self._panel_items.append((ax_m, f"abundance_C{c+1}"))
             s = _lut_for_win(self, c)
             vmin, vmax = _lut_clim(self._C[:, :, c], s)
             show_map(ax_m, self._fig, self._C[:, :, c], cmap=s["cmap"],
@@ -9736,8 +10882,11 @@ class MCRWindow(tk.Toplevel):
                      colorbar=True, px_um=getattr(self.master, "_px_um", None))
 
         self._canvas.draw_idle()
+        self.after_idle(self._place_panel_ticks)
+        ns = getattr(self, "_n_spikes", 0)
+        spike_txt = f"  ({ns} cosmic-ray points removed)" if ns else ""
         self._status.config(
-            text=f"MCR-ALS converged — {k} components.",
+            text=f"MCR-ALS converged — {k} components.{spike_txt}",
             fg=C["success"])
 
     def _save_fig(self):
@@ -9746,6 +10895,197 @@ class MCRWindow(tk.Toplevel):
             filetypes=[("PNG","*.png"),("PDF","*.pdf")], parent=self)
         if path:
             self._fig.savefig(path, dpi=250, bbox_inches="tight")
+
+    def _save_panels(self):
+        """Save every plot in the MCR-ALS window as its own standalone,
+        publication-ready file: the combined pure-spectra plot, each
+        component spectrum on its own, and each abundance map (with its own
+        colorbar + scale bar). Each panel is re-rendered into a fresh figure
+        so nothing is cropped or clipped."""
+        if self._S is None or self._C is None:
+            messagebox.showwarning("No results", "Run MCR-ALS first.",
+                                   parent=self)
+            return
+        out_dir = filedialog.askdirectory(
+            title="Choose a folder for the individual MCR-ALS panels",
+            parent=self)
+        if not out_dir:
+            return
+
+        # File format: vector PDF is best for journals; PNG also written.
+        save_pdf = messagebox.askyesno(
+            "Vector copy?",
+            "Also save a vector PDF of each panel (recommended for journals)?\n\n"
+            "Yes → PNG (600 dpi) + PDF      No → PNG only",
+            parent=self)
+
+        k    = self._k
+        cols = self.COMP_COLORS[:k]
+        base = Path(getattr(self.master, "_last_wdf_path", "MCR")).stem or "MCR"
+        sigma = float(getattr(self, "_dsig", None).get()
+                      if getattr(self, "_dsig", None) else 0.8)
+        px_um = getattr(self.master, "_px_um", None)
+        exported = []
+
+        def _write(fig, tag):
+            png = Path(out_dir) / f"{base}_{tag}.png"
+            fig.savefig(png, dpi=600, bbox_inches="tight", facecolor="white")
+            exported.append(png.name)
+            if save_pdf:
+                pdf = Path(out_dir) / f"{base}_{tag}.pdf"
+                fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+                exported.append(pdf.name)
+            plt.close(fig)
+
+        try:
+            # 1) Combined pure-spectra plot (all components, offset)
+            f1 = plt.figure(figsize=(7, 4.2), facecolor="white")
+            ax = f1.add_subplot(111)
+            offset = 0.0
+            for c in range(k):
+                spec = self._S[:, c]
+                pk = spec.max() or 1.0
+                ax.plot(self._xsel, spec / pk + offset, color=cols[c],
+                        lw=1.3, label=f"Component {c+1}")
+                offset += 1.1
+            ax.set_xlabel("Raman Shift  (cm⁻¹)", fontsize=11)
+            ax.set_ylabel("Intensity  (norm., offset)", fontsize=11)
+            ax.set_title("MCR-ALS Recovered Pure Spectra",
+                         fontsize=12, fontweight="semibold")
+            ax.legend(fontsize=9, frameon=True, framealpha=0.9)
+            ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+            _write(f1, "pure_spectra_all")
+
+            # 2) Each component spectrum on its own (no offset)
+            for c in range(k):
+                fc = plt.figure(figsize=(7, 3.4), facecolor="white")
+                axc = fc.add_subplot(111)
+                spec = self._S[:, c]
+                pk = spec.max() or 1.0
+                axc.plot(self._xsel, spec / pk, color=cols[c], lw=1.4)
+                axc.set_xlabel("Raman Shift  (cm⁻¹)", fontsize=11)
+                axc.set_ylabel("Intensity  (norm.)", fontsize=11)
+                axc.set_title(f"Pure Spectrum — Component {c+1}",
+                              fontsize=12, fontweight="semibold",
+                              color=cols[c])
+                axc.grid(True, ls="--", lw=0.4, alpha=0.5)
+                _write(fc, f"spectrum_C{c+1}")
+
+            # 3) Each abundance map on its own (with colorbar + scale bar)
+            for c in range(k):
+                fm = plt.figure(figsize=(4.6, 4.0), facecolor="white")
+                axm = fm.add_subplot(111)
+                s = _lut_for_win(self, c)
+                vmin, vmax = _lut_clim(self._C[:, :, c], s)
+                show_map(axm, fm, self._C[:, :, c], cmap=s["cmap"],
+                         sigma=sigma, robust=False, vmin=vmin, vmax=vmax,
+                         title=f"Abundance Map — C{c+1}", title_color=cols[c],
+                         colorbar=True, px_um=px_um)
+                _write(fm, f"abundance_C{c+1}")
+        except Exception as ex:
+            messagebox.showerror("Export error", str(ex), parent=self)
+            return
+
+        messagebox.showinfo(
+            "Panels saved",
+            f"Saved {len(exported)} files to:\n{out_dir}", parent=self)
+        self._status.config(
+            text=f"Saved {len(exported)} individual panels → "
+                 f"{Path(out_dir).name}", fg=C["success"])
+
+    def _save_ticked(self):
+        """Save only the panels whose top-left checkbox is ticked."""
+        if self._S is None or self._C is None:
+            messagebox.showwarning("No results", "Run MCR-ALS first.",
+                                   parent=self)
+            return
+        ticked = [tag for tag, var in self._panel_vars.items() if var.get()]
+        if not ticked:
+            messagebox.showinfo(
+                "Nothing selected",
+                "Tick the checkbox at the top-left of at least one panel "
+                "to choose what to save.", parent=self)
+            return
+        out_dir = filedialog.askdirectory(
+            title="Choose a folder for the ticked panels", parent=self)
+        if not out_dir:
+            return
+        save_pdf = messagebox.askyesno(
+            "Vector copy?",
+            "Also save a vector PDF of each panel?\n\n"
+            "Yes → PNG (600 dpi) + PDF      No → PNG only", parent=self)
+
+        k = self._k
+        cols = self.COMP_COLORS[:k]
+        base = Path(getattr(self.master, "_last_wdf_path", "MCR")).stem or "MCR"
+        sigma = float(getattr(self, "_dsig", None).get()
+                      if getattr(self, "_dsig", None) else 0.8)
+        px_um = getattr(self.master, "_px_um", None)
+        exported = []
+
+        def _write(fig, tag):
+            png = Path(out_dir) / f"{base}_{tag}.png"
+            fig.savefig(png, dpi=600, bbox_inches="tight", facecolor="white")
+            exported.append(png.name)
+            if save_pdf:
+                pdf = Path(out_dir) / f"{base}_{tag}.pdf"
+                fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+                exported.append(pdf.name)
+            plt.close(fig)
+
+        try:
+            if "pure_spectra_all" in ticked:
+                f1 = plt.figure(figsize=(7, 4.2), facecolor="white")
+                ax = f1.add_subplot(111)
+                offset = 0.0
+                for c in range(k):
+                    spec = self._S[:, c]; pk = spec.max() or 1.0
+                    ax.plot(self._xsel, spec / pk + offset, color=cols[c],
+                            lw=1.3, label=f"Component {c+1}")
+                    offset += 1.1
+                ax.set_xlabel("Raman Shift  (cm⁻¹)", fontsize=11)
+                ax.set_ylabel("Intensity  (norm., offset)", fontsize=11)
+                ax.set_title("MCR-ALS Recovered Pure Spectra",
+                             fontsize=12, fontweight="semibold")
+                ax.legend(fontsize=9, frameon=True, framealpha=0.9)
+                ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+                _write(f1, "pure_spectra_all")
+            # Each individually-ticked component spectrum (no offset)
+            for c in range(k):
+                if f"spectrum_C{c+1}" not in ticked:
+                    continue
+                fc = plt.figure(figsize=(7, 3.4), facecolor="white")
+                axc = fc.add_subplot(111)
+                spec = self._S[:, c]; pk = spec.max() or 1.0
+                axc.plot(self._xsel, spec / pk, color=cols[c], lw=1.4)
+                axc.set_xlabel("Raman Shift  (cm⁻¹)", fontsize=11)
+                axc.set_ylabel("Intensity  (norm.)", fontsize=11)
+                axc.set_title(f"Pure Spectrum — Component {c+1}",
+                              fontsize=12, fontweight="semibold", color=cols[c])
+                axc.grid(True, ls="--", lw=0.4, alpha=0.5)
+                _write(fc, f"spectrum_C{c+1}")
+            for c in range(k):
+                if f"abundance_C{c+1}" not in ticked:
+                    continue
+                fm = plt.figure(figsize=(4.6, 4.0), facecolor="white")
+                axm = fm.add_subplot(111)
+                s = _lut_for_win(self, c)
+                vmin, vmax = _lut_clim(self._C[:, :, c], s)
+                show_map(axm, fm, self._C[:, :, c], cmap=s["cmap"],
+                         sigma=sigma, robust=False, vmin=vmin, vmax=vmax,
+                         title=f"Abundance Map — C{c+1}", title_color=cols[c],
+                         colorbar=True, px_um=px_um)
+                _write(fm, f"abundance_C{c+1}")
+        except Exception as ex:
+            messagebox.showerror("Export error", str(ex), parent=self)
+            return
+
+        messagebox.showinfo(
+            "Panels saved",
+            f"Saved {len(exported)} files to:\n{out_dir}", parent=self)
+        self._status.config(
+            text=f"Saved {len(exported)} ticked panels → "
+                 f"{Path(out_dir).name}", fg=C["success"])
 
     def _save_spectra(self):
         if self._S is None:
@@ -9767,7 +11107,7 @@ class MCRWindow(tk.Toplevel):
 # ─────────────────────────────────────────────────────────────────────────────
 # N-FINDR ENDMEMBER EXTRACTION WINDOW
 # ─────────────────────────────────────────────────────────────────────────────
-class NFindrWindow(tk.Toplevel):
+class NFindrWindow(PanelSaveMixin, tk.Toplevel):
     """
     N-FINDR endmember extraction followed by NNLS abundance mapping.
 
@@ -9801,8 +11141,7 @@ class NFindrWindow(tk.Toplevel):
                  bg=C["header"], fg="white",
                  font=("Consolas", 12, "bold")).pack(side="left", padx=16, pady=10)
 
-        left = tk.Frame(self, bg=C["sidebar"], width=270)
-        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        left = make_scroll_sidebar(self, 270)
 
         SectionDiv(left, "PARAMETERS").pack(fill="x")
         pf = tk.Frame(left, bg=C["sidebar"])
@@ -9862,8 +11201,10 @@ class NFindrWindow(tk.Toplevel):
         _build_lut_panel(self, left, lambda: self._abund is not None)
 
         SectionDiv(left, "EXPORT").pack(fill="x")
-        ttk.Button(left, text="↓ Save Figure", style="N.TButton",
+        ttk.Button(left, text="↓ Save Figure (whole page)", style="N.TButton",
                    command=self._save_fig).pack(fill="x", padx=12, pady=4)
+        ttk.Button(left, text="↓ Save Individual Panels…", style="N.TButton",
+                   command=self._save_panels).pack(fill="x", padx=12, pady=4)
         ttk.Button(left, text="↓ Save Endmembers (.csv)", style="N.TButton",
                    command=self._save_endmembers).pack(fill="x", padx=12, pady=4)
 
@@ -9873,6 +11214,7 @@ class NFindrWindow(tk.Toplevel):
         self._canvas = FigureCanvasTkAgg(self._fig, master=right)
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self._canvas, right).update()
+        self._enable_panel_ticks(self._canvas, basename="NFINDR")
 
     def _compare_ems(self):
         if self._endmembers is None:
@@ -10029,6 +11371,99 @@ class NFindrWindow(tk.Toplevel):
             filetypes=[("PNG","*.png"),("PDF","*.pdf")], parent=self)
         if path:
             self._fig.savefig(path, dpi=250, bbox_inches="tight")
+
+    def _save_panels(self):
+        """Save each N-FINDR plot as its own standalone, publication-ready
+        file: the combined endmember spectra, each endmember spectrum on its
+        own, and each abundance map (with colorbar + scale bar)."""
+        if getattr(self, "_endmembers", None) is None \
+                or getattr(self, "_abund", None) is None:
+            messagebox.showwarning("No results", "Run N-FINDR first.",
+                                   parent=self)
+            return
+        out_dir = filedialog.askdirectory(
+            title="Choose a folder for the individual N-FINDR panels",
+            parent=self)
+        if not out_dir:
+            return
+        save_pdf = messagebox.askyesno(
+            "Vector copy?",
+            "Also save a vector PDF of each panel (recommended for journals)?\n\n"
+            "Yes → PNG (600 dpi) + PDF      No → PNG only",
+            parent=self)
+
+        p     = self._p
+        cols  = self.COMP_COLORS[:p]
+        base  = Path(getattr(self.master, "_last_wdf_path", "NFINDR")).stem or "NFINDR"
+        sigma = float(getattr(self, "_dsig", None).get()
+                      if getattr(self, "_dsig", None) else 0.8)
+        px_um = getattr(self.master, "_px_um", None)
+        exported = []
+
+        def _write(fig, tag):
+            png = Path(out_dir) / f"{base}_{tag}.png"
+            fig.savefig(png, dpi=600, bbox_inches="tight", facecolor="white")
+            exported.append(png.name)
+            if save_pdf:
+                pdf = Path(out_dir) / f"{base}_{tag}.pdf"
+                fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+                exported.append(pdf.name)
+            plt.close(fig)
+
+        try:
+            # 1) Combined endmember spectra
+            f1 = plt.figure(figsize=(7, 4.2), facecolor="white")
+            ax = f1.add_subplot(111)
+            offset = 0.0
+            for c in range(p):
+                spec = self._endmembers[c]
+                pk = spec.max() or 1.0
+                ax.plot(self._xsel, spec / pk + offset, color=cols[c],
+                        lw=1.3, label=f"Endmember {c+1}")
+                offset += 1.1
+            ax.set_xlabel("Raman Shift  (cm⁻¹)", fontsize=11)
+            ax.set_ylabel("Intensity  (norm., offset)", fontsize=11)
+            ax.set_title("N-FINDR Endmember Spectra",
+                         fontsize=12, fontweight="semibold")
+            ax.legend(fontsize=9, frameon=True, framealpha=0.9)
+            ax.grid(True, ls="--", lw=0.4, alpha=0.5)
+            _write(f1, "endmembers_all")
+
+            # 2) Each endmember spectrum on its own
+            for c in range(p):
+                fc = plt.figure(figsize=(7, 3.4), facecolor="white")
+                axc = fc.add_subplot(111)
+                spec = self._endmembers[c]
+                pk = spec.max() or 1.0
+                axc.plot(self._xsel, spec / pk, color=cols[c], lw=1.4)
+                axc.set_xlabel("Raman Shift  (cm⁻¹)", fontsize=11)
+                axc.set_ylabel("Intensity  (norm.)", fontsize=11)
+                axc.set_title(f"Endmember {c+1}", fontsize=12,
+                              fontweight="semibold", color=cols[c])
+                axc.grid(True, ls="--", lw=0.4, alpha=0.5)
+                _write(fc, f"endmember_EM{c+1}")
+
+            # 3) Each abundance map on its own
+            for c in range(p):
+                fm = plt.figure(figsize=(4.6, 4.0), facecolor="white")
+                axm = fm.add_subplot(111)
+                s = _lut_for_win(self, c)
+                vmin, vmax = _lut_clim(self._abund[:, :, c], s)
+                show_map(axm, fm, self._abund[:, :, c], cmap=s["cmap"],
+                         sigma=sigma, robust=False, vmin=vmin, vmax=vmax,
+                         title=f"Abundance — EM {c+1}", title_color=cols[c],
+                         colorbar=True, px_um=px_um)
+                _write(fm, f"abundance_EM{c+1}")
+        except Exception as ex:
+            messagebox.showerror("Export error", str(ex), parent=self)
+            return
+
+        messagebox.showinfo(
+            "Panels saved",
+            f"Saved {len(exported)} files to:\n{out_dir}", parent=self)
+        self._status.config(
+            text=f"Saved {len(exported)} individual panels → "
+                 f"{Path(out_dir).name}", fg=C["success"])
 
     def _save_endmembers(self):
         if self._endmembers is None:
@@ -11536,8 +12971,7 @@ class LibrarySearchWindow(tk.Toplevel):
         self.x = np.asarray(app.xdata, dtype=float)
         self._lib = []     # list of {name, spec(W,) with NaN outside coverage}
 
-        left = tk.Frame(self, bg=C["sidebar"], width=300)
-        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        left = make_scroll_sidebar(self, 300)
         SectionDiv(left, "REFERENCE LIBRARY").pack(fill="x")
         ttk.Button(left, text="★ Load bundled library",
                    command=self._load_bundled).pack(fill="x", padx=10, pady=(8, 2))
@@ -11569,6 +13003,14 @@ class LibrarySearchWindow(tk.Toplevel):
         self._topn = tk.IntVar(value=15)
         ttk.Spinbox(rt, from_=5, to=100, textvariable=self._topn,
                     width=6).pack(side="left")
+        rb = tk.Frame(left, bg=C["sidebar"]); rb.pack(fill="x", padx=10, pady=3)
+        tk.Label(rb, text="Broaden σ", width=11, anchor="w", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+        self._sigma = tk.DoubleVar(value=0.0)
+        ttk.Spinbox(rb, from_=0.0, to=50.0, increment=1.0,
+                    textvariable=self._sigma, width=6).pack(side="left")
+        tk.Label(rb, text="cm⁻¹", bg=C["sidebar"], fg=C["text_dim"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
         ttk.Button(left, text="🔎 Search", style="ROI.TButton",
                    command=self._search).pack(fill="x", padx=10, pady=(10, 4))
         ttk.Button(left, text="↓ Export results (CSV)",
@@ -11576,10 +13018,11 @@ class LibrarySearchWindow(tk.Toplevel):
 
         right = tk.Frame(self, bg=C["bg"]); right.pack(side="left", fill="both",
                                                        expand=True)
-        cols = ("rank", "name", "score")
+        cols = ("rank", "name", "score", "act", "conf")
+        heads = ("Rank", "Name", "Score", "Act", "Confidence")
         self._tv = ttk.Treeview(right, columns=cols, show="headings", height=10)
-        for c, w in zip(cols, (50, 360, 90)):
-            self._tv.heading(c, text=c.title()); self._tv.column(c, width=w)
+        for c, h, w in zip(cols, heads, (50, 300, 80, 80, 90)):
+            self._tv.heading(c, text=h); self._tv.column(c, width=w)
         self._tv.pack(fill="x", padx=8, pady=8)
         self._tv.bind("<<TreeviewSelect>>", lambda _e: self._plot_selected())
 
@@ -11684,29 +13127,76 @@ class LibrarySearchWindow(tk.Toplevel):
             if sd > 0: v = (v - mu) / sd
         return v
 
+    def _broaden(self, v):
+        """Optional Gaussian smoothing in cm⁻¹ to tolerate resolution /
+        small peak-position differences between query and library."""
+        sigma = float(self._sigma.get() or 0.0)
+        v = np.asarray(v, dtype=float)
+        if sigma <= 0:
+            return v
+        dx = np.median(np.abs(np.diff(self.x)))
+        if not np.isfinite(dx) or dx <= 0:
+            return v
+        nan_mask = ~np.isfinite(v)
+        sm = gaussian_filter1d(np.nan_to_num(v, nan=0.0), sigma / dx)
+        sm[nan_mask] = np.nan
+        return sm
+
+    @staticmethod
+    def _corr(q, L, mask):
+        """Mean-centred cosine similarity (Pearson r) over masked bins."""
+        a = q[mask] - q[mask].mean()
+        b = L[mask] - L[mask].mean()
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        if denom <= 0:
+            return float("nan")
+        return float(a @ b / denom)
+
+    @staticmethod
+    def _confidence(score, act):
+        """Heuristic qualitative label. Thresholds are generic starting
+        points — recalibrate on your own validation set."""
+        s = act if act == act else score
+        if s != s:
+            return "—"
+        if s >= 0.75:
+            return "high"
+        if s >= 0.50:
+            return "moderate"
+        return "low"
+
     def _search(self):
         if not self._lib:
             messagebox.showwarning("Library", "Load a reference library first.",
                                    parent=self); return
         mode = self._prep.get()
-        q = self._prep_vec(self._query_spectrum(), mode)
-        self._q_disp = self._query_spectrum()
+        qraw = self._query_spectrum()
+        q = self._prep_vec(self._broaden(qraw), mode)
+        self._q_disp = qraw
+        # Active bins: where the peak-normalised query rises above the baseline.
+        qn = np.asarray(qraw, dtype=float)
+        rng = np.nanmax(qn) - np.nanmin(qn)
+        active = (qn - np.nanmin(qn)) > 0.05 * rng if rng > 0 else \
+            np.ones_like(qn, dtype=bool)
         results = []
         for entry in self._lib:
-            L = self._prep_vec(entry["spec"], mode)
+            L = self._prep_vec(self._broaden(entry["spec"]), mode)
             m = np.isfinite(L) & np.isfinite(q)
             if m.sum() < 10:
                 continue
-            a = q[m] - q[m].mean(); b = L[m] - L[m].mean()
-            denom = (np.linalg.norm(a) * np.linalg.norm(b))
-            if denom <= 0:
+            score = self._corr(q, L, m)
+            if score != score:   # NaN -> degenerate
                 continue
-            results.append((entry["name"], float(a @ b / denom), entry["spec"]))
+            ma = m & active
+            act = self._corr(q, L, ma) if ma.sum() >= 10 else float("nan")
+            results.append((entry["name"], score, act, entry["spec"]))
         results.sort(key=lambda t: t[1], reverse=True)
         self._results = results[: self._topn.get()]
         self._tv.delete(*self._tv.get_children())
-        for i, (name, score, _) in enumerate(self._results, 1):
-            self._tv.insert("", "end", values=(i, name, f"{score:.3f}"))
+        for i, (name, score, act, _) in enumerate(self._results, 1):
+            act_s = f"{act:.3f}" if act == act else "—"
+            self._tv.insert("", "end", values=(
+                i, name, f"{score:.3f}", act_s, self._confidence(score, act)))
         if self._results:
             kids = self._tv.get_children()
             if kids: self._tv.selection_set(kids[0])
@@ -11724,7 +13214,7 @@ class LibrarySearchWindow(tk.Toplevel):
         if not sel or not self._results:
             return
         idx = self._tv.index(sel[0])
-        name, score, spec = self._results[idx]
+        name, score, act, spec = self._results[idx]
         self._ax.cla()
         q = self._query_spectrum()
         qn = (q - np.nanmin(q)) / (np.nanmax(q) - np.nanmin(q) + 1e-9)
@@ -11747,9 +13237,13 @@ class LibrarySearchWindow(tk.Toplevel):
             return
         import csv
         with open(path, "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh); w.writerow(["rank", "name", "correlation"])
-            for i, (name, score, _) in enumerate(self._results, 1):
-                w.writerow([i, name, f"{score:.4f}"])
+            w = csv.writer(fh)
+            w.writerow(["rank", "name", "correlation", "active_correlation",
+                        "confidence"])
+            for i, (name, score, act, _) in enumerate(self._results, 1):
+                w.writerow([i, name, f"{score:.4f}",
+                            f"{act:.4f}" if act == act else "",
+                            self._confidence(score, act)])
         messagebox.showinfo("Export", f"Saved {len(self._results)} matches.",
                             parent=self)
 
@@ -11796,7 +13290,7 @@ def _otsu_threshold(img):
     return float(centers[int(plateau[len(plateau) // 2])])
 
 
-class ComponentAnalysisWindow(tk.Toplevel):
+class ComponentAnalysisWindow(PanelSaveMixin, tk.Toplevel):
     """Supervised component analysis (DCLS / NNLS) on a 2-D map, producing
     concentration maps, a percentage lack-of-fit map and overall concentration
     estimates — the Renishaw WiRE \"Component analysis\" workflow."""
@@ -11812,8 +13306,7 @@ class ComponentAnalysisWindow(tk.Toplevel):
         self._res = None
         self._lut = {}      # per-panel {index|'lof': {cmap, lo, hi}}
 
-        left = tk.Frame(self, bg=C["sidebar"], width=300)
-        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        left = make_scroll_sidebar(self, 300)
         SectionDiv(left, "REFERENCE COMPONENTS").pack(fill="x")
         ttk.Button(left, text="＋ Load reference spectra…",
                    command=self._load_refs).pack(fill="x", padx=10, pady=(8, 2))
@@ -11914,6 +13407,7 @@ class ComponentAnalysisWindow(tk.Toplevel):
         self._fig = plt.Figure(figsize=(8, 7)); self._cv = FigureCanvasTkAgg(
             self._fig, master=right)
         self._cv.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=6)
+        self._enable_panel_ticks(self._cv, basename="ComponentAnalysis")
         note = ("Tip: load the map with Preprocessing → Normalisation = none and "
                 "use 'None (quantitative)' here for quantitative concentrations.")
         tk.Label(right, text=note, bg=C["bg"], fg=C["text_dim"],
@@ -12087,8 +13581,7 @@ class ParticleStatsWindow(tk.Toplevel):
         self.name = name
         self._props = []
 
-        left = tk.Frame(self, bg=C["sidebar"], width=290)
-        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        left = make_scroll_sidebar(self, 290)
         SectionDiv(left, "BINARISATION").pack(fill="x")
         self._auto = tk.BooleanVar(value=True)
         ttk.Checkbutton(left, variable=self._auto, text="Auto-binarise (Otsu)",
@@ -12226,8 +13719,7 @@ class ParticleFinderWindow(tk.Toplevel):
         self._labels = None       # full integer label image
 
         # ── left control panel ───────────────────────────────────────────────
-        left = tk.Frame(self, bg=C["sidebar"], width=300)
-        left.pack(side="left", fill="y"); left.pack_propagate(False)
+        left = make_scroll_sidebar(self, 300)
 
         SectionDiv(left, "PARTICLEFINDER").pack(fill="x")
         self._auto = tk.BooleanVar(value=True)
@@ -12273,6 +13765,14 @@ class ParticleFinderWindow(tk.Toplevel):
         self._prep = tk.StringVar(value="SNV")
         ttk.Combobox(rpm, textvariable=self._prep, state="readonly", width=14,
                      values=["raw", "SNV", "1st derivative"]).pack(side="left")
+        rbm = tk.Frame(left, bg=C["sidebar"]); rbm.pack(fill="x", padx=10, pady=3)
+        tk.Label(rbm, text="Broaden σ", width=11, anchor="w", bg=C["sidebar"],
+                 fg=C["text_mid"], font=("Segoe UI", 10)).pack(side="left")
+        self._sigma = tk.DoubleVar(value=0.0)
+        ttk.Spinbox(rbm, from_=0.0, to=50.0, increment=1.0,
+                    textvariable=self._sigma, width=6).pack(side="left")
+        tk.Label(rbm, text="cm⁻¹", bg=C["sidebar"], fg=C["text_dim"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
         ttk.Button(left, text="⛯ Identify all particles", style="ROI.TButton",
                    command=self._identify).pack(fill="x", padx=10, pady=(8, 4))
         ttk.Button(left, text="↓ Export particle table (CSV)",
@@ -12350,6 +13850,20 @@ class ParticleFinderWindow(tk.Toplevel):
                 v = (v - mu) / sd
         return v
 
+    def _broaden(self, v):
+        """Optional Gaussian smoothing in cm⁻¹ applied before matching."""
+        sigma = float(self._sigma.get() or 0.0)
+        v = np.asarray(v, dtype=float)
+        if sigma <= 0:
+            return v
+        dx = np.median(np.abs(np.diff(self.x)))
+        if not np.isfinite(dx) or dx <= 0:
+            return v
+        nan_mask = ~np.isfinite(v)
+        sm = gaussian_filter1d(np.nan_to_num(v, nan=0.0), sigma / dx)
+        sm[nan_mask] = np.nan
+        return sm
+
     def _ingest(self, paths):
         n = 0
         for p in paths:
@@ -12423,10 +13937,10 @@ class ParticleFinderWindow(tk.Toplevel):
         """Return (name, score) of best library match for one spectrum."""
         if spec is None or not self._lib:
             return ("", float("nan"))
-        q = self._prep_vec(spec, mode)
+        q = self._prep_vec(self._broaden(spec), mode)
         best_name, best_score = "", -2.0
         for entry in self._lib:
-            L = self._prep_vec(entry["spec"], mode)
+            L = self._prep_vec(self._broaden(entry["spec"]), mode)
             m = np.isfinite(L) & np.isfinite(q)
             if m.sum() < 10:
                 continue
@@ -12615,4 +14129,11 @@ if __name__ == "__main__":
         sys.exit(_run_cli(sys.argv[1:]))
 
     app = RamanApp()
+    # Offline Analysis Planner pops up at launch (user can disable via its checkbox)
+    try:
+        import bioraman_planner as _bp
+        if _bp.should_show_startup():
+            app.after(700, app.open_planner)
+    except Exception:
+        pass
     app.mainloop()

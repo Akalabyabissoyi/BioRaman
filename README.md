@@ -156,3 +156,23 @@ Developed by **Akalabya Bissoyi** in the
 
 - akalabya.bissoyi@manchester.ac.uk
 - bissoyi.akalabya@gmail.com
+
+## Repository layout
+
+```
+bioraman.py                  Main application (Tkinter GUI)
+bioraman_group_compare.py    Group Comparison module (per-cell band ratio, stats, maps)
+bioraman_planner.py          Offline Analysis Planner (suggests a workflow)
+raman_metadata.py            Metadata / instrument-file parsing
+spectra_io.py                Spectral file I/O helpers
+pca_core.py, pca_studio.py   PCA engine + standalone PCA Studio window
+ramanbiolib_bands.py         Reference Raman band library
+docs/                        User manual, release notes, module docs
+tools/                       Library-build scripts (run from the repo root)
+example/                     Small bundled example dataset
+tests/                       Unit tests
+validation/                  Validation scripts
+```
+
+Run the app with `python bioraman.py` from the repository root (all runtime
+modules and the bundled data folders live alongside it).
