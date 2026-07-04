@@ -104,3 +104,6 @@ rigor*.json
 # marketing / comparison artefacts (not part of the codebase)
 BioRaman_tool_comparison.html
 LinkedIn_Post*.md
+
+# keep documentation PDFs (e.g. the user manual) in the repo
+!docs/**/*.pdf
