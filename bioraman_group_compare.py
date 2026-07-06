@@ -362,6 +362,16 @@ def open_group_compare(parent=None):
     win = tk.Toplevel(parent) if parent is not None else tk.Tk()
     win.title("BioRaman — Group Comparison")
     win.geometry("1120x760")
+    try:
+        _st = ttk.Style(win)
+        for _b in ("TEntry", "TCombobox", "TSpinbox"):
+            _st.configure(_b, foreground="black", fieldbackground="white",
+                          background="white", insertcolor="black")
+        _st.map("TEntry", foreground=[("!disabled", "black")], fieldbackground=[("!disabled", "white")])
+        _st.map("TCombobox", foreground=[("readonly", "black"), ("!disabled", "black")],
+                fieldbackground=[("readonly", "white"), ("!disabled", "white")])
+    except Exception:
+        pass
     groups = {}     # label -> list[path]
 
     # scrollable left panel + pinned bottom action bar (so buttons never get cut off)

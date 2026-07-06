@@ -107,3 +107,6 @@ LinkedIn_Post*.md
 
 # keep documentation PDFs (e.g. the user manual) in the repo
 !docs/**/*.pdf
+
+# personal cryo preset (local only, never publish)
+.bioraman_presets.json.personal

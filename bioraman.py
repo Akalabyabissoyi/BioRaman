@@ -4466,6 +4466,8 @@ class RamanApp(tk.Tk):
                        command=self.open_group_compare)
         am.add_command(label="🧭  Analysis Planner (suggests a workflow)…",
                        command=self.open_planner)
+        am.add_command(label="╱  Line Profile (line scan across a map)…",
+                       command=self.open_line_profile)
 
         # ── PCRS (Particle Characterisation & Raman Spectroscopy) ──────────────
         pm = tk.Menu(mb, tearoff=0, bg=C["panel"], fg=C["text_hi"],
@@ -4533,6 +4535,7 @@ class RamanApp(tk.Tk):
             ("🔁 Reprocess",    self.reprocess,              "Neutral.TButton"),
             ("⊞ White Light",   self.load_wl,                "Neutral.TButton"),
             ("◈ PCA",          self.open_pca,               "Neutral.TButton"),
+            ("◇ PCA Studio",   self.open_pca_studio,        "Primary.TButton"),
             ("🧊 3D Volume",    self.open_3d_viewer,         "Neutral.TButton"),
             ("📊 Univariate",   self.open_univariate,        "Neutral.TButton"),
             ("⚡ Dynamic",      self.open_dynamic_map,       "Neutral.TButton"),
@@ -9155,6 +9158,22 @@ td:first-child{{color:#556;font-weight:600}} img{{max-width:100%;border:1px soli
                 "Details: %s" % e)
             return
         bp.open_planner(self)
+
+    def open_line_profile(self):
+        """Draw a line across the current map and plot band intensity (one or two
+        bands, dual axis) vs distance — a 'line scan'. See bioraman_lineprofile.py."""
+        if self.spectra is None or np.asarray(self.spectra).ndim != 3:
+            messagebox.showwarning("No map", "Load a Raman map first (a 2-D map, not a single spectrum).")
+            return
+        try:
+            import bioraman_lineprofile as blp
+        except Exception as e:
+            messagebox.showerror(
+                "Line Profile unavailable",
+                "Could not load bioraman_lineprofile.py (keep it next to bioraman.py).\n\n"
+                "Details: %s" % e)
+            return
+        blp.open_line_profile(self)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

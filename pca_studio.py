@@ -490,6 +490,35 @@ class PCAStudio(tk.Toplevel):
         ttk.Button(left, text="↓ Save loadings (CSV)", style="N.TButton",
                    command=self._save_loadings).pack(fill="x", padx=10, pady=(2, 12))
 
+        self._section(left, "HELP")
+        ttk.Button(left, text="🧭 Analysis Planner", style="N.TButton",
+                   command=self._open_planner).pack(fill="x", padx=10, pady=2)
+        ttk.Button(left, text="✉ Ask the developer", style="N.TButton",
+                   command=self._ask_developer).pack(fill="x", padx=10, pady=(2, 12))
+
+    def _open_planner(self):
+        from tkinter import messagebox
+        try:
+            import bioraman_planner as bp
+            bp.open_planner(self)
+        except Exception as e:
+            messagebox.showerror("Analysis Planner unavailable",
+                                 "Keep bioraman_planner.py next to pca_studio.py.\n\n%s" % e)
+
+    def _ask_developer(self):
+        import webbrowser, urllib.parse
+        from tkinter import messagebox
+        email = "akalabya.bissoyi@manchester.ac.uk"
+        body = ("Hi Akalabya,\n\nI'm using PCA Studio in BioRaman and have a question:\n\n\n")
+        try:
+            webbrowser.open("mailto:%s?subject=%s&body=%s" % (
+                email, urllib.parse.quote("BioRaman / PCA Studio — help"),
+                urllib.parse.quote(body)))
+        except Exception:
+            pass
+        messagebox.showinfo("Ask the developer",
+                            "Contact the developer:\n\n%s\n\nResponse within ~48 hours." % email)
+
     def _spin(self, parent, label, row, lo, hi, attr, init, dbl=False, inc=1):
         tk.Label(parent, text=label, bg=C["sidebar"], fg=C["text_mid"]).grid(
             row=row, column=0, sticky="w", pady=2)
