@@ -27,9 +27,6 @@ library. No changes to existing analytical defaults.
   PCA Studio runs both standalone (`python pca_studio.py`) and embedded, and
   can ingest the map currently loaded in BioRaman or load its own files
   (`.wdf`, `.csv`, `.txt`, `.dpt`, `.xlsx`).
-- **Expanded RamanBioLib peak/band reference** (`ramanbiolib_bands.py` plus
-  `build_ramanbiolib_library.py` / `build_pcrs_library.py`) for more reliable
-  band-to-biomolecule assignment across proteins, lipids and nucleic acids.
 
 ### Changed
 - `bioraman.py` is now the single canonical application file and includes the
