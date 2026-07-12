@@ -166,7 +166,7 @@ bioraman_planner.py          Offline Analysis Planner (suggests a workflow)
 raman_metadata.py            Metadata / instrument-file parsing
 spectra_io.py                Spectral file I/O helpers
 pca_core.py, pca_studio.py   PCA engine + standalone PCA Studio window
-ramanbiolib_bands.py         Reference Raman band library
+ramanbiolib_bands.py         Reference Raman band library (RamanBioLib, ODbL-1.0)
 docs/                        User manual, release notes, module docs
 tools/                       Library-build scripts (run from the repo root)
 example/                     Small bundled example dataset

@@ -1,5 +1,8 @@
 # Auto-generated from RamanBioLib (ODbL-1.0). Diagnostic peaks (rel.I>=0.40).
 # Source: Teran et al., Chemom. Intell. Lab. Syst. 264 (2025) 105476.
+# Paper: https://www.sciencedirect.com/science/article/pii/S0169743925001613
+# Project: https://github.com/mteranm/ramanbiolib
+# Used with the authors' permission (M. Teran, Universitat Oberta de Catalunya).
 RAMANBIOLIB_BANDS = [
     (452, "RamanBioLib: l-proline"),
     (477, "RamanBioLib: amylopectin, lactose"),
